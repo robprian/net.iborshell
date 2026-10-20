@@ -19,7 +19,7 @@
   "source": "https://github.com/robprian/net.iborshell",
   "homepage": "https://github.com/robprian/net.iborshell",
   "license": "MIT",
-  "releaseNotes": "iBorShell 1.0.0: fork of jinpy's Terminal (io.dbx.ssh 0.7.9-beta.2), repacked as net.iborshell. Command history panel removed; adds Multi Exec panel, Clone Session and a live CPU/ping/disk stats strip.",
+  "releaseNotes": "iBorShell 1.0.1: signed-release refresh of 1.0.0 (fork of jinpy's Terminal io.dbx.ssh 0.7.9-beta.2, repacked as net.iborshell). All platform packages are Ed25519-signed (key_id net.iborshell). Command history panel removed; adds Multi Exec panel, Clone Session and a live CPU/ping/disk stats strip.",
   "localizations": {
     "zh-CN": {
       "name": "终端",
