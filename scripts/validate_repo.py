@@ -52,7 +52,7 @@ def main() -> int:
         fail("backend initialization identity is missing or stale")
 
     required = [
-        "assets/plugin.svg", "frontend/package.json", "backend/Cargo.toml",
+        "assets/plugin.png", "frontend/package.json", "backend/Cargo.toml",
         "scripts/test.sh", "scripts/connection-forms/verify.mjs",
         "shared/frontend/binaryEvent.ts", "shared/frontend/editorTheme.ts",
         "shared/frontend/themeSync.ts", "shared/sdk/rust/dbx-plugin-sdk/src/lib.rs",

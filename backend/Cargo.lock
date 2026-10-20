@@ -2630,7 +2630,7 @@ dependencies = [
 
 [[package]]
 name = "net-iborshell"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "aes",
  "aes-gcm",
