@@ -1,0 +1,22 @@
+/backend/target/
+/.dbx-dev/
+/frontend/node_modules/
+/frontend/dist/
+/scripts/__pycache__/
+/docs/screenshots-ui-mock/
+/dist/
+# 构建产物不入库：发布与候选打包在 CI 现构建前端（release.yml / ci.yml）
+/ui/
+.dbx-repository-signing-key.env
+
+# git worktrees (feature isolation)
+.worktrees/
+
+# Codex planning artifacts
+.zcode/
+.omc/
+
+# AI 会话工件（hook-state / 转录）不入库：曾一次性入库 6.7 万行后被清除
+.mimosa/
+gui-test-screenshots/
+.keys/.dbx-repository-signing-key.env

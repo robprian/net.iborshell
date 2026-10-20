@@ -1,0 +1,223 @@
+// 薄 spec：验证 shared/frontend/pluginStorage 适配器在本插件工具链下
+// import 解析成立，并锁定 pluginStore 的迁键清单（实现与文档只在 shared
+// 维护，通道级行为由适配器保证；这里防的是"新偏好键直写 localStorage
+// 没进 store"与"node 环境默认解析抛错"两类回归）。
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { DbxPluginStorageBridge } from "../../../shared/frontend/pluginStorage";
+import { PLUGIN_STORE_KEYS, pluginStore } from "./pluginStore";
+
+describe("ssh pluginStore wiring", () => {
+  it("declares every migrated UI-state key (sidecar-backed keys stay out)", () => {
+    // 迁移键 = 活的前端 UI 偏好（键名与迁移前 localStorage 一致）。
+    // 不在此列：ssh-download-* / ssh-transfer-* / ssh-sftp-compat-mode /
+    // ssh-sftp-name-encoding / ssh-history-suggestion-*（sidecar preferences.json
+    // 权威的 web 同步缓存）。注意宿主 storage 水合只拉本清单键：新走 pluginStore
+    // 的键必须登记，否则真机写入能落盘但重启永远读不回。
+    expect([...PLUGIN_STORE_KEYS].sort()).toEqual(
+      [
+        "sftp-path-history",
+        "ssh-command-history",
+        // 命令 → 最近执行时刻（Warp 式 history 面板相对时间），与命令环同采集口。
+        "ssh-command-history-times",
+        // history 面板富元数据（时长 + 退出码，随命令环修剪）。
+        "ssh-command-history-meta",
+        "ssh-follow-directory",
+        "ssh-sftp-pane-open",
+        "ssh-sftp-side-tab",
+        "ssh-sftp-side-collapsed",
+        "ssh-terminal-select-copy",
+        "ssh-keyword-highlight",
+        // 关键词显示方式（#180）：与 pluginStore 白名单镜像同步。
+        "ssh-keyword-display-mode",
+        "ssh-batch-bar-open",
+        "ssh-terminal-search-options",
+        "ssh-terminal-webgl",
+        "ssh-terminal-font-size",
+        "ssh-terminal-font-family",
+        "ssh-terminal-behavior",
+        "ssh-terminal-hotkeys",
+        "ssh-terminal-appearance",
+        // dock 面板精简工具条隐藏偏好。
+        "ssh-panel-toolbar-hidden",
+        // Docker 浮层宽度（issue #170，拖拽手柄 300..720）。
+        "ssh-docker-panel-width",
+        "telnet-connect-last",
+        "serial-connect-last",
+        "vnc-connect-last",
+        // 结构化补全引擎（FIG wave-1）：fig-safe（默认）/ fig / off。
+        // 旧结构化补全开关键已随 legacy spec 目录退役（键集全等断言本身
+        // 即禁止任何退役键回流，故此处不写字面量，避免命中退役 grep 门禁）。
+        "ssh-completion-engine",
+        "ssh-terminal-ghost-suggest",
+        // 「Tab 接受建议」开关 + 建议黑名单（ghost/suggestions 批次）。
+        "ssh-ghost-tab-accept",
+        "ssh-suggestion-blocklist",
+        // 历史面板功能开关（issue #169，SettingsDialog 自治读写，默认开）。
+        // 历史显示条数（issue #192，命令环上限 10..1000 默认 100，App 穿参）。
+        "ssh-command-history-limit",
+        // 空提示符引导条开关+消散旗标（issue #178 补登记，terminalPromptHints 自治）。
+        "ssh-terminal-prompt-hints-enabled",
+        "ssh-terminal-prompt-hints-dismissed",
+        // 跨重启布局/视图全局偏好（issue #178，单键 JSON，App.vue 写穿）。
+        "ssh-workbench-layout",
+        // AI 助手三开关 + AI 修复「不再询问」授权位（Warp AI 对齐批）。
+        "ssh-ai-assist",
+        // Docker/Podman 引擎连接设置（单键 JSON 映射，dockerEngine.ts 自治）。
+        "ssh-docker-engine",
+        // 外部编辑器配置（编辑器映射增强，editorRules.ts 自治）。
+        "ssh-editor-config",
+        "ssh-tunnel-profiles",
+        // 空提示符快捷键引导两键（issue #176-3：漏注册 = 消散旗标每次重开丢）。
+        "ssh-terminal-prompt-hints-enabled",
+        "ssh-terminal-prompt-hints-dismissed",
+        // 工作台 UI 布局镜像（issue #178，宿主缺 workbenchState 桥时的兜底）。
+        "ssh-workbench-ui",
+        // 存储迁移批 1（IMPL_PLAN_STORAGE_SYNC）：全局偏好三域权威键，
+        // sidecar JSON 降级为一次性搬迁种子。
+        "ssh-quick-commands",
+        "ssh-highlight-rules",
+        "ssh-sftp-bookmarks",
+        // MCP 设置镜像（批 1 收尾）：sidecar 即时权威 + 镜像作云同步载荷。
+        "ssh-mcp-settings",
+        // 存储迁移批 2：连接级四域镜像键（值内按 connectionId 分桶）。
+        "ssh-startup-commands",
+        "ssh-name-encoding-overrides",
+        "ssh-agent-modes",
+        "ssh-agent-approved-commands",
+        // 存储迁移批 3：传输/下载 14 键合并单镜像（wire 键名同形）。
+        "ssh-preferences-mirror",
+      ].sort(),
+    );
+    for (const banned of [
+      "ssh-download-directory",
+      "ssh-download-use-default-dir",
+      "ssh-download-conflict-policy",
+      "ssh-transfer-concurrency",
+      "ssh-transfer-duplicate-policy",
+      "ssh-history-suggestions-enabled",
+      "ssh-history-suggestion-min-chars",
+      "ssh-history-suggestion-max-chars",
+      // FIG wave-1 legacy 退役：旧结构化补全开关键被引擎键取代；字面量按
+      // 退役 grep 门禁要求省略（"ssh-completion" + "-spec" 拼接）。
+      ["ssh-completion", "-spec"].join(""),
+    ]) {
+      expect(PLUGIN_STORE_KEYS).not.toContain(banned);
+    }
+  });
+
+  it("resolves to the memory channel in node tests instead of throwing", async () => {
+    // node 环境无 window：默认解析应落到内存档而不是抛错（opaque origin
+    // 真机上 localStorage 访问即抛，适配器需把它折断成降级通道）。
+    expect(pluginStore.channel).toBe("memory");
+    await pluginStore.ready;
+  });
+
+  it("hydrates from a host bridge and writes through synchronously", async () => {
+    // 用注入桥走一遍 host 通道：水合读存量 + set/remove 写穿（App.vue 调用
+    // 点的同步 getItem/setItem/removeItem 语义依赖该行为）。
+    const map = new Map<string, unknown>([["ssh-keyword-highlight", "false"]]);
+    const bridge: DbxPluginStorageBridge & { map: Map<string, unknown> } = {
+      map,
+      get: async (key) => (map.has(key) ? map.get(key) : null),
+      set: async (key, value) => {
+        map.set(key, value);
+        return null;
+      },
+      delete: async (key) => {
+        map.delete(key);
+        return null;
+      },
+    };
+    const { createPluginKvStore } = await import("../../../shared/frontend/pluginStorage");
+    const store = createPluginKvStore([...PLUGIN_STORE_KEYS], { bridge, localStorage: null });
+    await store.ready;
+    expect(store.getItem("ssh-keyword-highlight")).toBe("false");
+    store.setItem("ssh-sftp-pane-open", "true");
+    await Promise.resolve();
+    expect(bridge.map.get("ssh-sftp-pane-open")).toBe("true");
+    store.removeItem("ssh-sftp-pane-open");
+    await Promise.resolve();
+    expect(bridge.map.has("ssh-sftp-pane-open")).toBe(false);
+  });
+});
+
+describe("host init-aware channel resolution", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function stubHostApi(capabilities: Record<string, unknown>) {
+    const initListeners = new Set<(event: Event) => void>();
+    const hostApi: Record<string, unknown> = { capabilities };
+    vi.stubGlobal(
+      "window",
+      Object.assign(Object.create(null), { dbxPlugin: hostApi }),
+    );
+    vi.stubGlobal("document", {
+      addEventListener: (_type: string, listener: (event: Event) => void) => initListeners.add(listener),
+      removeEventListener: (_type: string, listener: (event: Event) => void) => initListeners.delete(listener),
+    });
+    return { hostApi, dispatchInit: () => initListeners.forEach((listener) => listener(new Event("dbx-plugin-init"))) };
+  }
+
+  function bridgeFor(map: Map<string, unknown>): DbxPluginStorageBridge {
+    return {
+      get: async (key) => (map.has(key) ? map.get(key) : null),
+      set: async (key, value) => {
+        map.set(key, value);
+        return null;
+      },
+      delete: async (key) => {
+        map.delete(key);
+        return null;
+      },
+    };
+  }
+
+  it("delays channel resolution until the host init event fills capabilities", async () => {
+    // 回归根因（新建/复制会话 tab 主题被重置）：宿主 SDK 的 capabilities
+    // 由 init 消息填充，插件模块加载即判定通道时它还是空对象——opaque
+    // origin 下又没有 localStorage 可降级，整个 store 被误锁到 memory 档，
+    // 主题等偏好读到默认、写入重启即丢。判定必须等 dbx-plugin-init。
+    const map = new Map<string, unknown>([["ssh-terminal-appearance", "{}"]]);
+    const bridge = bridgeFor(map);
+    const { hostApi, dispatchInit } = stubHostApi({});
+    const { createPluginKvStore } = await import("../../../shared/frontend/pluginStorage");
+    const store = createPluginKvStore(["ssh-terminal-appearance"], { localStorage: null, initTimeoutMs: 50 });
+
+    let ready = false;
+    void store.ready.then(() => (ready = true));
+    await Promise.resolve();
+    expect(ready).toBe(false);
+
+    hostApi.capabilities = { storage: true };
+    hostApi.storage = bridge;
+    dispatchInit();
+    await store.ready;
+
+    expect(store.channel).toBe("host");
+    expect(store.getItem("ssh-terminal-appearance")).toBe("{}");
+  });
+
+  it("falls back to the degraded channel when the host init never lands", async () => {
+    stubHostApi({});
+    const { createPluginKvStore } = await import("../../../shared/frontend/pluginStorage");
+    const store = createPluginKvStore(["ssh-terminal-appearance"], { localStorage: null, initTimeoutMs: 10 });
+    await store.ready;
+    expect(store.channel).toBe("memory");
+  });
+
+  it("does not wait when no host api exists (direct-browser/node)", async () => {
+    vi.stubGlobal("window", Object.assign(Object.create(null), {}));
+    vi.stubGlobal("document", { addEventListener() {}, removeEventListener() {} });
+    const backing = new Map<string, string>([["ssh-terminal-appearance", "{}"]]);
+    const localStorage = {
+      getItem: (key: string) => backing.get(key) ?? null,
+      setItem: (key: string, value: string) => backing.set(key, value),
+      removeItem: (key: string) => backing.delete(key),
+    };
+    const { createPluginKvStore } = await import("../../../shared/frontend/pluginStorage");
+    const store = createPluginKvStore(["ssh-terminal-appearance"], { localStorage });
+    await store.ready;
+    expect(store.channel).toBe("localStorage");
+    expect(store.getItem("ssh-terminal-appearance")).toBe("{}");
+  });
+});

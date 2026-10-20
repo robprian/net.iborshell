@@ -1,0 +1,250 @@
+name: Release iBorShell plugin
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+# Same tag cannot run twice concurrently; different tags are independent.
+concurrency:
+  group: release-net-iborshell-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  PLUGIN_CLI_VERSION: "0.1.3"
+  # aws-lc-sys falls back to its bundled prebuilt NASM objects when the
+  # assembler is missing on the MSVC toolchain; harmless on every other OS.
+  AWS_LC_SYS_PREBUILT_NASM: "1"
+  # Windows runners default python stdout to cp1252; UTF-8 mode is a no-op
+  # on the other platforms.
+  PYTHONUTF8: "1"
+  # sccache caches rustc invocations — `dbx-plugin package`'s staging build
+  # has its own target dir that rust-cache cannot help (see ci.yml).
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache-cache
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  validate:
+    if: startsWith(github.event.release.tag_name, 'v')
+    name: Validate SSH release identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate manifest and release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 scripts/validate_repo.py
+          # Vendored RDP 认证链发布硬门：六个 crate 的双哈希登记 + 树哈希
+          # 与实际内容逐文件比对（backend/vendor/README.md；计划 §6）。
+          python3 scripts/verify_rdp_vendor_integrity.py --require-recorded-hashes
+          python3 - "$RELEASE_TAG" <<'PY'
+          import json
+          import pathlib
+          import sys
+          version = json.loads(pathlib.Path("manifest.json").read_text())["version"]
+          expected = f"v{version}"
+          if sys.argv[1] != expected:
+              raise SystemExit(f"release tag {sys.argv[1]!r} does not match {expected!r}")
+          PY
+
+  # Build the target-independent UI once; every platform job below unpacks it
+  # as ui/ and packages it as-is instead of rebuilding the frontend 5x.
+  frontend:
+    if: startsWith(github.event.release.tag_name, 'v')
+    name: Build release frontend
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.24.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm --dir frontend install --frozen-lockfile
+      - run: pnpm --dir frontend build
+      - name: Upload prebuilt UI
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-ui-ssh
+          path: ui/**
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    if: startsWith(github.event.release.tag_name, 'v')
+    name: Build ${{ matrix.target }}
+    needs: [validate, frontend]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux 侧车全静态 musl 构建：glibc 构建在 ubuntu-24.04（2.39）上，
+          # Ubuntu 22.04/Debian 11 等老系统动态加载器直接失败（exit status 1）。
+          # rust_target 同时喂给 rustup targets 与 CARGO_BUILD_TARGET。
+          - os: linux
+            runner: ubuntu-24.04
+            target: linux-x64
+            rust_target: x86_64-unknown-linux-musl
+          - os: linux
+            runner: ubuntu-24.04-arm
+            target: linux-arm64
+            rust_target: aarch64-unknown-linux-musl
+          - os: macos
+            runner: macos-15
+            target: darwin-arm64
+          - os: macos
+            runner: macos-15-intel
+            target: darwin-x64
+          - os: windows
+            runner: windows-2022
+            target: windows-x64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native dependencies
+        if: matrix.os == 'linux'
+        # musl-tools 提供 musl-gcc：aws-lc-sys（russh 依赖）在 musl target 下
+        # 仍要编译 C 源码。libdbus-1-dev / nasm 已移除：secret-service（dbus）
+        # 在 Linux 被 cfg 门控掉（走 keyfile 层），nasm 只服务 aws-lc-sys 的
+        # MSVC 预置对象路径。
+        run: sudo apt-get update && sudo apt-get install -y pkg-config musl-tools
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.sccache-cache
+          # Primary key carries matrix.target so the five parallel saves
+          # never collide.
+          key: sccache-${{ runner.os }}-${{ github.job }}-${{ matrix.target }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ github.job }}-${{ matrix.target }}-
+            sccache-${{ runner.os }}-${{ github.job }}-
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
+      # ui/index.html 由 frontend job 一次构建后经 artifact 下发，打包直接用
+      # （已脱库，见 .gitignore /ui/）。
+      - name: Download prebuilt UI
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-ui-ssh
+          path: ui
+      # CARGO_BUILD_TARGET 经环境变量传导（cargo 原生支持）：同时约束这里的
+      # 预构建与 package 步骤里 CLI 内部的 cargo build（CLI 不传 --target）。
+      # 非 linux 条目 RUST_TARGET 为空，保持默认主机 target。
+      - name: Build sidecar
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          if [ -n "$RUST_TARGET" ]; then export CARGO_BUILD_TARGET="$RUST_TARGET"; fi
+          cargo build --locked --release --manifest-path backend/Cargo.toml
+      # cargo 带 target 时输出在 backend/target/<triple>/release/；裸
+      # backend/target/release/ 预放一份 musl 产物兜底（ Offline smoke 等引用
+      # 裸路径的步骤用）。plugin-cli 的打包构建有独立 staging 目录，见下方
+      # Package 步骤的垫片说明。
+      - name: Stage musl binary at the default target path
+        if: matrix.os == 'linux'
+        run: |
+          mkdir -p backend/target/release
+          cp -f "backend/target/${{ matrix.rust_target }}/release/net-iborshell" backend/target/release/net-iborshell
+      - run: npm install --global "@dbx-app/plugin-cli@${PLUGIN_CLI_VERSION}"
+      - name: Package .dbxp candidate
+        # plugin-cli 自带 CARGO_TARGET_DIR=<dist/.build-rust-*> 调 cargo 且不传
+        # --target，随后固定从 <dir>/release/ 拷贝；CARGO_BUILD_TARGET（musl）会把
+        # 产物重定向到 <dir>/<triple>/release/。经 PATH 注入 cargo 垫片
+        # （scripts/cargo_target_shim.sh），在构建后把二进制同步回 CLI 的拷贝源。
+        env:
+          DBX_PLUGIN_TARGET: ${{ matrix.target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          NO_COLOR: "1"
+        run: |
+          if [ -n "$RUST_TARGET" ]; then
+            export CARGO_BUILD_TARGET="$RUST_TARGET"
+            shim_dir="$(mktemp -d)"
+            printf '#!/usr/bin/env bash\nexport REAL_CARGO="%s"\nexec bash "%s" "$@"\n' "$(command -v cargo)" "${{ github.workspace }}/scripts/cargo_target_shim.sh" > "$shim_dir/cargo"
+            chmod +x "$shim_dir/cargo"
+            export PATH="$shim_dir:$PATH"
+          fi
+          # 不设 DBX_PLUGIN_SDK_ROOT 时 npm 包装器会注入 CLI 自带 sdk-root，
+          # vendored SDK（shared/sdk/）的本地修复进不了出货 sidecar——指向垫片。
+          export DBX_PLUGIN_SDK_ROOT="$(bash scripts/sdk_root_shim.sh)"
+          dbx-plugin package .
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" scripts/verify_packaged_sdk.py
+      # 出货前把关：包内 Linux 二进制必须全静态（glibc 地板修复），
+      # 动态链接即失败——不允许带病发布。
+      - name: Verify packaged linux binary is statically linked
+        if: matrix.os == 'linux'
+        run: |
+          pkg="$(ls -t dist/*.dbxp | head -1)"
+          tmp="$(mktemp -d)"
+          unzip -q "$pkg" -d "$tmp"
+          bin="$(find "$tmp/bin" -type f -name net-iborshell | head -1)"
+          [ -n "$bin" ] || { echo "FAIL: packaged net-iborshell binary missing under $tmp/bin"; exit 1; }
+          file "$bin"
+          if file "$bin" | grep -q "dynamically linked"; then
+            echo "FAIL: packaged linux binary is dynamically linked; expected a static musl build" >&2
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: net-iborshell-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            dist/*.dbxp
+            dist/*.artifact.json
+
+  publish:
+    if: startsWith(github.event.release.tag_name, 'v')
+    name: Publish plugin release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: net-iborshell-*
+          path: dist
+          merge-multiple: true
+      - name: Validate candidates and merge metadata
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          python3 scripts/check_candidates.py dist \
+            --expect linux-x64,linux-arm64,darwin-arm64,darwin-x64,windows-x64 \
+            --write-release-candidates dist/release-candidates.json
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mapfile -d '' packages < <(find dist -type f -name '*.dbxp' -print0)
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "No .dbxp packages were downloaded" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${packages[@]}" dist/release-candidates.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber

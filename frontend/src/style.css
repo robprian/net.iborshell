@@ -1,0 +1,1260 @@
+:root {
+  color-scheme: dark;
+  --background: #131416;
+  --foreground: #d7d7db;
+  --muted: #2a2a2d;
+  --muted-foreground: #97989d;
+  --accent: #2e2f33;
+  --accent-foreground: #dddde2;
+  --border: rgb(110 110 114 / 28%);
+  --destructive: #ef4444;
+  --primary: #3b82f6;
+  --primary-foreground: #fff;
+  --popover: color-mix(in srgb, var(--background) 94%, var(--foreground));
+  --ssh-terminal-background: color-mix(in srgb, var(--background) 94%, #000);
+  --ui-font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+  --terminal-font-family: "JetBrains Mono", "Cascadia Mono", Consolas, monospace;
+  --radius: 6px;
+  /* 阴影两档：弹层 / 模态。所有浮面统一引用，不再各写各的 rgb 配方。 */
+  --shadow-popover: 0 10px 32px rgb(0 0 0 / 28%);
+  --shadow-modal: 0 16px 48px rgb(0 0 0 / 32%);
+  color: var(--foreground);
+  background: var(--background);
+  font-family: var(--ui-font-family);
+  font-size: 12px;
+}
+
+/* 工作台区域不显示滚动条：条体全部隐藏，滚动仍由滚轮/触控板/键盘驱动 */
+* {
+  box-sizing: border-box;
+  scrollbar-width: none;
+}
+*::-webkit-scrollbar { display: none; }
+html, body, #app { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+button, input, select, textarea { font: inherit; }
+button { color: inherit; }
+button:focus-visible, input:focus-visible { outline: 1px solid var(--primary); outline-offset: -1px; }
+.hidden { display: none !important; }
+.muted { color: var(--muted-foreground); }
+.mono { font-family: var(--terminal-font-family); }
+.numeric { font-variant-numeric: tabular-nums; text-align: right; }
+
+.workbench {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--background);
+  color: var(--foreground);
+}
+
+.toolbar {
+  position: relative;
+  /* 本层叠上下文仍须高于终端 xterm 内部层（关键词高亮装饰 .xterm-decoration
+     z=6、.xterm-helpers z=5）与指标/录制浮动卡（.metrics-float z=6），否则
+     工具栏本身会被这些层盖住；工具栏 popover 已 portal 到 body（z-50），不再
+     随本上下文排序，仍低于 modal(80)/回放(90)。 */
+  z-index: 40;
+  isolation: isolate;
+  overflow: visible;
+  display: flex;
+  height: 36px;
+  min-height: 36px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+  padding: 0 8px;
+  background: color-mix(in srgb, var(--background) 92%, transparent);
+}
+
+.identity, .toolbar-actions, .follow-directory-control, .icon-button,
+.file-name, .transfer-title, .transfer-meta,
+.modal header, .modal footer, .file-footer {
+  display: flex;
+  align-items: center;
+}
+
+/* 标识区 + Info 按钮的左组容器：弹层锚点在外层（identity 自身 overflow
+   hidden 负责长主机名截断，弹层不会被裁）。 */
+.identity-side { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; gap: 4px; }
+
+/* Dock panel surface (surface=panel): the host dock chrome provides its own
+   close/collapse/maximize controls, so the workbench toolbar collapses to a
+   slim right-aligned quick strip (font zoom, palette, settings) at dock
+   density — 30px row, compact 20px icon buttons. */
+.workbench.panel-surface .toolbar {
+  height: 30px;
+  min-height: 30px;
+  gap: 4px;
+  padding: 0 6px;
+  /* ghost 化：条子融进终端（去底色/去分隔线），按钮低透明度、hover 才显形。 */
+  background: transparent;
+  border-bottom: 0;
+}
+.workbench.panel-surface .toolbar .icon-button { width: 22px; height: 22px; }
+.workbench.panel-surface .toolbar .icon-button.compact { width: 20px; height: 20px; }
+.workbench.panel-surface .toolbar .icon-button {
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+  opacity: .72;
+}
+.workbench.panel-surface .toolbar .icon-button:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  color: var(--foreground);
+  opacity: 1;
+}
+.workbench.panel-surface .toolbar .icon-button.is-active {
+  background: color-mix(in srgb, var(--primary) 18%, transparent);
+  color: var(--foreground);
+  opacity: 1;
+}
+.workbench.panel-surface .toolbar .icon-button.is-recording { color: var(--destructive); opacity: 1; }
+
+/* 左组系统信息带：11px 等宽数字、tabular-nums 防抖动，溢出截断不换行。 */
+.panel-toolbar-left { display: flex; flex: 1 1 auto; min-width: 0; align-items: center; overflow: hidden; }
+.panel-metrics {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.panel-metrics b { font-weight: 600; color: var(--foreground); }
+/* 降级带（ssh/metrics 失败）：占位数字弱化，原因在 tooltip 里，成功即回正常。 */
+.panel-metrics-degraded b { color: var(--muted-foreground); opacity: 0.7; }
+.live-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-right: 10px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+.live-stats b { font-weight: 600; color: var(--foreground); }
+
+
+/* 工具条隐藏后的还原微钮：贴右上角悬浮于终端上，低透明度、hover 复原。 */
+.panel-toolbar-reveal {
+  position: fixed;
+  top: 4px;
+  right: 6px;
+  z-index: 45;
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-foreground);
+  opacity: .35;
+  cursor: pointer;
+}
+.panel-toolbar-reveal:hover { background: var(--accent); opacity: 1; }
+.panel-toolbar-reveal svg { width: 13px; height: 13px; }
+
+/* 传输弹层共享隐形锚点：固定定位在工具条右缘下，tab/panel 两个表面的按钮
+   都只是开关（见 App.vue header 层的单实例 Popover）。 */
+.transfer-popover-anchor { position: fixed; top: 34px; right: 8px; width: 0; height: 0; }
+
+/* Dock 面板配色快切弹层：窄体 + 列表内滚，短面板（宿主 dock 可调高度）下
+   也不被视口裁剪；行密度与 shell-surface-item 同档。 */
+.panel-palette-popover { gap: 0; width: 236px; padding: 8px; }
+.panel-palette-popover h3 { margin: 0 2px 6px; font-size: 12px; }
+.panel-palette-list {
+  list-style: none;
+  margin: 0;
+  padding: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: min(220px, 46vh);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.panel-palette-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--foreground);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.panel-palette-row:hover { background: var(--accent); }
+.panel-palette-row.selected { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, transparent); }
+.panel-palette-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel-palette-swatch { flex: 0 0 auto; display: inline-flex; gap: 1px; }
+.panel-palette-swatch i { display: block; width: 6px; height: 11px; border-radius: 1px; }
+.panel-palette-footer { display: flex; justify-content: flex-end; margin-top: 6px; }
+.panel-palette-footer .link-button { gap: 5px; font-size: 11px; }
+.panel-palette-footer .link-button svg { width: 12px; height: 12px; flex: 0 0 12px; }
+
+/* Panel "+" shell menu entries. */
+.shell-surface-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  text-align: left;
+}
+.shell-surface-item:hover {
+  background: color-mix(in srgb, currentColor 8%, transparent);
+}
+.shell-surface-header {
+  padding: 4px 8px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+.shell-surface-item .local-shell-program {
+  margin-left: auto;
+  opacity: 0.6;
+  font-size: 10px;
+}
+/* 工具条「会话」下拉（新建/复制/命令会话/本地终端/Shell 选项）：图标 + 文案的
+   整宽行菜单项，形态对齐 shell-surface-item。popover 作用域没有 .modal button
+   的扁平化兜底，需自带去边框/去背景。 */
+.session-menu-popover { min-width: 210px; }
+.session-menu-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.session-menu-item svg { width: 14px; height: 14px; flex: 0 0 14px; }
+.session-menu-item:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 8%, transparent);
+}
+.session-menu-item:disabled { opacity: 0.45; }
+.session-menu-separator { margin: 4px 0; border: 0; border-top: 1px solid var(--border); }
+.session-shell-head { display: flex; align-items: center; gap: 6px; }
+.session-shell-head h3 { margin: 0; font-size: 12px; font-weight: 600; }
+.identity { min-width: 0; overflow: hidden; gap: 6px; }
+/* 空间不足时 Info 按钮也可折叠（先缩主机名，再缩它到 0），不再硬顶
+   右侧按钮组造成叠印。 */
+.identity-side > .icon-button { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+.identity > * { flex: 0 0 auto; }
+.identity strong { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 600; }
+.connection-color { width: 4px; height: 16px; flex: 0 0 4px; border-radius: 999px; }
+.read-only-badge { border: 1px solid var(--border); border-radius: 999px; padding: 1px 6px; color: var(--muted-foreground); font-size: 10px; }
+/* 窄窗口下工具栏按钮一律保持固有宽度（flex 不收缩）：收缩会把 24px 按钮压到
+   比 14px 图标还窄，相邻按钮互相叠印（"堆叠错乱"）。空间不够时优先压缩左侧
+   .identity 的 strong（省略号截断），仍不够则右侧溢出而非重叠。 */
+/* 按钮组整体不参与收缩：收缩时 flex-end 对齐会让内容向左溢出、压到
+   .identity 上（窄窗口"堆叠错乱"的另一半根因）。空间不足时由 .identity
+   的 strong 先缩到 0，再不够宁可右缘裁切也不重叠。 */
+.toolbar-actions { flex: 0 0 auto; justify-content: flex-end; gap: 2px; }
+.toolbar-actions > * { flex: 0 0 auto; }
+
+.icon-button, .link-button, .file-header button,
+/* 弹窗/路径栏按钮统一去默认样式；开关（data-slot="switch"）、下拉触发钮
+   （data-slot="select-trigger"）与页签触发钮（data-slot="tabs-trigger"）自带
+   轨道/边框/选中样式，必须排除——:not() 按参数计特异性（每条 (0,1,0)），
+   该选择器实际特异性 (0,3,1)，会把这些控件的背景抹成透明
+   （设置侧栏选中项白字无药丸、弹窗内控件隐形而工具栏正常的根因）。 */
+.modal button:not([data-slot="switch"]):not([data-slot="select-trigger"]):not([data-slot="tabs-trigger"]), .path-toolbar button:not([data-slot="switch"]):not([data-slot="select-trigger"]):not([data-slot="tabs-trigger"]) {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+}
+/* 图标按钮统一两档：工具栏 24px（svg 14px）/ 紧凑位 .compact 20px（svg 12px）。
+   新增图标按钮只用这两档，不再散养 16/22/26px。 */
+.icon-button {
+  display: inline-grid;
+  position: relative;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: var(--radius);
+  padding: 0;
+}
+.icon-button.compact { width: 20px; height: 20px; }
+.icon-button:hover:not(:disabled),
+.file-header button:hover { background: var(--accent); }
+.icon-button:disabled, button:disabled { cursor: default; opacity: .42; }
+.icon-button svg, .path-toolbar svg,
+.file-header svg, .file-name svg, .transfer-title svg, .drop-overlay svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  stroke-width: 1.7;
+}
+.icon-button.compact svg { width: 12px; height: 12px; flex: 0 0 12px; }
+.follow-directory-control { gap: 5px; margin-right: 2px; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
+.toolbar-separator { width: 1px; height: 16px; flex: 0 0 1px; margin: 0 3px; background: var(--border); }
+.icon-button.is-active { background: var(--accent); box-shadow: inset 0 0 0 1px var(--border); }
+.columns-popover input, .remember input { width: 13px; height: 13px; margin: 0; accent-color: var(--primary); }
+/* 复选/单选全局对齐主色（UA 默认蓝色与宿主主题脱节）。 */
+input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); }
+.icon-neutral { color: var(--muted-foreground); }
+/* 图标色保留原有六色相区分，全部从宿主令牌派生（随宿主明暗/调色板变化），
+   不再硬编码 hex、不再维护明暗双份。 */
+.icon-emerald { color: var(--success); }
+.icon-amber { color: var(--warning); }
+.icon-cyan { color: color-mix(in srgb, var(--info) 65%, var(--success)); }
+.icon-blue { color: var(--info); }
+.icon-teal { color: color-mix(in srgb, var(--success) 55%, var(--info)); }
+.icon-violet { color: color-mix(in srgb, var(--info) 60%, var(--destructive)); }
+
+/* reka Toast viewport（ol）：定位与层级在这里；toast 本体（li）只带视觉样式。
+   通知在视口底部居中 z90（tooltip 100 之下、modal 80 之上）；错误横幅在顶栏下
+   居中 z15（保持迁移前被模态遮罩覆盖的语义）。 */
+.notice-viewport, .error-viewport { position: fixed; left: 50%; width: max-content; max-width: min(720px, calc(100vw - 32px)); transform: translateX(-50%); margin: 0; padding: 0; list-style: none; }
+.notice-viewport { bottom: 24px; z-index: 90; }
+.error-viewport { top: 42px; z-index: 15; }
+.notice, .error-banner { display: flex; align-items: center; gap: 10px; border-radius: var(--radius); box-shadow: 0 6px 24px rgb(0 0 0 / 24%); }
+/* toast 通知与错误横幅同一横幅体系：令牌色弹层底 + 边框，不再反色；
+   字号对齐全局 12px（原 14px 比模态标题还大）。 */
+.notice { border: 1px solid var(--border); border-radius: var(--radius); padding: 7px 14px; background: var(--popover); color: var(--foreground); font-size: 12px; box-shadow: var(--shadow-popover); }
+.notice-action { flex: 0 0 auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 2px 8px; background: transparent; color: var(--primary); font-size: 11px; white-space: nowrap; cursor: pointer; }
+.notice-action:hover { background: var(--accent); }
+
+/* 自定义 tooltip：反色气泡 + 小三角（对齐 DBX 宿主观感），pointer-events
+   关闭避免遮挡 hover；above 变体翻到元素上方。宽度按内容自然展开——
+   不能加 overflow-wrap:anywhere（CJK 下 min-content 会退化成单字宽，
+   tooltip 逐字竖排）。 */
+.app-tooltip { position: fixed; z-index: 100; width: max-content; max-width: 260px; transform: translateX(-50%); border-radius: 6px; padding: 4px 10px; background: var(--foreground); color: var(--background); font-size: 11px; line-height: 1.45; text-align: center; pointer-events: none; box-shadow: 0 4px 14px rgb(0 0 0 / 18%); }
+.app-tooltip::before { content: ""; position: absolute; top: -3px; left: calc(50% + var(--arrow-offset, 0px)); width: 7px; height: 7px; transform: translateX(-50%) rotate(45deg); background: var(--foreground); }
+.app-tooltip.app-tooltip-above { transform: translateX(-50%) translateY(-100%); }
+.app-tooltip-above::before { top: auto; bottom: -3px; }
+.error-banner { justify-content: space-between; border: 1px solid color-mix(in srgb, var(--destructive) 60%, var(--border)); padding: 6px 10px; background: color-mix(in srgb, var(--destructive) 16%, var(--popover)); color: color-mix(in srgb, var(--destructive) 45%, var(--foreground)); }
+.error-banner button { display: grid; width: 20px; height: 20px; border: 0; padding: 0; place-items: center; background: transparent; color: inherit; cursor: pointer; }
+.error-banner svg { width: 13px; height: 13px; }
+
+.panes {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.panes--reversed { flex-direction: row-reverse; }
+.terminal-pane, .sftp-pane { display: flex; height: 100%; min-width: 0; min-height: 0; flex-direction: column; background: var(--background); }
+.terminal-pane { position: relative; flex-grow: 0; flex-shrink: 0; overflow: hidden; background: var(--ssh-terminal-background); }
+.terminal-pane.drag-active { background: color-mix(in srgb, var(--primary) 5%, var(--ssh-terminal-background)); }
+.terminal-pane .drop-overlay strong { max-width: 92%; font-size: 13px; word-break: break-all; }
+/* 内边距必须挂在 .xterm（terminal.element）而非宿主 div 上：FitAddon 只读
+   element 自身的 padding 做行数扣减，挂在宿主上会多算一行、底行溢出可视区
+   （命令条打开时正好被压在条下）。底部 8px 是常驻呼吸间距。 */
+/* z-index: 0 为宿主建立层叠上下文：xterm 内部图层（文字/选择/关键词高亮
+   decoration，xterm.css 里 z-index 高达 10）会被关在里面，否则高亮装饰层
+   会穿透 z-index: 2 的 .terminal-overlay——连接/成功动画期间 replay 写入的
+   内容其高亮块（如 Last login 的 IP）会浮到卡片遮罩之上。 */
+.terminal-host { position: absolute; z-index: 0; inset: 0; background: var(--ssh-terminal-background); }
+/* 终端响铃的视觉提示（对标 Tabby「Terminal → Sound」bell = visual，默认 off）：
+   走 ::after 覆盖层而非宿主自身的 outline / box-shadow —— 宿主背景已被 xterm 画布
+   铺满，只有独立伪元素能稳定压在最上层。强调色用 --primary：深浅两套终端配色下
+   都保得住对比度，且无需新增主题变量。时长须与 App.vue 的 TERMINAL_BELL_FLASH_MS 一致。 */
+.terminal-host::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0;
+  box-shadow: inset 0 0 0 2px var(--primary);
+}
+.terminal-host.bell-flash::after { animation: terminal-bell-flash 150ms ease-out; }
+@keyframes terminal-bell-flash {
+  from { opacity: 1; background: color-mix(in srgb, var(--primary) 16%, transparent); }
+  to { opacity: 0; }
+}
+/* 内边距可经外观设置覆盖：四个方向各自一个变量，变量缺失时回落内置值
+   （左 10 / 右 0 / 上 5 / 下 8）。必须挂在 .xterm（terminal.element）上——
+   FitAddon 只读 element 自身 padding 扣减行数，挂宿主 div 会多算一行。 */
+.terminal-host .xterm {
+  height: 100%;
+  padding: var(--ssh-terminal-padding-top, 5px) var(--ssh-terminal-padding-right, 0) var(--ssh-terminal-padding-bottom, 8px) var(--ssh-terminal-padding-left, 10px);
+  background: var(--ssh-terminal-background);
+}
+/* 选择器必须压过 xterm 6.1-beta 的 `.xterm:not(.allow-transparency)
+   .xterm-viewport{background-color:#000}`（特异性 0,3,0）——6.0.0 时该规则
+   是 `.xterm .xterm-viewport`（0,2,0），靠导入顺序即可覆盖；升 beta 后特异性
+   变高，低特异性写法静默失效、padding 环带复现黑边。这里提到 .xterm .xterm-viewport
+   （同为 0,3,0），本文件在 xterm.css 之后导入，同特异性后者生效。 */
+.terminal-host .xterm .xterm-viewport {
+  scrollbar-width: none !important;
+  /* xterm 6：主题背景色改内联到 .xterm-scrollable-element（内容盒，避开了
+     .xterm 的 padding），viewport 不再内联着色、保留库默认 #000，其矩形
+     （absolute inset:0）仍覆盖整个 .xterm —— padding 环带与 fit 富余露出
+     黑边。这里跟随插件终端背景色压掉库默认值（本文件在 xterm.css 之后
+     导入，同特异性后者生效；若未来 xterm 恢复 viewport 内联着色，内联
+     同为主题色，此规则自然让位）。 */
+  background: var(--ssh-terminal-background);
+}
+.terminal-overlay { position: absolute; z-index: 2; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 10px; padding: 24px; background: var(--ssh-terminal-background); color: var(--muted-foreground); text-align: center; }
+.terminal-overlay p { margin: 0; font-size: 12px; }
+
+
+/* Termius 风格连接卡片：挂在 .terminal-overlay（原连接中遮罩）内。
+   三段式——头部（服务器徽章 + 名称 + Show logs）、中段进度线（左服务器端点
+   旋转弧 + 流光段 → 右终端徽章）、底部状态行（Cancel / 错误+Reconnect /
+   已取消+Connect）+ 可展开日志面板。全令牌色，明暗主题随宿主。 */
+.connect-card { display: flex; width: min(400px, 94%); flex-direction: column; gap: 16px; border: 1px solid var(--border); border-radius: calc(var(--radius) + 4px); padding: 18px 18px 14px; background: var(--popover); box-shadow: var(--shadow-modal); color: var(--foreground); text-align: left; }
+.connect-card-header { display: flex; align-items: center; gap: 11px; }
+.connect-card-badge { display: grid; width: 34px; height: 34px; flex: 0 0 34px; place-items: center; border-radius: 9px; background: var(--primary); color: var(--primary-foreground); }
+.connect-card-badge svg { width: 17px; height: 17px; stroke-width: 1.8; }
+/* PluginLogo 是 ?raw 引入的 assets/plugin.svg（宿主插件中心同款图形），外层为
+   span.plugin-logo 包装：块级化避免行内基线缝隙；svg 描边统一压成 currentColor
+   （覆盖原文件硬编码的 #0ea5e9，表示属性可被 CSS 规则覆盖），否则同色系徽标底
+   上不可读。尺寸不在此处定——由使用处规则给出（徽标 17px / 端点 15px），
+   裸 svg 无固有尺寸，缺上下文会落到 300×150 默认。 */
+.plugin-logo { display: block; line-height: 0; }
+.plugin-logo svg path { stroke: currentColor; }
+.connect-card-heading { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 1px; }
+.connect-card-name { overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.connect-card-identity { overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.connect-card-logs-toggle { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; border: 0; border-radius: var(--radius); padding: 3px 7px; background: transparent; color: var(--muted-foreground); font-size: 11px; cursor: pointer; }
+.connect-card-logs-toggle:hover { background: var(--accent); color: var(--accent-foreground); }
+.connect-card-logs-toggle svg { width: 12px; height: 12px; }
+.connect-card-track { display: flex; align-items: center; gap: 12px; padding: 2px 4px; }
+.connect-card-endpoint { position: relative; display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center; border-radius: 50%; background: color-mix(in srgb, var(--muted) 60%, var(--background)); color: var(--muted-foreground); }
+.connect-card-endpoint > svg, .connect-card-endpoint .plugin-logo svg { width: 15px; height: 15px; stroke-width: 1.8; }
+.connect-card-endpoint-server { background: color-mix(in srgb, var(--primary) 14%, transparent); color: var(--primary); }
+/* 左侧端点旋转环：常显的整圆轨道（足够可见，任何时刻都读出"同心圆环"）+
+   一段短亮弧在轨道上匀速旋转；环比图标大 8px，与图标间留出明显间隙。
+   注意选择器必须写成 .connect-card-endpoint > svg.connect-card-arc：
+   图标尺寸规则 .connect-card-endpoint > svg（15px）优先级更高，会把环压小。 */
+.connect-card-endpoint > svg.connect-card-arc { position: absolute; inset: -8px; width: 46px; height: 46px; animation: spin 1.1s linear infinite; }
+.connect-card-arc-track { fill: none; stroke: color-mix(in srgb, var(--primary) 30%, transparent); stroke-width: 2; }
+.connect-card-arc-spin { fill: none; stroke: var(--primary); stroke-width: 2; stroke-dasharray: 30 71; stroke-linecap: round; }
+.connect-card-line { position: relative; height: 2px; flex: 1; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, var(--muted-foreground) 28%, transparent); }
+/* 不定态流光段：40% 宽渐变光斑沿线从左滑到右（后端无真实阶段，纯装饰）。 */
+.connect-card-flow { position: absolute; top: 0; bottom: 0; left: 0; width: 40%; border-radius: 999px; background: linear-gradient(90deg, transparent, var(--primary), transparent); animation: connect-card-flow 1.4s ease-in-out infinite; }
+@keyframes connect-card-flow { from { transform: translateX(-100%); } to { transform: translateX(260%); } }
+/* 错误/取消态：旋转弧整体隐藏（不再留一截冻结的"残弧"），只保留淡淡轨道环；
+   错误态轨道转 destructive，进度线转 destructive。 */
+.connect-card[data-state="error"] .connect-card-arc, .connect-card[data-state="cancelled"] .connect-card-arc { animation: none; }
+.connect-card[data-state="error"] .connect-card-arc-spin, .connect-card[data-state="cancelled"] .connect-card-arc-spin { opacity: 0; }
+.connect-card[data-state="error"] .connect-card-arc-track { stroke: color-mix(in srgb, var(--destructive) 30%, transparent); }
+.connect-card[data-state="cancelled"] .connect-card-arc-track { stroke: color-mix(in srgb, var(--muted-foreground) 18%, transparent); }
+.connect-card[data-state="error"] .connect-card-flow, .connect-card[data-state="cancelled"] .connect-card-flow { display: none; }
+.connect-card[data-state="error"] .connect-card-line { background: color-mix(in srgb, var(--destructive) 55%, transparent); }
+/* 成功过渡（Termius 式）：进度线用 .connect-card-fill 从 0 填满到顶（transition
+   由 data-state 切换触发），右端点图标换对号并弹入，左侧旋转环收起。 */
+.connect-card-fill { position: absolute; top: 0; bottom: 0; left: 0; width: 0; border-radius: 999px; background: var(--primary); transition: width .45s ease-out; }
+.connect-card[data-state="success"] .connect-card-fill { width: 100%; }
+.connect-card[data-state="success"] .connect-card-flow { display: none; }
+.connect-card[data-state="success"] .connect-card-arc { animation: none; }
+.connect-card[data-state="success"] .connect-card-arc-spin { opacity: 0; }
+.connect-card[data-state="success"] .connect-card-endpoint-target { background: color-mix(in srgb, var(--primary) 14%, transparent); color: var(--primary); }
+.connect-card[data-state="success"] .connect-card-endpoint-target svg { animation: connect-card-check .3s ease-out; }
+@keyframes connect-card-check { from { transform: scale(.3); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+.connect-card-success-status { color: var(--primary); }
+.connect-card-footer { display: flex; min-height: 28px; align-items: center; justify-content: space-between; gap: 12px; }
+.connect-card-status { min-width: 0; overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.connect-card-error { min-width: 0; color: var(--destructive); font-size: 11px; overflow-wrap: anywhere; }
+.connect-card-ghost-button { display: inline-flex; min-height: 28px; flex: 0 0 auto; align-items: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 11px; background: transparent; cursor: pointer; }
+.connect-card-ghost-button:hover { background: var(--accent); }
+.connect-card .primary-button { flex: 0 0 auto; }
+/* 日志面板：与卡片同用 UI 字体（等宽栈与中文无衬线混排在 10.5px 下基线错位，
+   反而更怪）；仅时间戳保留等宽数字（纯 ASCII，无 CJK 回退问题）。 */
+.connect-card-logs { display: flex; max-height: 148px; flex-direction: column; gap: 3px; overflow-y: auto; overflow-x: hidden; border-top: 1px solid var(--border); padding-top: 9px; font-family: var(--ui-font-family); font-size: 11px; }
+.connect-card-log-row { display: flex; gap: 8px; color: var(--muted-foreground); line-height: 1.45; }
+.connect-card-log-row[data-level="warn"] { color: var(--warning); }
+.connect-card-log-row[data-level="error"] { color: var(--destructive); }
+.connect-card-log-ts { flex: 0 0 auto; font-family: var(--terminal-font-family); font-variant-numeric: tabular-nums; opacity: .65; }
+.connect-card-log-message { min-width: 0; overflow-wrap: anywhere; }
+.connect-card-logs-empty { margin: 0; color: var(--muted-foreground); opacity: .8; }
+@media (prefers-reduced-motion: reduce) {
+  .connect-card-arc, .connect-card-flow { animation: none; }
+  .connect-card-flow { display: none; }
+  .connect-card-fill { transition: none; }
+  .connect-card-endpoint-target svg { animation: none; }
+}
+.divider { position: relative; z-index: 4; width: 1px; flex: 0 0 1px; background: var(--border); cursor: col-resize; }
+/* 命中区加宽到 7px：1px 视觉线几乎抓不到（SFTP 分栏与 Docker 面板拖宽共用）。 */
+.divider::after { content: ""; position: absolute; top: 0; bottom: 0; left: -3px; right: -3px; }
+.divider:hover { background: color-mix(in srgb, var(--foreground) 38%, var(--border)); }
+.sftp-pane { position: relative; z-index: 0; flex: 1; overflow: hidden; }
+/* Docker 浮层（鲸鱼按钮开合，metrics-float 同款）：挂终端面板内右上角，
+   出现即自右缘向左覆盖终端一角，不占分栏、永不遮挡 SFTP 面板；z=6 与
+   指标/录制浮条同族（同开时按 DOM 序后挂者置顶）。宽度沿用旧停靠面板的
+   口径：容器表 5 列 + 7 个操作按钮自然宽约 670px，给 min(680px, 100%-16px)，
+   更窄由 .docker-panel 自身 overflow:auto 横向滚动。 */
+.docker-float { position: absolute; z-index: 6; top: 8px; right: 8px; display: flex; width: min(680px, calc(100% - 16px)); max-height: calc(100% - 16px); flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--popover); box-shadow: var(--shadow-popover); }
+.docker-float > header { display: flex; min-height: 34px; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); padding: 3px 4px 3px 12px; }
+.docker-float h2 { margin: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 12px; font-weight: 600; }
+.docker-float > .docker-panel { flex: 1 1 auto; min-height: 0; }
+/* 左缘拖拽手柄（issue #170）：骑在左缘上的 7px 竖条，向左拖 = 变宽
+   （纯计算 lib/dockerPanelWidth，300..720 钳制 + pluginStore 持久化）。
+   命中区左右各外扩 3px，落在浮层圆角外不遮挡内容；拖拽中光标全程列向。 */
+.docker-float-resize { position: absolute; z-index: 7; top: 0; bottom: 0; left: -3px; width: 7px; cursor: col-resize; touch-action: none; }
+.docker-float-resize:hover, .docker-float.resize-active .docker-float-resize { background: color-mix(in srgb, var(--primary) 35%, transparent); }
+.sftp-pane.drag-active { background: color-mix(in srgb, var(--primary) 4%, var(--background)); }
+
+/* SFTP 面板主体：左侧 tree/quick 双 tab 侧栏（可收起为窄条）+ 右侧文件区。
+   配色沿用现有 CSS 变量（对标 files 插件 wb-side-* 样式族）。 */
+.sftp-body { display: flex; min-height: 0; flex: 1; }
+.sftp-main { position: relative; display: flex; min-width: 0; min-height: 0; flex: 1; flex-direction: column; }
+
+.sftp-side-panel { display: flex; flex: 0 0 148px; min-height: 0; flex-direction: column; border-right: 1px solid var(--border); background: color-mix(in srgb, var(--muted) 28%, var(--background)); }
+/* tab 头行（reka Tabs 根）：unlayered 规则压过 wrapper 的 Tailwind 分层工具类
+   （data-horizontal:flex-col / flex-1 / h-8 / bg-muted / data-active:shadow-sm 等）。 */
+.sftp-side-tabs { display: flex; flex-direction: row; align-items: center; gap: 2px; border-bottom: 1px solid var(--border); padding: 4px 5px; }
+.sftp-side-tab-list { display: flex; align-items: center; gap: 2px; height: auto; padding: 0; background: transparent; }
+.sftp-side-tabs button { display: inline-flex; flex: 0 0 22px; align-items: center; justify-content: center; width: 22px; height: 22px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; color: var(--muted-foreground); padding: 0; box-shadow: none; }
+.sftp-side-tabs button svg { width: 13px; height: 13px; }
+.sftp-side-tabs button:hover { background: var(--accent); color: var(--foreground); }
+.sftp-side-tabs button[data-state="active"] { background: var(--accent); color: var(--primary); box-shadow: none; }
+.sftp-side-spacer { flex: 1 1 auto; }
+.sftp-side-body { flex: 1 1 auto; overflow: auto; overflow-x: hidden; padding: 4px 3px; }
+.sftp-side-quick { display: flex; flex-direction: column; gap: 1px; }
+.sftp-side-quick button { display: flex; min-width: 0; align-items: center; gap: 7px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; padding: 5px 6px; color: var(--foreground); font-size: 12px; text-align: left; white-space: nowrap; }
+.sftp-side-quick button svg { width: 14px; height: 14px; flex: 0 0 14px; color: var(--muted-foreground); stroke-width: 1.7; }
+.sftp-side-quick button span { overflow: hidden; text-overflow: ellipsis; }
+.sftp-side-quick button:hover { background: var(--accent); }
+.sftp-side-quick button.is-current { background: var(--accent); }
+.sftp-side-quick button.is-current svg { color: var(--primary); }
+
+.sftp-tree-row { display: flex; align-items: center; gap: 2px; width: 100%; height: 24px; padding-right: 4px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; color: var(--foreground); font-size: 12px; white-space: nowrap; text-align: left; }
+.sftp-tree-row:hover { background: var(--accent); }
+.sftp-tree-row.is-current { background: var(--accent); }
+.sftp-tree-row.is-current .sftp-tree-name { color: var(--primary); font-weight: 600; }
+.sftp-tree-caret { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 14px; width: 14px; height: 14px; border: 0; border-radius: 3px; background: transparent; cursor: pointer; color: var(--muted-foreground); padding: 0; }
+.sftp-tree-caret svg { width: 11px; height: 11px; }
+.sftp-tree-caret:hover { background: color-mix(in srgb, var(--muted-foreground) 20%, transparent); color: var(--foreground); }
+.sftp-tree-row > svg.sftp-tree-dir-icon { width: 13px; height: 13px; flex: 0 0 13px; color: var(--muted-foreground); }
+.sftp-tree-name { overflow: hidden; text-overflow: ellipsis; }
+.sftp-tree-spinner { width: 9px; height: 9px; border: 1.5px solid var(--muted-foreground); border-top-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; }
+
+.sftp-side-rail { display: flex; flex-direction: column; align-items: center; flex: 0 0 26px; padding-top: 6px; border-right: 1px solid var(--border); background: color-mix(in srgb, var(--muted) 28%, var(--background)); }
+.sftp-side-rail button { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; color: var(--muted-foreground); padding: 0; }
+.sftp-side-rail button svg { width: 13px; height: 13px; }
+.sftp-side-rail button:hover { background: var(--accent); color: var(--foreground); }
+
+/* 窄面板（SFTP 置左 + 小窗口）下工具栏折行到第二行，按钮不再溢出压到终端；
+   不用 overflow-x 滚动：折行即可容纳全部按钮（弹层已 portal 到 body，
+   不再有滚动容器裁切问题，但折行布局本身仍是更稳的窄面板形态）。 */
+.path-toolbar { display: flex; height: auto; min-height: 38px; flex-wrap: wrap; align-items: center; gap: 4px; border-bottom: 1px solid var(--border); padding: 3px 7px; }
+.path-toolbar .sudo-label { margin-left: 2px; }
+/* 容器查询按面板宽度（而非视口）整理窄面板布局：图标按 DOM 序自然折行，
+   路径输入框独占一行沉底，sudo 开关隐去文字只留开关——行列对齐不零散。 */
+.sftp-pane { container-type: inline-size; }
+@container (max-width: 520px) {
+  .path-toolbar { row-gap: 3px; }
+  /* 同名旧规则 .path-toolbar .path-bar（flex:1; min-width:110px）特异性相同且位置
+     靠后，这里用 .sftp-pane 前缀压过它，否则路径框不会独占一行。 */
+  .sftp-pane .path-toolbar > .path-bar { flex: 1 0 100%; min-width: 0; order: 99; }
+  .path-toolbar .sudo-label > span:last-child { display: none; }
+  .path-toolbar .sudo-label { margin-left: 0; }
+}
+.path-toolbar input, .modal input, .modal textarea,
+.popover textarea {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  outline: none;
+  background: color-mix(in srgb, var(--background) 95%, var(--foreground));
+  color: var(--foreground);
+}
+.path-toolbar input { height: 26px; flex: 1; min-width: 110px; font-family: var(--terminal-font-family); }
+/* 路径栏分段回跳（issue #54）：.path-bar 与原输入框同位同尺寸（flex:1、26px 高），
+   非编辑态渲染 path-crumbs（外观对齐 path-toolbar input 的描边/底色），编辑态
+   仍是原先的输入框；分段悬停反馈对齐 path-item（accent 底），末段为当前位置
+   不可点。超长路径按段内省略，不撑破工具栏；窄面板折行见上方 @container。 */
+.path-bar { display: flex; flex: 1; height: 26px; min-width: 110px; }
+.path-crumbs { display: flex; flex: 1; min-width: 0; overflow: hidden; align-items: center; gap: 2px; padding: 0 3px; border: 1px solid var(--border); border-radius: var(--radius); background: color-mix(in srgb, var(--background) 95%, var(--foreground)); cursor: text; }
+.path-crumbs:focus-visible { outline: 1px solid var(--primary); outline-offset: -1px; }
+.path-crumb { flex: 0 1 auto; min-width: 0; height: 100%; overflow: hidden; border: 0; border-radius: 3px; padding: 0 3px; background: transparent; color: var(--foreground); font-size: 12px; line-height: 24px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.path-crumb:hover { background: var(--accent); }
+.path-crumb.current { cursor: default; }
+.path-crumb-sep { flex: none; color: var(--muted-foreground); font-size: 11px; user-select: none; }
+/* 原生 select 已全部迁到 reka Select（触发钮外观由 wrapper 工具类负责）；
+   焦点描边由全局 button:focus-visible 规则覆盖触发钮。 */
+.path-toolbar input:focus, .modal input:focus, .modal textarea:focus,
+.popover textarea:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
+
+.file-table { display: flex; min-height: 0; flex: 1; flex-direction: column; }
+.file-header, .file-row { display: grid; min-width: 100%; align-items: center; column-gap: 6px; padding: 0 8px; }
+.file-header { position: sticky; top: 0; z-index: 3; height: 28px; min-height: 28px; border-bottom: 1px solid var(--border); background: var(--background); box-shadow: 0 1px 2px color-mix(in srgb, var(--foreground) 8%, transparent); color: var(--muted-foreground); font-size: 11px; user-select: none; }
+.file-header button { display: flex; min-width: 0; height: 22px; align-items: center; justify-content: space-between; gap: 4px; border-radius: 3px; padding: 0 3px; text-align: left; color: inherit; }
+.file-header button:nth-child(n + 2) { justify-content: flex-end; }
+.file-header span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-rows { min-height: 0; flex: 1; overflow: auto; }
+/* 文件列表是全局"隐藏滚动条"规则（*::-webkit-scrollbar{display:none}）的例外：
+   6 列超宽时需要常驻横向滚动条，否则用户不知道后面还有列。 */
+.file-rows { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--foreground) 25%, transparent) transparent; }
+.file-rows::-webkit-scrollbar { display: block; height: 10px; width: 10px; }
+.file-rows::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--foreground) 25%, transparent); border-radius: 5px; }
+.file-rows::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--foreground) 40%, transparent); }
+.file-rows::-webkit-scrollbar-track { background: transparent; }
+.file-row { width: 100%; height: 30px; border: 0; border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent); border-radius: 0; background: transparent; text-align: left; color: var(--foreground); font-size: 12px; cursor: default; }
+.file-row:hover { background: color-mix(in srgb, var(--accent) 65%, transparent); }
+.file-row.selected, .file-row.selected:hover { background: var(--accent); color: var(--accent-foreground); }
+.file-row > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-name { gap: 7px; }
+.file-name > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* gb18030 最小方案：不可解码文件名警示标记（U+FFFD 条目），不占格子只贴名后。 */
+.sftp-lossy-icon { flex: none; width: 13px; height: 13px; color: var(--destructive, #d93025); }
+.folder-icon { color: var(--warning); fill: color-mix(in srgb, var(--warning) 16%, transparent); }
+.rename-input { width: 100%; min-width: 60px; height: 22px; border: 1px solid var(--primary); border-radius: var(--radius); padding: 1px 5px; background: var(--background); color: var(--foreground); }
+.file-footer { height: 26px; min-height: 26px; justify-content: space-between; gap: 16px; border-top: 1px solid var(--border); padding: 0 8px; color: var(--muted-foreground); font-size: 11px; }
+/* 窄面板下三段信息（条目数/磁盘余量/当前路径）一律单行：余量与路径可收缩
+   省略（完整值走 title），条目数固定不缩，避免换行把 26px 页脚挤错位。 */
+.file-footer span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-footer span:first-child { flex: 0 0 auto; }
+.file-footer span:nth-child(2) { color: var(--muted-foreground); }
+.file-footer span:last-child { font-family: var(--terminal-font-family); }
+.empty { display: flex; min-height: 120px; align-items: center; justify-content: center; gap: 8px; padding: 16px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
+.empty.compact { min-height: 42px; padding: 8px; }
+
+.drop-overlay { position: absolute; z-index: 12; inset: 4px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; border: 2px dashed var(--primary); border-radius: var(--radius); background: color-mix(in srgb, var(--primary) 11%, var(--background)); color: var(--foreground); pointer-events: none; }
+.drop-overlay svg { width: 28px; height: 28px; }
+
+/* 工具栏 popover 已迁移 reka Popover：内容 portal 到 body、floating-ui 定位 +
+   碰撞翻转，基础壳（背景/边框/阴影/圆角）由 wrapper 工具类提供；此处只保留
+   各弹层的尺寸与内部布局。`.popover` 类保留为后代选择器钩子（无基础规则）。 */
+.columns-popover { display: flex; width: 220px; flex-direction: column; gap: 1px; padding: 8px; }
+/* 以下五个弹层根规则原在 App.vue scoped：portal 后内容根不带 scopeId，必须全局。
+   gap:0 的三者旧为块级/无间距布局，抵消 wrapper 的 gap-2.5。 */
+.quick-commands-popover { display: flex; width: min(360px, calc(100vw - 24px)); max-height: min(480px, calc(100vh - 60px)); flex-direction: column; gap: 4px; padding: 8px; overflow: auto; }
+.connection-info-popover { gap: 0; width: min(300px, calc(100vw - 24px)); padding: 8px 12px 12px; }
+.agent-mode-popover { gap: 0; width: min(280px, calc(100vw - 24px)); padding: 8px 12px 12px; }
+.bookmark-save-popover { display: flex; width: 250px; flex-direction: column; gap: 6px; padding: 8px; }
+.path-history-popover { display: flex; gap: 0; width: 250px; max-height: min(320px, 50vh); flex-direction: column; padding: 8px; overflow: auto; }
+.columns-popover label { display: flex; height: 28px; align-items: center; gap: 8px; border-radius: 4px; padding: 0 7px; cursor: pointer; }
+.columns-popover label:hover { background: var(--accent); }
+.columns-popover-separator { width: 100%; height: 1px; margin: 4px 0; border: 0; background: var(--border); }
+/* 旧 z60 是为了在工具栏层叠上下文里压过 xterm 装饰层；portal 后由 wrapper
+   z-50 统一参与根级排序，与右键菜单同档（菜单后挂载 DOM 序靠后自然盖住）。 */
+.transfer-popover { gap: 0; width: min(340px, calc(100vw - 24px)); max-height: min(520px, calc(100vh - 52px)); padding: 8px; overflow: auto; }
+.transfer-popover h3 { margin: 2px 4px 8px; font-size: 12px; }
+/* Docker 工具条弹层（鲸鱼入口）：容器表需要比侧栏宽的横向空间，关闭即卸载。 */
+.transfer-card { display: grid; grid-template: "title actions" auto "progress progress" auto "meta meta" auto "path path" auto "error error" auto / minmax(0, 1fr) auto; position: relative; column-gap: 6px; row-gap: 4px; border-top: 1px solid var(--border); padding: 7px 4px; }
+.transfer-title { grid-area: title; min-width: 0; gap: 6px; }
+.transfer-title span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-title strong { font-size: 11px; font-variant-numeric: tabular-nums; }
+/* 压缩传输徽标（M33）：窄胶囊，弱化色，不打断标题行省略。 */
+.transfer-badge { flex: 0 0 auto !important; border: 1px solid var(--border); border-radius: 999px; padding: 0 5px; color: var(--muted-foreground); font-size: 9px; line-height: 14px; }
+.transfer-card progress { grid-area: progress; width: 100%; height: 4px; border: 0; accent-color: var(--primary); }
+.transfer-meta { grid-area: meta; min-width: 0; gap: 7px; overflow: hidden; color: var(--muted-foreground); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.transfer-meta span { overflow: hidden; text-overflow: ellipsis; }
+.transfer-meta span + span::before { content: "·"; margin-right: 7px; color: var(--border); }
+.transfer-path { grid-area: path; min-width: 0; margin: 0; color: var(--muted-foreground); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+.transfer-actions { grid-area: actions; display: flex; align-self: start; justify-content: flex-end; gap: 3px; }
+.transfer-actions .icon-button { width: 24px; height: 24px; min-width: 24px; padding: 3px; }
+.transfer-card .task-error { grid-area: error; }
+.link-button { align-self: flex-end; padding: 2px 0; color: var(--primary); font-size: 11px; }
+.task-error { margin: 0; color: var(--destructive); font-size: 10px; overflow-wrap: anywhere; }
+.activity-dot { position: absolute; top: 4px; right: 3px; width: 5px; height: 5px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 0 1px var(--background); }
+
+/* reka 右键菜单紧凑化：对齐旧 .context-menu 视觉（unlayered 覆盖 layered 工具类；
+   z-index 走 wrapper 的 z-50，落在弹层阶梯 context-menu(50) 一档）。 */
+[data-slot="context-menu-content"] { min-width: 160px; max-width: 280px; }
+[data-slot="context-menu-item"] { min-height: 29px; padding-top: 0; padding-bottom: 0; }
+[data-slot="context-menu-item"] svg { width: 14px; height: 14px; flex: 0 0 14px; }
+
+.zmodem-status { position: absolute; z-index: 3; right: 8px; bottom: 8px; left: 8px; display: flex; align-items: center; gap: 7px; border: 1px solid color-mix(in srgb, var(--primary) 40%, var(--border)); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 92%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); color: var(--foreground); font-size: 11px; pointer-events: none; }
+.zmodem-status svg { width: 14px; height: 14px; flex: 0 0 14px; }
+.zmodem-status span:first-of-type { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* trzsz overlay reuses the zmodem status card shell and adds transfer-card
+   style progress/state affordances: a thin progress bar, file counter, speed
+   and a working cancel button (the shell itself keeps pointer-events: none). */
+.trzsz-status { flex-wrap: wrap; }
+.trzsz-status.trzsz-done { border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.trzsz-status.trzsz-failed { border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); color: var(--destructive); }
+.trzsz-status .trzsz-label { min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trzsz-status progress { flex: 0 0 90px; height: 4px; border: 0; accent-color: var(--primary); }
+.trzsz-status .trzsz-count { flex: 0 0 auto; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.trzsz-status .trzsz-speed { flex: 0 0 auto; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.trzsz-status .trzsz-cancel { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 4px; padding: 0; color: var(--muted-foreground); pointer-events: auto; }
+.trzsz-status .trzsz-cancel:hover { background: var(--accent); color: var(--foreground); }
+.trzsz-status .trzsz-cancel svg { width: 12px; height: 12px; flex: 0 0 12px; }
+/* 传输期间（trz/zmodem，issue #171）显式钉住系统鼠标指针：WKWebView 在原生
+   文件对话框往返后可能残留隐藏/错形光标（指针"看不见"，用户没法点取消）。
+   显式声明压过 .xterm 的 cursor:text 等继承/残留态；类切换本身会触发命中
+   重算，指针随之恢复可见，传输结束回落常规文本 I 形光标。 */
+.terminal-pane.transfer-busy, .terminal-pane.transfer-busy .terminal-host, .terminal-pane.transfer-busy .xterm { cursor: default; }
+/* Auto-reconnect banner pinned inside the terminal pane (top edge): keeps the
+   frozen terminal content visible below while countdown + progress + a manual
+   "reconnect now" action stay in view. */
+.reconnect-banner { position: absolute; z-index: 4; top: 8px; left: 8px; right: 8px; display: flex; align-items: center; gap: 7px; border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border)); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 92%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); color: var(--warning); font-size: 11px; }
+.reconnect-banner svg { width: 14px; height: 14px; flex: 0 0 14px; }
+.reconnect-banner .reconnect-text { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.reconnect-banner .reconnect-countdown { flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.reconnect-banner .reconnect-attempt { flex: 0 0 auto; opacity: 0.75; }
+.reconnect-banner progress { flex: 0 0 64px; height: 6px; accent-color: var(--warning); }
+.reconnect-banner .reconnect-now { flex: 0 0 auto; height: 24px; border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border)); border-radius: var(--radius); padding: 0 8px; background: transparent; color: var(--warning); font-size: 11px; cursor: pointer; }
+.reconnect-banner .reconnect-now:hover { background: color-mix(in srgb, var(--warning) 14%, transparent); }
+
+.modal { position: relative; display: flex; width: min(560px, 100%); max-height: calc(100vh - 32px); flex-direction: column; gap: 16px; border: 1px solid var(--border); border-radius: var(--radius-lg, 8px); padding: 16px; background: var(--popover); color: var(--foreground); box-shadow: var(--shadow-modal); }
+.modal header { min-height: 24px; justify-content: space-between; gap: 12px; padding: 0; }
+.modal header > .icon-button { position: absolute; top: 8px; right: 8px; }
+.modal h2 { min-width: 0; margin: 0; padding-right: 24px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 600; }
+.modal > p, .modal > dl, .modal > label, .modal > input { margin-right: 0; margin-left: 0; }
+.modal > p { line-height: 1.55; }
+.modal footer { min-height: 56px; justify-content: flex-end; gap: 8px; margin: 0 -16px -16px; border-top: 1px solid var(--border); border-radius: 0 0 var(--radius-lg, 8px) var(--radius-lg, 8px); padding: 12px 16px; background: color-mix(in srgb, var(--muted) 50%, transparent); }
+.modal footer button, .primary-button, .danger-button { display: inline-flex; min-height: 28px; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px 11px; background: var(--background); }
+/* footer 按钮里的图标（删除确认的 Trash2 等）必须显式定尺寸——lucide 默认
+   24px，不定尺寸会把按钮撑得又高又粗。 */
+.modal footer button svg, .primary-button svg, .danger-button svg { width: 14px; height: 14px; flex: 0 0 14px; }
+.modal footer button:hover, .primary-button:hover, .danger-button:hover { background: var(--accent); }
+.primary-button { border-color: color-mix(in srgb, var(--primary) 72%, var(--border)) !important; background: var(--primary) !important; color: var(--primary-foreground); cursor: pointer; }
+.danger-button { border-color: transparent !important; background: color-mix(in srgb, var(--destructive) 12%, transparent) !important; color: var(--destructive); cursor: pointer; }
+.danger-button:hover { background: color-mix(in srgb, var(--destructive) 20%, transparent) !important; }
+/* popover 内的动作按钮用紧凑档（24px），与快速命令编辑器对齐；
+   模态 footer 保持 28px 档不变。 */
+.popover .primary-button, .popover .danger-button { min-height: 24px; padding: 2px 8px; font-size: 11px; }
+.small-modal { width: min(420px, 100%); }
+.small-modal > input { margin-top: 16px; margin-bottom: 16px; }
+.destructive-copy { display: flex; min-width: 0; align-items: flex-start; gap: 12px; }
+.destructive-copy:not(:has(p)) { align-items: center; }
+.destructive-copy > div { min-width: 0; }
+.destructive-copy strong { display: block; overflow-wrap: anywhere; font-weight: 400; }
+.destructive-copy.warning strong { font-weight: 600; }
+.destructive-copy p { margin: 5px 0 0; line-height: 1.5; }
+.destructive-icon { display: grid; width: 32px; height: 32px; flex: 0 0 32px; place-items: center; border-radius: 999px; background: color-mix(in srgb, var(--destructive) 12%, transparent); color: var(--destructive); }
+.destructive-icon svg { width: 16px; height: 16px; }
+.preview-modal { width: min(760px, calc(100vw - 40px)); height: min(680px, calc(100vh - 40px)); }
+.preview-editor { min-height: 0; flex: 1; overflow: hidden; background: var(--ssh-terminal-background); }
+.host-key-modal { width: min(540px, 100%); }
+.host-key-modal dl { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 8px 12px; padding: 6px 0; }
+.host-key-modal dt { color: var(--muted-foreground); }
+.host-key-modal dd { min-width: 0; margin: 0; }
+.fingerprint { overflow-wrap: anywhere; font-family: var(--terminal-font-family); }
+.remember { display: flex; align-items: center; gap: 7px; padding-bottom: 14px; }
+
+.spinning { animation: spin 1s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 布局方向偏好（issue #187）的纵向覆盖类：与窄屏断点同形的堆叠规则，
+   但不依赖视口——「始终上下」在宽屏同样生效。终端恒在上（.panes--reversed
+   的 row-reverse 被压成 column，左右换位对纵向无意义）。
+   高度消费容器上的 --pane-split（issue #207，App.vue 由 splitRatio 写入），
+   拖拽/键盘微调即时生效；flex-basis:auto !important 压过横向同款内联
+   flexBasis。变量缺失（历史缓存/未绑定）回落 52%。 */
+.panes--vertical, .panes--vertical.panes--reversed { flex-direction: column; }
+.panes--vertical .terminal-pane { width: 100%; height: var(--pane-split, 52%); flex-basis: auto !important; flex-shrink: 0; }
+/* SFTP 面板 flex:1 撑满终端（--pane-split）与 1px 把手之外的余量，
+   min-height:0 防内容把面板撑出容器。 */
+.panes--vertical .sftp-pane { width: 100%; height: auto; flex: 1 1 auto; min-height: 0; }
+.panes--vertical .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
+.panes--vertical .divider::after { top: -3px; bottom: -3px; left: 0; right: 0; }
+.panes--vertical.panes--solo .terminal-pane { height: 100%; }
+
+@media (max-width: 900px) {
+  .follow-directory-control > span { display: none; }
+  /* 窄屏纵向仅是「自动」模式的缺省：强制左右（.panes--horizontal）不受断点
+     影响（issue #187），:not() 提一档特异性压过下面的列布局规则。高度消费
+     --pane-split（issue #207），与 .panes--vertical 同源同回落。 */
+  .panes:not(.panes--horizontal), .panes--reversed:not(.panes--horizontal) { flex-direction: column; }
+  .panes:not(.panes--horizontal) .terminal-pane { width: 100%; height: var(--pane-split, 52%); flex-basis: auto !important; flex-shrink: 0; }
+  .panes:not(.panes--horizontal) .sftp-pane { width: 100%; height: auto; flex: 1 1 auto; min-height: 0; }
+  .panes:not(.panes--horizontal) .divider { width: 100%; height: 1px; flex-basis: 1px; cursor: row-resize; }
+  /* 纵向布局把手命中区向下/上扩展。 */
+  .divider::after { top: -3px; bottom: -3px; left: 0; right: 0; }
+  /* SFTP 面板收起时终端占满整个工作台（含窄屏纵向布局）。 */
+  .panes--solo .terminal-pane { height: 100%; }
+}
+
+@media (max-width: 640px) {
+  /* 极窄屏：按钮不再收缩后整体宽度可能仍超出工具栏，隐藏低优先级的
+     「跟随终端目录」开关，保证其余按钮完整可点、不溢出。 */
+  .follow-directory-control { display: none; }
+}
+
+/* Quick sudo command dialog */
+.quick-sudo-control { display: inline-flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
+.command-modal { width: min(640px, 100%); }
+.command-modal > textarea { min-height: 96px; resize: vertical; font-family: var(--terminal-font-family); line-height: 1.45; }
+.command-output { display: flex; min-height: 96px; max-height: 40vh; overflow: auto; flex-direction: column; align-items: flex-start; gap: 8px; margin: 0; border: 1px solid var(--border); border-radius: 6px; padding: 12px; background: color-mix(in srgb, var(--muted) 45%, transparent); font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+.command-exit { color: var(--muted-foreground); font-size: 10px; }
+
+/* 批量发送命令条（Electerm quick-command bar 风格）：常驻贴终端底部，回车即发送。
+   命令条约 35px 高，宿主让位 42px 留出 7px 间隙；浮层偏移同步上移。 */
+.terminal-pane.batch-bar-open .terminal-host { inset: 0 0 42px 0; }
+/* 命令标记状态条可见时同样为 host 让位（FitAddon 经 ResizeObserver 自动
+   重排行数）——标记条从浮层改为贴底状态条，避免盖住最后一行提示符/命令
+   （真实反馈：光标停在底行时被 pill 挡住）。与批量条叠放时组合让位。 */
+.terminal-pane.marker-visible .terminal-host { inset: 0 0 24px 0; }
+.terminal-pane.batch-bar-open.marker-visible .terminal-host { inset: 0 0 66px 0; }
+.terminal-pane.batch-bar-open .terminal-command-marker,
+.terminal-pane.batch-bar-open .zmodem-status { bottom: 50px; }
+/* 命令标记状态条可见时，传输横幅上移避免叠压（终端同样装了 633 标记） */
+.terminal-pane.marker-visible .zmodem-status { bottom: 28px; }
+.terminal-pane.batch-bar-open.marker-visible .zmodem-status { bottom: 70px; }
+.batch-bar { position: absolute; z-index: 5; right: 0; bottom: 0; left: 0; display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding: 4px 8px; background: var(--background); }
+.batch-bar-targets { display: inline-flex; flex: 0 1 auto; min-width: 0; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; background: var(--background); color: var(--foreground); font-size: 11px; cursor: pointer; white-space: nowrap; }
+.batch-bar-targets:hover { background: color-mix(in srgb, var(--muted) 55%, transparent); }
+.batch-bar-targets span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.batch-bar-quick { flex: 0 1 170px; min-width: 0; }
+.batch-bar-input { flex: 1 1 auto; min-width: 60px; height: 26px; border: 1px solid var(--border); border-radius: 4px; padding: 0 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.batch-bar-input:focus { border-color: color-mix(in srgb, var(--primary) 70%, var(--border)); }
+.batch-bar .icon-button { flex: 0 0 auto; }
+.batch-bar-send { color: var(--success); }
+/* 底部条上的 popover 向上展开：定位由 reka side="top" 负责，这里只管尺寸布局。 */
+.batch-targets-popover { display: flex; width: min(380px, calc(100vw - 32px)); max-height: min(320px, 60vh); flex-direction: column; gap: 6px; overflow: auto; padding: 8px; }
+/* 快速命令弹层：与右上角面板同形态（搜索 + 可折叠分组 + 卡片），内部行样式
+   复用面板的 quick-search、quick-group 与 quick-card 全局类。 */
+.batch-quick-popover { display: flex; width: min(300px, calc(100vw - 32px)); max-height: min(320px, 60vh); flex-direction: column; gap: 2px; overflow: auto; padding: 8px; }
+.batch-quick-popover .quick-card { cursor: pointer; text-align: left; width: 100%; }
+.batch-quick-popover .quick-card:hover { background: color-mix(in srgb, var(--muted) 45%, transparent); }
+.batch-bar-status { position: absolute; z-index: 5; right: 8px; bottom: 48px; left: 8px; display: flex; align-items: flex-start; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: color-mix(in srgb, var(--background) 94%, transparent); box-shadow: 0 4px 14px color-mix(in srgb, #000 18%, transparent); font-size: 11px; }
+.batch-bar-status p { margin: 0; }
+.batch-bar-status .icon-button { flex: 0 0 auto; margin-left: auto; }
+.batch-send-hint { margin: 0; font-size: 11px; }
+.batch-target-actions { display: inline-flex; gap: 10px; }
+.batch-target-list { display: flex; max-height: 180px; overflow: auto; flex-direction: column; gap: 2px; }
+.batch-target-row { display: flex; align-items: center; gap: 8px; border-radius: 6px; padding: 3px 6px; font-size: 12px; cursor: pointer; }
+.batch-target-row:hover { background: color-mix(in srgb, var(--muted) 45%, transparent); }
+.batch-target-row.offline { opacity: 0.55; }
+.batch-target-row .mono { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.batch-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; font-size: 10px; color: var(--muted-foreground); }
+.batch-badge-warn { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, transparent); }
+.batch-result-list { display: flex; max-height: 96px; overflow: auto; flex-direction: column; gap: 2px; }
+.batch-result-row { font-size: 11px; color: var(--destructive); overflow-wrap: anywhere; }
+.quick-command-global-hint { margin: 0 4px 6px; font-size: 10px; color: var(--muted-foreground); }
+
+/* Server metrics floating card and permissions */
+/* 悬浮卡挂在终端面板内部右上角：只遮挡终端一角，永不遮挡 SFTP 面板。 */
+.metrics-float { position: absolute; z-index: 6; top: 8px; right: 8px; display: flex; width: min(448px, calc(100% - 16px)); max-height: calc(100% - 16px); flex-direction: column; overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--popover); box-shadow: var(--shadow-popover); }
+/* 高占用进程行（CPU≥50% / 内存≥30%）警示色强调，扫一眼就能定位大户。 */
+.proc-hot { color: var(--warning); font-weight: 600; }
+.metrics-float > header { display: flex; min-height: 34px; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 8px; border-bottom: 1px solid var(--border); padding: 3px 4px 3px 12px; }
+/* 头部三段（标题/发行版徽标/主机名）用 flex+gap 排版，不再文本堆叠；
+   主机名超长时省略号截断（完整值在 metrics-host 的 title）。 */
+.metrics-float h2 { display: flex; min-width: 0; margin: 0; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; font-size: 12px; font-weight: 600; }
+.metrics-float h2 .metrics-host { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.metrics-float-body { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; gap: 10px; overflow: auto; padding: 10px 12px; }
+.metrics-host { color: var(--muted-foreground); font-weight: 400; }
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+/* 三级信息层级（对齐现代监控面板观感）：大数字 22px/700 抓眼 → xs 标签 →
+   10px mono 副信息；卡片留白与圆角走令牌。 */
+.metric-card { display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; background: color-mix(in srgb, var(--muted) 40%, transparent); }
+.metric-card strong { font-size: 22px; font-weight: 700; letter-spacing: -0.01em; line-height: 1.2; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* 运行时长等长文本卡片独占整行，不在两列网格里被挤压折行。 */
+.metric-card--wide { grid-column: 1 / -1; }
+.metric-card > span { color: var(--foreground); font-size: 11px; font-weight: 500; }
+.metric-card small { color: var(--muted-foreground); font-family: var(--terminal-font-family); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.metrics-disks { display: flex; flex-direction: column; gap: 6px; margin: 0; }
+.disk-row { display: grid; grid-template-columns: minmax(70px, 130px) 1fr auto; align-items: center; gap: 10px; font-size: 11px; }
+/* 超长挂载点/网卡名不得外溢压到进度条与数值列：第一列截断省略，完整值走 title。 */
+.disk-row > .mono { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.disk-row progress { width: 100%; height: 8px; accent-color: var(--primary); }
+/* >=85% 磁盘占用转警示红；accent-color 是 progress 跨浏览器唯一可靠着色点
+   （::-webkit-progress-value/::-moz-progress-bar 各家不同名，规则要成对写）。 */
+.disk-row progress.disk-warn { accent-color: var(--destructive); }
+.metrics-hint { margin: 0; font-size: 10px; }
+/* 进程表复用全局 .file-header：在悬浮卡（popover 底色）内改用同底色，
+   避免 var(--background) 在卡片上显出一块色差；sticky + 阴影保留。 */
+.metrics-float .file-header { background: var(--popover); box-shadow: 0 1px 2px color-mix(in srgb, var(--foreground) 6%, transparent); }
+
+/* SSH settings dialog */
+.settings-modal { width: min(680px, 100%); height: min(620px, calc(100vh - 48px)); }
+/* overflow-y:auto 会让 overflow-x 也算成 auto，本元素因此成为水平裁剪盒；
+   .settings-layout 的 margin:0 -16px 若冲不出裁剪盒，左栏左边 16px 会被切掉
+   （选中药丸左角变直角、视觉贴边的根因）。负 margin 移到本层、用等量 padding
+   保持子内容原位：裁剪盒扩到 modal 边缘，layout 的负 margin 在盒内成立。 */
+.settings-body { display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 14px; overflow-y: auto; margin: 0 -16px; padding: 0 20px 0 16px; }
+/* 分类导航布局（对齐宿主设置页）：左栏分类 + 右栏内容；右栏滚动，左栏不滚。
+   弹窗高度固定，切分类时不再随内容多少跳动。 */
+.settings-nav-modal { height: min(600px, calc(100vh - 40px)); }
+.settings-layout { display: flex; min-height: 0; flex: 1 1 auto; margin: 0 -16px; border-top: 1px solid var(--border); }
+/* 左栏水平留白对齐宿主设置侧栏：药丸距内容边缘 12px（.settings-layout 负 margin
+   把左栏拉到弹窗 padding 边缘，这里 8px 会让选中药丸视觉贴边）。 */
+.settings-nav { display: flex; flex: 0 0 168px; flex-direction: column; gap: 1px; overflow-y: auto; border-right: 1px solid var(--border); padding: 8px 12px; }
+/* reka Tabs 包装：unlayered 规则压过 wrapper 分层工具类；.modal 按钮复位选择器
+   已排除 data-slot="tabs-trigger"（:not 按参数计特异性，复位实际是 (0,3,1)，
+   不排除会压过本组 (0,3,0) 规则、把背景抹成透明）。 */
+.settings-nav-tabs { width: 100%; }
+.settings-nav-list { display: flex; flex-direction: column; gap: 1px; width: 100%; height: auto; padding: 0; background: transparent; }
+.settings-nav .settings-nav-item { height: 28px; overflow: hidden; border: 0; border-radius: var(--radius); padding: 0 8px; background: transparent; color: var(--muted-foreground); font-size: 12px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; flex: 0 0 auto; justify-content: flex-start; box-shadow: none; }
+/* hover 不用 --accent：亮色（pearl）主题下它是 #f5f5f5，落在白底上等于没颜色；
+   改用前景色 8% 混合，明暗两态都可见。 */
+.settings-nav .settings-nav-item:hover { background: color-mix(in srgb, var(--foreground) 8%, transparent); }
+/* 选中态对齐宿主设置侧栏（截图「隧道维护」）：前景色实心药丸 + 反色文字，
+   暗色主题下令牌自动反转。active 优先于 hover。
+   选择器同时覆盖 data-state 与 data-active：reka 的 RovingFocusItem 会把
+   data-active="" 合并到 trigger 上，shadcn 包装类的 data-active:bg-background/
+   text-foreground（白底）只认这个属性，漏盖会出现选中项白底白字。 */
+.settings-nav .settings-nav-item[data-state="active"],
+.settings-nav .settings-nav-item[data-active],
+.settings-nav .settings-nav-item[data-state="active"]:hover,
+.settings-nav .settings-nav-item[data-active]:hover { background: var(--foreground); color: var(--background); font-weight: 500; }
+.settings-content { display: flex; min-width: 0; flex: 1 1 auto; flex-direction: column; gap: 14px; overflow-y: auto; padding: 12px 16px; }
+.settings-pane { display: flex; flex-direction: column; gap: 10px; }
+.settings-pane .settings-section-title:first-child { margin-top: 0; border-top: 0; padding-top: 0; }
+/* 窄弹窗：左栏变顶部横向分类条。 */
+@media (max-width: 560px) {
+  .settings-layout { flex-direction: column; }
+  .settings-nav { flex: 0 0 auto; border-right: 0; border-bottom: 1px solid var(--border); }
+  .settings-nav-list { flex-direction: row; }
+  .settings-nav .settings-nav-item { flex: 0 0 auto; }
+}
+.settings-field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--muted-foreground); }
+/* 开关行恢复横向布局：.settings-field 的 column 会让开关与文字掉到两行，
+   行内 flex 保持"开关 + 标签"同行（WebGL / 下载目录开关）。 */
+.settings-switch-row { flex-direction: row; align-items: center; gap: 8px; }
+.settings-radio-row { flex-direction: row; align-items: center; gap: 8px; }
+.settings-radio-row input { margin: 0; }
+.settings-field input, .settings-field textarea { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+/* 设置表单里的 reka Select：触发钮吃满整行（原生 select 的 stretch 语义）。 */
+.settings-field [data-slot="select-trigger"] { width: 100%; min-width: 0; }
+/* 目录输入 + 浏览按钮同行：输入框吃满剩余宽度，图标按钮与输入框等高。 */
+.settings-dir-row { display: flex; align-items: center; gap: 6px; }
+.settings-dir-row input { min-width: 0; flex: 1 1 auto; }
+.browse-button { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); cursor: pointer; }
+.browse-button:hover { background: var(--accent); }
+.browse-button svg { width: 16px; height: 16px; flex: 0 0 16px; }
+
+/* ---- 应用内目录选择器（local/fs/browse，沙箱 iframe 无原生目录选择 API）---- */
+.folder-picker-modal { width: min(520px, 100%); height: min(460px, calc(100vh - 64px)); gap: 10px; }
+.folder-picker-path input { width: 100%; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.folder-picker-list { display: flex; min-height: 0; flex: 1 1 auto; flex-direction: column; gap: 1px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; }
+.folder-picker-row { display: flex; align-items: center; gap: 8px; border: 0; border-radius: var(--radius); padding: 6px 8px; background: transparent; color: var(--foreground); font-size: 12px; text-align: left; cursor: pointer; }
+.folder-picker-row:hover { background: var(--accent); }
+.folder-picker-row svg { width: 14px; height: 14px; flex: 0 0 14px; color: var(--primary); }
+.folder-picker-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.folder-picker-hint { display: flex; align-items: center; gap: 6px; margin: 0; padding: 8px; color: var(--muted-foreground); font-size: 11px; }
+.folder-picker-hint svg { width: 12px; height: 12px; }
+.folder-picker-current { min-width: 0; flex: 1 1 auto; overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.settings-field textarea { resize: vertical; font-family: var(--terminal-font-family); }
+.settings-note { margin: 0; font-size: 10px; }
+.settings-section-title { margin: 6px 0 0; border-top: 1px solid var(--border); padding-top: 12px; font-size: 12px; }
+.settings-list { display: flex; margin: 0; flex-direction: column; border: 1px solid var(--border); border-radius: 6px; padding: 0; list-style: none; }
+.settings-list li { display: flex; align-items: center; gap: 8px; border-bottom: 1px solid color-mix(in srgb, var(--border) 45%, transparent); padding: 6px 8px; font-size: 11px; }
+.settings-list li:last-child { border-bottom: 0; }
+.settings-list-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.settings-list-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; font-size: 12px; }
+.settings-list-main span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.settings-key-icon { width: 14px; height: 14px; flex: 0 0 14px; color: var(--muted-foreground); }
+/* 全局 quick sudo 配置：来源选择行、列表操作列、内联表单操作列。 */
+.credential-source-row { display: flex; flex: 1; align-items: center; gap: 8px; min-width: 0; }
+.credential-source-row .credential-source-select { flex: 1; min-width: 0; }
+/* 「管理全局配置」入口：裸文字链接放表单行里太像半成品，升级为紧凑描边按钮。 */
+.credential-source-row .link-button { flex: 0 0 auto; align-self: center; border: 1px solid var(--border); border-radius: var(--radius); padding: 3px 10px; background: var(--background); color: var(--foreground); font-size: 11px; white-space: nowrap; }
+.credential-source-row .link-button:hover { background: var(--accent); }
+.settings-list-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+.profiles-form-actions { display: flex; justify-content: flex-end; gap: 8px; margin: 4px 0 0; }
+/* 独立 profiles 弹窗：高度随内容（空态不再撑满 620px），宽度收窄，上限同设置弹窗。 */
+.profiles-modal { width: min(560px, 100%); height: auto; max-height: min(620px, calc(100vh - 48px)); }
+/* 工具行：左侧计数（muted 小字），右侧主按钮「新建配置」。 */
+.profiles-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.profiles-count { font-size: 11px; }
+.profiles-add { min-height: 26px; padding: 2px 10px; font-size: 11px; }
+/* 列表区保底高度：空态垂直居中不塌陷；有列表时随内容撑开。 */
+.profiles-content { display: flex; min-height: 240px; flex: 1 1 auto; flex-direction: column; }
+.profiles-empty { display: flex; flex: 1 1 auto; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--muted-foreground); font-size: 12px; text-align: center; }
+.profiles-empty svg { width: 28px; height: 28px; opacity: .55; }
+.profiles-empty p { margin: 0; }
+/* 行 hover 与录制记录列表同一视觉语言。 */
+.profiles-list li:hover { background: var(--accent); }
+.profiles-list li:first-child { border-radius: 5px 5px 0 0; }
+.profiles-list li:last-child { border-radius: 0 0 5px 5px; }
+.mcp-limits { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.mcp-limits input { width: 100%; }
+.settings-body .link-button { display: inline-flex; align-items: center; gap: 5px; }
+.settings-body .link-button svg { width: 12px; height: 12px; flex: 0 0 12px; }
+
+/* Preview editing */
+.preview-actions { display: flex; align-items: center; gap: 6px; margin-right: 30px; }
+.preview-actions button { display: inline-flex; min-height: 24px; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--border); border-radius: 4px; padding: 2px 9px; background: var(--background); color: var(--foreground); font-size: 11px; }
+.preview-actions button:hover:not(:disabled) { background: var(--accent); }
+.preview-actions svg { width: 13px; height: 13px; flex: 0 0 13px; }
+
+/* Unsaved-changes marker and binary badge in the preview header */
+.preview-dirty { display: inline-flex; align-items: center; gap: 5px; margin-left: 8px; border-radius: 999px; padding: 1px 7px; background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary); font-size: 10px; font-weight: 500; vertical-align: middle; }
+.preview-dirty-dot { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: currentColor; }
+.preview-truncated-badge { margin-left: 8px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px; color: var(--muted-foreground); font-size: 10px; font-weight: 500; vertical-align: middle; }
+
+/* Image preview: checkerboard backdrop that follows the active theme variables */
+.preview-image-stage { display: flex; min-height: 0; flex: 1; overflow: auto; border-radius: 4px; background: repeating-conic-gradient(color-mix(in srgb, var(--muted-foreground) 22%, var(--background)) 0% 25%, var(--background) 0% 50%) 0 0 / 20px 20px; }
+.preview-image { display: block; max-width: 100%; max-height: 100%; margin: auto; cursor: zoom-in; }
+.preview-image--full { max-width: none; max-height: none; cursor: zoom-out; }
+
+/* Session status pill in the toolbar identity area (connecting/connected/reconnecting/disconnected/error) */
+.session-pill { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--muted-foreground); font-size: 10px; font-weight: 500; white-space: nowrap; }
+.session-dot { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; background: var(--muted-foreground); }
+.session-pill.session-connected .session-dot { background: var(--success); }
+.session-pill.session-connecting .session-dot { background: var(--warning); }
+.session-pill.session-reconnecting { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.session-pill.session-reconnecting .session-dot { background: var(--warning); animation: session-dot-pulse 1s ease-in-out infinite; }
+@keyframes session-dot-pulse { 50% { opacity: 0.3; } }
+.session-pill .session-pill-countdown { flex: 0 0 auto; opacity: 0.85; font-variant-numeric: tabular-nums; }
+.session-pill.session-error { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
+.session-pill.session-error .session-dot { background: var(--destructive); }
+.session-pill.session-local { color: var(--violet-foreground, var(--foreground)); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.session-pill.session-local .session-dot { background: var(--primary); }
+
+/* 本地终端退出态覆盖层（VS Code 式：退出码 + 重开/关闭出口）。挂在
+   .terminal-overlay 内，复用其居中与背景。 */
+.local-exit-card { display: flex; align-items: center; flex-direction: column; gap: 10px; max-width: 420px; padding: 28px 32px; border: 1px solid var(--border); border-radius: var(--radius); background: color-mix(in srgb, var(--background) 96%, transparent); }
+.local-exit-card .local-exit-icon { width: 28px; height: 28px; color: var(--muted-foreground); }
+.local-exit-card strong { font-size: 14px; color: var(--foreground); }
+.local-exit-card .local-exit-code { font-size: 12px; }
+.local-exit-card .local-exit-actions { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.local-shell-chevron { margin-left: -6px; }
+.local-shell-popover { min-width: 300px; }
+/* shell 选项视图并入会话下拉后沿用原 local-shell-popover 的行布局。 */
+.session-menu-popover.session-menu-shell { min-width: 300px; }
+.session-menu-shell .local-shell-hint { margin: 0 0 8px; font-size: 11px; }
+.session-menu-shell .local-shell-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.session-menu-shell .local-shell-program { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; opacity: 0.75; }
+.session-menu-shell .local-shell-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; font-size: 9px; color: var(--muted-foreground); }
+.session-menu-shell .local-shell-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
+/* 本地 Shell 设置视图的启动目录/环境变量编辑器（localShellCwd/localShellEnv）。 */
+.session-menu-shell .local-shell-field { margin: 10px 0 0; }
+.session-menu-shell .local-shell-field-label { display: block; font-size: 11px; font-weight: 600; margin-bottom: 4px; }
+.session-menu-shell .local-shell-input { width: 100%; box-sizing: border-box; border: 1px solid var(--border); border-radius: var(--radius); background: var(--background); color: var(--foreground); padding: 4px 8px; font-size: 11px; }
+.session-menu-shell .local-shell-input:focus { outline: 1px solid var(--ring, var(--border)); }
+.session-menu-shell .local-shell-env-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.session-menu-shell .local-shell-env-row { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
+.session-menu-shell .local-shell-env-row .local-shell-input { flex: 1 1 40%; min-width: 0; }
+.local-shell-popover .local-shell-hint { margin: 0 0 8px; font-size: 11px; }
+.local-shell-popover .local-shell-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.local-shell-popover .local-shell-program { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; opacity: 0.75; }
+.local-shell-popover .local-shell-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 6px; font-size: 9px; color: var(--muted-foreground); }
+.local-shell-popover .local-shell-footer { display: flex; justify-content: flex-end; margin-top: 8px; }
+.local-rerun-command { display: inline-block; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.local-shell-footer .local-tab-button { display: inline-flex; align-items: center; justify-content: center; min-height: 28px; min-width: 32px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--background); margin-right: auto; }
+.local-shell-footer .local-tab-button:hover { background: var(--accent); }
+.local-shell-footer .local-tab-button svg { width: 14px; height: 14px; }
+
+/* BEL 视觉铃：程序输出 \x07 时终端面板边框短促脉冲（alert() 的终端惯例替代） */
+.terminal-pane.bell-flash { animation: terminal-bell-pulse 0.4s ease-out; }
+@keyframes terminal-bell-pulse {
+  0% { box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--warning, #e5a400) 70%, transparent); }
+  100% { box-shadow: inset 0 0 0 0 transparent; }
+}
+
+/* OSC 633 command marker strip at the bottom-left of the terminal pane; hidden
+   unless the remote shell integration emits 633 frames. The zmodem banner
+   (z-index 3) takes precedence when both would overlap. */
+.terminal-command-marker { position: absolute; z-index: 2; left: 0; right: 0; bottom: 0; display: inline-flex; align-items: center; gap: 6px; border-top: 1px solid var(--border); padding: 3px 10px 4px; background: var(--ssh-terminal-background); color: var(--muted-foreground); font-size: 10px; pointer-events: auto; cursor: default; min-width: 0; }
+.terminal-command-marker svg { width: 12px; height: 12px; flex: 0 0 12px; }
+
+/* #33/#71 快速输入丢失诊断浮层（Ctrl/Cmd+Shift+D 切换，双击关闭）：
+   与 command-marker 同侧但右上角，避免遮挡交互元素。 */
+.terminal-diag-overlay { position: absolute; z-index: 4; right: 8px; top: 8px; border: 1px solid var(--warning, var(--border)); border-radius: 6px; padding: 3px 8px; background: color-mix(in srgb, var(--background) 92%, transparent); color: var(--foreground); font-family: var(--mono-font, monospace); font-size: 10px; pointer-events: auto; cursor: default; user-select: none; }
+.terminal-command-marker .marker-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.terminal-command-marker .marker-elapsed { flex: 0 0 auto; opacity: 0.8; font-variant-numeric: tabular-nums; }
+.terminal-command-marker .marker-cwd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 40ch; opacity: 0.75; }
+.terminal-command-marker.active { color: var(--foreground); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.terminal-command-marker.failed { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
+
+/* AI 审批「记住此命令」勾选行 */
+.agent-prompt-remember { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--foreground); cursor: pointer; }
+.agent-prompt-remember input { accent-color: var(--primary); }
+
+/* 设置弹窗「已记住命令」列表 */
+.settings-remembered { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+.remembered-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-height: 140px; overflow-y: auto; }
+.remembered-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.remembered-line { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; }
+
+/* 设置弹窗「启动命令」编辑行（P0-4）：启用勾选 + 命令文本 + 延迟毫秒 + 排序/删除 */
+.startup-commands-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 200px; overflow-y: auto; }
+.startup-commands-list li { display: flex; align-items: center; gap: 6px; }
+.startup-commands-list li input[type="checkbox"] { accent-color: var(--primary); flex: 0 0 auto; }
+.startup-command-text { flex: 1 1 auto; min-width: 0; font-size: 11px; }
+.startup-command-delay { flex: 0 0 84px; width: 84px; font-size: 11px; }
+
+/* 告警排查弹窗 */
+.alert-triage-modal { width: min(560px, calc(100vw - 32px)); }
+.alert-triage-hint { margin: -6px 0 0; font-size: 11px; line-height: 1.5; }
+.alert-triage-payload { width: 100%; resize: vertical; font-size: 11px; line-height: 1.5; }
+.alert-triage-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
+.alert-triage-result { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+.alert-triage-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.alert-severity-badge { border-radius: 999px; padding: 2px 10px; font-size: 10px; font-weight: 600; border: 1px solid var(--border); color: var(--muted-foreground); }
+.alert-severity-badge.critical { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
+.alert-severity-badge.warning { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.alert-severity-badge.info { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.alert-category { font-size: 11px; font-weight: 600; }
+.alert-title { font-size: 12px; }
+.alert-message { margin: 0; font-size: 10px; max-height: 60px; overflow-y: auto; overflow-wrap: anywhere; }
+.alert-suggestion-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+.alert-suggestion-row { display: flex; align-items: center; gap: 8px; }
+.alert-suggestion-command { flex: 1 1 auto; font-size: 10px; padding: 3px 6px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alert-purpose { flex: 0 0 auto; font-size: 10px; }
+
+/* ---- 关键词高亮（IMPL_PLAN_NETCATTY_PARITY §3-B1）---- */
+/* 管理弹层：规则列表 + 新增表单（工具栏 Palette 按钮，紧邻快捷命令） */
+.highlight-rules-popover { width: 300px; display: flex; flex-direction: column; gap: 8px; padding: 8px; }
+.highlight-rules-popover h3 { margin: 0; font-size: 12px; }
+.highlight-rule-list { display: flex; flex-direction: column; gap: 8px; max-height: min(320px, calc(100vh - 260px)); overflow-y: auto; }
+.highlight-rule-row { display: flex; align-items: center; gap: 6px; }
+.highlight-color-dot { width: 10px; height: 10px; flex: 0 0 10px; border-radius: 3px; border: 1px solid rgb(255 255 255 / 22%); }
+.highlight-rule-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.highlight-rule-main .highlight-rule-pattern { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.highlight-rule-main .highlight-rule-pattern.disabled { opacity: 0.45; text-decoration: line-through; }
+.highlight-rule-badges { display: inline-flex; gap: 4px; font-size: 10px; color: var(--muted-foreground); }
+.highlight-rule-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; }
+.highlight-rule-actions .icon-button svg { width: 12px; height: 12px; }
+.highlight-editor { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 8px; }
+.highlight-editor .highlight-editor-inputs { display: flex; align-items: center; gap: 6px; }
+.highlight-editor .highlight-editor-inputs input[type="text"], .highlight-editor .highlight-editor-inputs input:not([type]) { flex: 1 1 auto; min-width: 0; }
+.highlight-editor label.highlight-editor-flag { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; color: var(--muted-foreground); cursor: pointer; white-space: nowrap; }
+.highlight-editor label.highlight-editor-flag input { accent-color: var(--primary); }
+/* 编辑器标志位 ToggleGroup（.* / Aa）：样式对齐终端搜索面板的开关组。 */
+.highlight-editor-flags { display: inline-flex; overflow: hidden; border: 1px solid var(--border); border-radius: 4px; }
+.highlight-editor-flag-item { min-width: 26px; height: 20px; padding: 0 6px; border: 0; background: transparent; color: var(--muted-foreground); font-family: var(--terminal-font-family); font-size: 10px; }
+.highlight-editor-flag-item + .highlight-editor-flag-item { border-left: 1px solid var(--border); }
+.highlight-editor-flag-item:hover { background: var(--accent); }
+.highlight-editor-flag-item[data-state="on"] { background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary); }
+.highlight-palette { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.highlight-palette-swatch { width: 18px; height: 18px; border-radius: 4px; border: 2px solid transparent; cursor: pointer; padding: 0; }
+.highlight-palette-swatch.selected { border-color: var(--foreground); }
+.highlight-editor input.highlight-hex-input { width: 90px; font-family: var(--terminal-font-family); font-size: 11px; }
+.highlight-editor-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.highlight-rule-limit { font-size: 10px; color: var(--muted-foreground); margin-right: auto; }
+.highlight-switch-control { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--muted-foreground); cursor: pointer; }
+.highlight-switch-control input { accent-color: var(--primary); }
+/* 显示方式（全局偏好）：背景色块 = 既有行为；字体颜色把规则色写进字形前景。
+   两者都在 GPU 渲染器下生效，故无降级提示样式。 */
+.highlight-display-mode { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-bottom: 8px; margin-bottom: 8px; border-bottom: 1px solid var(--border); }
+.highlight-display-mode-label { font-size: 11px; color: var(--muted-foreground); }
+.highlight-display-mode-group { display: inline-flex; overflow: hidden; border: 1px solid var(--border); border-radius: 4px; }
+.highlight-display-mode-item { height: 22px; padding: 0 10px; border: 0; background: transparent; color: var(--muted-foreground); font-size: 11px; white-space: nowrap; }
+.highlight-display-mode-item + .highlight-display-mode-item { border-left: 1px solid var(--border); }
+.highlight-display-mode-item:hover { background: var(--accent); }
+.highlight-display-mode-item[data-state="on"] { background: color-mix(in srgb, var(--primary) 16%, transparent); color: var(--primary); }
+
+/* ---- metrics sparkline + 发行版徽标（IMPL_PLAN_NETCATTY_PARITY §3-B2）---- */
+/* 网络区头部两枚 60×18 SVG 曲线（rx=primary / tx=success），零资产纯内联。
+   Processes 标题与 Manage 链接共用同款两端对齐，避免「(top CPU)Manage」挤行。 */
+.metrics-net-title, .metrics-proc-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.metrics-sparkline-group { display: inline-flex; align-items: center; gap: 6px; }
+.metrics-sparkline { display: block; }
+/* 发行版 monogram 徽标：圆角方块 + 首字母，纯 CSS，无图片/SVG 资产。 */
+.distro-badge { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; flex: 0 0 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 700; line-height: 1; vertical-align: middle; }
+.metrics-float .distro-badge { width: 18px; height: 18px; flex-basis: 18px; font-size: 11px; }
+
+/* ---- 审计日志（IMPL_PLAN_NETCATTY_PARITY §3-B4，独立弹窗）---- */
+.audit-modal { width: min(680px, 100%); height: min(560px, calc(100vh - 48px)); }
+.audit-toolbar { display: flex; align-items: center; gap: 8px; }
+.audit-toolbar .audit-kind-select { min-width: 150px; }
+.audit-toolbar .audit-actions { display: flex; gap: 4px; margin-left: auto; }
+.audit-empty { display: flex; flex: 1 1 auto; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--muted-foreground); font-size: 12px; }
+.audit-empty > svg { width: 28px; height: 28px; opacity: 0.5; }
+.audit-truncated { font-size: 10px; }
+/* 标准列表项（同录制记录）：行间单条发丝分隔线、行 hover 底色。 */
+.audit-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; overflow-y: auto; }
+.audit-row { display: flex; align-items: baseline; gap: 8px; border-radius: var(--radius); padding: 7px 8px; font-size: 12px; }
+.audit-row + .audit-row { border-top: 1px solid color-mix(in srgb, var(--border) 45%, transparent); }
+.audit-row:hover { background: var(--accent); }
+.audit-time { flex: 0 0 auto; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.audit-kind-badge { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; font-size: 10px; font-weight: 600; color: var(--muted-foreground); }
+.audit-kind-badge.k-exec { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.audit-kind-badge.k-agent-challenge { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.audit-kind-badge.k-terminal-auto_sudo { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.audit-kind-badge.k-mcp-tool, .audit-kind-badge.k-mcp-gate { color: var(--destructive); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); }
+.audit-connection { flex: 0 1 auto; max-width: 20ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-command { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.audit-output { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted-foreground); }
+.audit-outcome { flex: 0 0 auto; font-weight: 600; }
+.audit-outcome.error { color: var(--destructive); }
+.audit-outcome.ok { color: var(--success, var(--primary)); }
+.audit-gate { flex: 0 0 auto; color: var(--muted-foreground); }
+
+/* 端口映射管理弹窗（PortForwardDialog）：映射行 = 类型徽标 + 路由 + 状态 +
+   计数 + 停止；下方为添加表单（方向单选 + 监听/目标地址对）。 */
+.forwards-modal { width: min(760px, calc(100vw - 40px)); }
+.forwards-modal--manager { width: min(1040px, calc(100vw - 40px)); max-height: min(82vh, 780px); overflow: auto; }
+.tunnel-manager-root { overflow: auto; padding: 20px clamp(16px, 4vw, 48px); }
+.forwards-modal--standalone { width: min(1040px, 100%); max-height: none; min-height: 480px; margin: 0 auto; box-shadow: none; background: var(--background); }
+.forwards-modal--standalone .forwards-list { max-height: min(55vh, 560px); }
+.forwards-modal--standalone h1 { margin: 0; font-size: 16px; font-weight: 600; }
+.forward-profiles { display: flex; flex-direction: column; gap: 10px; border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+.forward-profiles header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.forward-profiles h2, .forward-section-title { margin: 0; font-size: 13px; font-weight: 600; }
+.forward-profiles .forwards-list { max-height: 240px; }
+.forward-profiles .forward-form-hint { white-space: pre-wrap; }
+.forward-kind--dynamic { color: var(--success, var(--primary)); border-color: color-mix(in srgb, var(--success, var(--primary)) 45%, var(--border)); }
+.forwards-body { display: flex; flex-direction: column; gap: 14px; min-height: 200px; }
+.forwards-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; max-height: 300px; overflow: auto; }
+.forward-row { display: flex; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; }
+.forward-kind { flex: 0 0 auto; border: 1px solid var(--border); border-radius: 999px; padding: 0 8px; font-size: 10px; color: var(--muted-foreground); }
+.forward-kind--remote { color: var(--warning, var(--foreground)); border-color: color-mix(in srgb, var(--warning, var(--border)) 45%, var(--border)); }
+.forward-kind--local { color: var(--primary); border-color: color-mix(in srgb, var(--primary) 45%, var(--border)); }
+.forward-route { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono-font, monospace); font-size: 12px; }
+.forward-state { flex: 0 0 auto; font-size: 11px; color: var(--muted-foreground); }
+.forward-state--active { color: var(--success, var(--primary)); }
+.forward-state--error { color: var(--destructive); }
+.forward-state--starting { color: var(--warning, var(--muted-foreground)); }
+.forward-stats { flex: 0 0 auto; font-size: 10px; color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.forward-stop { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; border: none; background: none; color: var(--muted-foreground); cursor: pointer; }
+.forward-stop:hover:not(:disabled) { color: var(--destructive); }
+.forward-stop:disabled { opacity: 0.5; cursor: default; }
+.forward-stop svg { width: 13px; height: 13px; }
+.forward-form { border-top: 1px solid var(--border); padding-top: 12px; display: flex; flex-direction: column; gap: 10px; }
+.forward-form[disabled] { opacity: 0.55; }
+.forward-form-row { display: flex; gap: 12px; flex-wrap: wrap; }
+.forward-form-kinds { gap: 16px; }
+.forward-kind-picker { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; cursor: pointer; }
+.forward-kind-picker input { margin: 0; }
+.forward-field { display: flex; flex-direction: column; gap: 4px; flex: 1 1 220px; font-size: 11px; color: var(--muted-foreground); }
+.forward-field-pair { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 6px; }
+.forward-form-hint { margin: 0; font-size: 11px; color: var(--muted-foreground); }
+.forward-form-error { margin: 0; font-size: 11px; color: var(--destructive); }
+.forward-form footer { display: flex; justify-content: flex-end; }
+
+/* ---------------------------------------------------------------------------
+   终端外观设置（对标 Tabby 的 Appearance）：主题快照列表、导入动作与色卡。
+   设置弹窗自身无 scoped 样式块（历史约定），新控件样式统一落在这里。
+   --------------------------------------------------------------------------- */
+/* issue #163：chip 不参与 flex 压缩（flex: 0 0 auto）——被压缩时内部文字
+   换行/溢出边框，视觉上与相邻 chip「裁切重叠」；超长主题名走省略号而不是
+   撑破换行，行高保持一致。 */
+.theme-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.theme-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  flex: 0 0 auto; max-width: 100%;
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 4px 8px; background: var(--background); color: var(--foreground);
+  font-size: 11px; cursor: pointer;
+}
+.theme-chip-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.theme-chip:hover { background: var(--accent); }
+.theme-chip.active { border-color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, var(--background)); }
+.theme-chip--dirty { cursor: default; border-style: dashed; color: var(--muted-foreground); }
+.theme-chip--dirty:hover { background: var(--background); }
+.theme-chip-icon { width: 11px; height: 11px; flex: 0 0 11px; color: var(--primary); }
+.theme-chip-delete { display: inline-flex; align-items: center; color: var(--muted-foreground); }
+.theme-chip-delete:hover { color: var(--destructive); }
+.theme-chip-delete svg { width: 11px; height: 11px; }
+/* issue #163：主题名称行统一区块间距（10px 与设置页其他行一致）；两个动作
+   按钮补 inline-flex 对齐（icon 与文字基线一致、换行后整组下移不与输入框
+   挤在一行），文字不折行避免按钮内两行。 */
+.theme-save-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.theme-save-row input { min-width: 0; flex: 1 1 160px; border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 8px; background: var(--background); color: var(--foreground); font-size: 12px; }
+.theme-save-row button { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.theme-save-row button svg { width: 12px; height: 12px; flex: 0 0 12px; }
+.appearance-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+/* 隐藏的原生文件选择器：外观导入与下载目录选择共用「按钮触发」的交互形态。 */
+.hidden-file-input { display: none; }
+/* 数值项两列排布：六项间距/字重排成三行，避免设置弹窗被拉成长条。 */
+.appearance-number-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 12px; }
+.scheme-mini-swatch { display: inline-flex; gap: 1px; }
+.scheme-mini-swatch i { display: block; width: 6px; height: 10px; border-radius: 1px; }

@@ -1,0 +1,10 @@
+schema_version = 1
+
+[backend]
+language = "rust"
+directory = "backend"
+binary = "net-iborshell"
+
+[package]
+include = ["assets", "ui"]
+

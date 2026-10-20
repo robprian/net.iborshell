@@ -1,0 +1,56 @@
+{
+  "name": "@robprian/net-iborshell-ui",
+  "private": true,
+  "version": "0.2.2",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "fig:sync": "node ../scripts/sync_fig_specs.mjs",
+    "fig:verify": "node ../scripts/verify_fig_specs.mjs",
+    "fig:test": "vitest run src/lib/completion"
+  },
+  "dependencies": {
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/language-data": "^6.5.2",
+    "@codemirror/state": "^6.7.5",
+    "@codemirror/view": "^6.43.12",
+    "@lezer/highlight": "^1.2.3",
+    "@lucide/vue": "1.17.0",
+    "@vueuse/core": "^14.4.0",
+    "@xterm/addon-fit": "0.12.0-beta.301",
+    "@xterm/addon-image": "0.10.0-beta.301",
+    "@xterm/addon-search": "0.17.0-beta.301",
+    "@xterm/addon-unicode11": "0.10.0-beta.301",
+    "@xterm/addon-web-links": "0.13.0-beta.301",
+    "@xterm/addon-webgl": "0.20.0-beta.300",
+    "@xterm/xterm": "6.1.0-beta.304",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "codemirror": "^6.0.2",
+    "reka-ui": "^2.10.4",
+    "shadcn-vue": "^2.8.2",
+    "tailwind-merge": "^3.7.0",
+    "trzsz": "^1.1.6",
+    "tw-animate-css": "^1.4.0",
+    "vue": "^3.5.43",
+    "zmodem.js": "^0.1.10"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-vue": "6.0.9",
+    "@vitest/coverage-v8": "5.0.1",
+    "@vue/test-utils": "^2.5.1",
+    "happy-dom": "^20.14.5",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~6.0.3",
+    "vite": "8.3.0",
+    "vitest": "^5.0.1",
+    "vue-tsc": "^3.3.11"
+  },
+  "optionalDependencies": {
+    "@rolldown/binding-win32-x64-msvc": "1.2.9"
+  },
+  "packageManager": "pnpm@11.24.0"
+}

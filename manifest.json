@@ -1,0 +1,3197 @@
+{
+  "$schema": "https://raw.githubusercontent.com/t8y2/dbx/main/plugins/manifest.schema.json",
+  "manifest_version": 1,
+  "id": "net.iborshell",
+  "name": "iBorShell",
+  "version": "1.0.0",
+  "publisher": "robprian",
+  "description": "iBorShell: a secure SSH terminal for DBX — interactive sessions, SFTP file transfer, multi-host exec, clone session and live server stats. Fork of jinpy's Terminal plugin.",
+  "source": "https://github.com/robprian/net.iborshell",
+  "homepage": "https://github.com/robprian/net.iborshell",
+  "icon": "assets/plugin.svg",
+  "engines": {
+    "dbx": ">=0.6.31",
+    "host_api": ">=1.0.0"
+  },
+  "permissions": [
+    "host.events",
+    "host.binary",
+    "host.filesystem",
+    "host.workbench",
+    "host.storage",
+    "host.clipboard:read",
+    "host.ai"
+  ],
+  "entrypoints": {
+    "backend": {
+      "transport": "stdio-framed",
+      "executable": "bin/net-iborshell"
+    },
+    "ui": {
+      "root": "ui",
+      "entry": "ui/index.html"
+    }
+  },
+  "contributions": [
+    {
+      "type": "connection-provider",
+      "id": "net.iborshell.connection",
+      "label": "SSH server",
+      "icon": "assets/plugin.svg",
+      "database_type": "ssh",
+      "description": "SSH, Telnet, or VNC connection with protocol-appropriate authentication. Experimental RDP stays disabled by default and is not available as a connection profile.",
+      "fields": [
+        {
+          "key": "display_name",
+          "label": "Connection name",
+          "type": "text",
+          "binding": "name",
+          "required": true,
+          "default": "SSH server"
+        },
+        {
+          "key": "protocol",
+          "label": "Protocol",
+          "type": "select",
+          "binding": "config",
+          "default": "ssh",
+          "options": [
+            {
+              "label": "SSH",
+              "value": "ssh"
+            },
+            {
+              "label": "Telnet",
+              "value": "telnet"
+            },
+            {
+              "label": "VNC",
+              "value": "vnc"
+            },
+            {
+              "label": "Serial",
+              "value": "serial"
+            },
+            {
+              "label": "RDP (experimental)",
+              "value": "rdp"
+            }
+          ],
+          "description": "Session protocol carried by this connection. Telnet, VNC and RDP connections open their own session view in the workbench (per-protocol options live there); serial connections talk to a local device and skip TCP host fields. RDP is experimental."
+        },
+        {
+          "key": "host",
+          "label": "Host",
+          "type": "text",
+          "binding": "host",
+          "required": true,
+          "default": "127.0.0.1",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh",
+              "telnet",
+              "vnc",
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "port",
+          "label": "Port",
+          "type": "number",
+          "binding": "port",
+          "required": true,
+          "default": 22,
+          "description": "TCP port, 1-65535. Defaults per protocol: SSH 22, Telnet 23, VNC 5900, RDP 3389.",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh",
+              "telnet",
+              "vnc",
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "username",
+          "label": "Username",
+          "type": "text",
+          "binding": "username",
+          "required": true,
+          "default": "root",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh",
+              "telnet",
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "authentication",
+          "label": "Authentication",
+          "type": "select",
+          "binding": "config",
+          "default": "password",
+          "options": [
+            {
+              "label": "Password",
+              "value": "password"
+            },
+            {
+              "label": "Private key",
+              "value": "private-key"
+            },
+            {
+              "label": "Private key, then password",
+              "value": "private-key-password"
+            },
+            {
+              "label": "SSH Agent",
+              "value": "agent"
+            },
+            {
+              "label": "Auto (try each in order)",
+              "value": "auto"
+            },
+            {
+              "label": "No authentication",
+              "value": "none"
+            }
+          ],
+          "description": "Choose how to sign in to the server: password, private key, SSH agent, none, or Auto (tries password, private key, interactive prompts and SSH agent in order until one works).",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh"
+            ]
+          }
+        },
+        {
+          "key": "password_source",
+          "label": "Password source",
+          "type": "select",
+          "binding": "config",
+          "default": "direct",
+          "options": [
+            {
+              "label": "Enter in this form",
+              "value": "direct"
+            },
+            {
+              "label": "Local command",
+              "value": "command"
+            }
+          ],
+          "description": "Where the login password comes from. \"Enter in this form\" requires the Password field; \"Local command\" requires Password command, which runs with your user privileges at connect time.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "password",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "password",
+          "label": "Password",
+          "type": "password",
+          "binding": "password",
+          "description": "Password for \"Password\", \"Private key, then password\" and \"Auto\", used when Password source is \"Enter in this form\". Switch Password source to \"Local command\" to fetch it with a local command instead. Auto tries each method in order, so this is one of its possible sources. Telnet, VNC and RDP connections use this password directly.",
+          "visible_when": {
+            "any_of": [
+              {
+                "all_of": [
+                  {
+                    "field": "protocol",
+                    "one_of": [
+                      "ssh"
+                    ]
+                  },
+                  {
+                    "field": "password_source",
+                    "one_of": [
+                      "direct"
+                    ]
+                  }
+                ]
+              },
+              {
+                "field": "protocol",
+                "one_of": [
+                  "telnet",
+                  "vnc",
+                  "rdp"
+                ]
+              }
+            ]
+          },
+          "required_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "password_source",
+                "one_of": [
+                  "direct"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "password_command",
+          "label": "Password command",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Local command to fetch the login password. stdout minus one final newline is used. Required when Password source is \"Local command\"; runs with your user privileges.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "password_source",
+                "one_of": [
+                  "command"
+                ]
+              }
+            ]
+          },
+          "required_when": {
+            "field": "password_source",
+            "one_of": [
+              "command"
+            ]
+          }
+        },
+        {
+          "key": "private_key_path",
+          "label": "Private key path",
+          "type": "text",
+          "binding": "config",
+          "picker": {
+            "kind": "file",
+            "content_field": "private_key"
+          },
+          "description": "Type the key path, or pick one: the suggestion list (desktop) and the file button both fill this field; in Web/Docker builds the file button uploads the key into Private key content below and clears this field. Path or content - at least one of the two.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "private-key",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "private_key_passphrase",
+          "label": "Private key passphrase",
+          "type": "password",
+          "binding": "secret",
+          "description": "Passphrase that unlocks the private key file; it is separate from the account password.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "private-key",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "private_key",
+          "label": "Private key content",
+          "type": "textarea",
+          "binding": "secret",
+          "required": false,
+          "description": "Paste the private key contents (OpenSSH, PEM, or PPK); in Web/Docker builds the file button above uploads them here. Non-empty content wins over the key path, is kept in the secret store and never displayed again; choosing a file above clears this field.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "private-key",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "agent_socket",
+          "label": "Agent socket",
+          "type": "text",
+          "binding": "config",
+          "description": "Optional SSH_AUTH_SOCK override. Leave empty for the environment default or Windows Pageant.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "agent",
+                  "auto"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "sudo_source",
+          "label": "Sudo credentials",
+          "type": "select",
+          "binding": "config",
+          "default": "custom",
+          "options": [
+            {
+              "value": "custom",
+              "label": "Custom (this connection)"
+            },
+            {
+              "value": "global",
+              "label": "Global Quick Sudo profile"
+            },
+            {
+              "value": "off",
+              "label": "Off"
+            }
+          ],
+          "description": "Choose where sudo credentials come from: keep it Off unless this host needs sudo, then pick Custom (this connection) or a shared global Quick Sudo profile. Ignored for read-only connections. Off disables sudo credential handling; the 2FA field below still serves login-time MFA.",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh"
+            ]
+          }
+        },
+        {
+          "key": "sudo_profile",
+          "label": "Quick Sudo profile",
+          "type": "text",
+          "binding": "config",
+          "options_action": "sudo/profiles/options",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "global"
+                ]
+              }
+            ]
+          },
+          "description": "Optional global Quick Sudo profile."
+        },
+        {
+          "key": "sudo_password",
+          "label": "Sudo password",
+          "type": "password",
+          "binding": "secret",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom"
+                ]
+              }
+            ]
+          },
+          "description": "Password for sudo; empty reuses the login password."
+        },
+        {
+          "key": "sudo_use_pty",
+          "label": "Request PTY for sudo",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom"
+                ]
+              }
+            ]
+          },
+          "description": "Request a TTY for sudo prompts."
+        },
+        {
+          "key": "sudo_whitelist",
+          "label": "Sudo allowlist",
+          "type": "textarea",
+          "binding": "config",
+          "default": "",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom",
+                  "global"
+                ]
+              }
+            ]
+          },
+          "description": "Optional sudo command allowlist, one entry per line. Empty allows all commands."
+        },
+        {
+          "key": "auth_flow_mode",
+          "label": "2FA",
+          "type": "select",
+          "binding": "config",
+          "default": "off",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom",
+                  "off"
+                ]
+              }
+            ]
+          },
+          "options": [
+            {
+              "value": "off",
+              "label": "Off (never auto-answer OTP)"
+            },
+            {
+              "value": "password_then_otp",
+              "label": "Password first, then OTP"
+            },
+            {
+              "value": "password_plus_otp",
+              "label": "Password + OTP combined"
+            },
+            {
+              "value": "password_only",
+              "label": "Password only"
+            }
+          ],
+          "description": "Controls automatic OTP answers for login and sudo. Pick \"Password + OTP combined\" for hosts that ask for the code first or merge password and code into one prompt. Off disables automatic OTP answers; unanswered keyboard-interactive login questions are requested in a masked connection-time dialog when the DBX host supports it. Existing connections keep their saved mode."
+        },
+        {
+          "key": "totp_secret",
+          "label": "TOTP secrets",
+          "type": "textarea",
+          "binding": "secret",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "auth_flow_mode",
+                "one_of": [
+                  "password_then_otp",
+                  "password_plus_otp"
+                ]
+              }
+            ]
+          },
+          "description": "One per line: an otpauth:// URI or base32 key for automatic codes, or a static recovery code. Leave this blank to enter a rotating app, hardware-token, or SMS code in the connection-time dialog; do not save a current six-digit code here."
+        },
+        {
+          "key": "totp_prompt_hint",
+          "label": "OTP prompt",
+          "type": "text",
+          "binding": "config",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "auth_flow_mode",
+                "one_of": [
+                  "password_then_otp",
+                  "password_plus_otp"
+                ]
+              }
+            ]
+          },
+          "description": "Optional extra text for recognizing OTP prompts. Built-in patterns already cover common wording such as \"[OTP Code]\" or \"Please Enter MFA Code.\" — only add a hint when the server asks differently."
+        },
+        {
+          "key": "password_prompt_hint",
+          "label": "Password prompt",
+          "type": "text",
+          "binding": "config",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "sudo_source",
+                "one_of": [
+                  "custom",
+                  "off"
+                ]
+              },
+              {
+                "field": "auth_flow_mode",
+                "one_of": [
+                  "password_then_otp",
+                  "password_plus_otp"
+                ]
+              }
+            ]
+          },
+          "description": "Optional text for recognizing password prompts. OTP wording belongs in the OTP prompt field above — a hint filled here only ever matches password prompts."
+        },
+        {
+          "key": "advanced_options",
+          "label": "Show advanced options",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "description": "Show the less-used settings: timeouts, keepalive, environment, automatic replies, and read-only. Off by default.",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "ssh"
+            ]
+          }
+        },
+        {
+          "key": "read_only",
+          "label": "Read-only",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "description": "Reject write operations on this connection.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "connect_timeout_secs",
+          "label": "SSH timeout (seconds)",
+          "type": "number",
+          "binding": "config",
+          "default": 30,
+          "description": "SSH handshake and authentication timeout.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "keepalive_interval_secs",
+          "label": "SSH keepalive (seconds)",
+          "type": "number",
+          "binding": "config",
+          "default": 30,
+          "description": "SSH keepalive interval; 0 disables it.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "terminal_keepalive_secs",
+          "label": "Terminal keepalive (seconds)",
+          "type": "number",
+          "binding": "config",
+          "default": 0,
+          "description": "Terminal idle keepalive; 0 disables it.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "set_env",
+          "label": "Environment (SetEnv)",
+          "type": "textarea",
+          "binding": "config",
+          "default": "",
+          "placeholder": "LANG=zh_CN.UTF-8",
+          "description": "Optional KEY=VALUE entries sent on terminal, exec, and sudo channels.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "triggers_enabled",
+          "label": "Enable automatic replies",
+          "type": "boolean",
+          "binding": "config",
+          "default": false,
+          "description": "Enable tssh/JSON Expect rules. Off by default; saved rules stay inactive.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "triggers",
+          "label": "Automatic reply rules",
+          "type": "textarea",
+          "binding": "config",
+          "default": "",
+          "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r",
+          "description": "tssh/JSON Expect rules for automatic replies. A server can spoof prompts and receive configured replies. Empty disables.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "triggers_enabled",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "trigger_answer_1",
+          "label": "Secret slot 1",
+          "type": "password",
+          "binding": "secret",
+          "description": "Secret sent when referenced by sendSecretKey. A server can spoof the prompt.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "triggers_enabled",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "trigger_answer_2",
+          "label": "Secret slot 2",
+          "type": "password",
+          "binding": "secret",
+          "description": "Secret sent when referenced by sendSecretKey. A server can spoof the prompt.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "triggers_enabled",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "passphrase_command",
+          "label": "Passphrase command",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Local command to fetch a missing private-key passphrase. stdout minus one final newline is used. Runs with your user privileges.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              },
+              {
+                "field": "authentication",
+                "one_of": [
+                  "private-key",
+                  "private-key-password",
+                  "auto"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "remote_command",
+          "label": "Remote command",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Run instead of the shell when a terminal opens. Empty uses a normal shell.",
+          "visible_when": {
+            "all_of": [
+              {
+                "field": "protocol",
+                "one_of": [
+                  "ssh"
+                ]
+              },
+              {
+                "field": "advanced_options",
+                "one_of": [
+                  "true"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "key": "serial_port",
+          "label": "Serial device",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Local serial device path, e.g. /dev/ttyUSB0 (Linux/macOS) or COM3 (Windows).",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_baud",
+          "label": "Baud rate",
+          "type": "select",
+          "binding": "config",
+          "default": "115200",
+          "options": [
+            {
+              "label": "9600",
+              "value": "9600"
+            },
+            {
+              "label": "19200",
+              "value": "19200"
+            },
+            {
+              "label": "38400",
+              "value": "38400"
+            },
+            {
+              "label": "57600",
+              "value": "57600"
+            },
+            {
+              "label": "115200",
+              "value": "115200"
+            },
+            {
+              "label": "230400",
+              "value": "230400"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_data_bits",
+          "label": "Data bits",
+          "type": "select",
+          "binding": "config",
+          "default": "8",
+          "options": [
+            {
+              "label": "7",
+              "value": "7"
+            },
+            {
+              "label": "8",
+              "value": "8"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_parity",
+          "label": "Parity",
+          "type": "select",
+          "binding": "config",
+          "default": "none",
+          "options": [
+            {
+              "label": "None",
+              "value": "none"
+            },
+            {
+              "label": "Even",
+              "value": "even"
+            },
+            {
+              "label": "Odd",
+              "value": "odd"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_stop_bits",
+          "label": "Stop bits",
+          "type": "select",
+          "binding": "config",
+          "default": "1",
+          "options": [
+            {
+              "label": "1",
+              "value": "1"
+            },
+            {
+              "label": "2",
+              "value": "2"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "serial_backspace",
+          "label": "Backspace sends",
+          "type": "select",
+          "binding": "config",
+          "default": "del",
+          "options": [
+            {
+              "label": "DEL (0x7F)",
+              "value": "del"
+            },
+            {
+              "label": "Ctrl+H (0x08)",
+              "value": "ctrl_h"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "serial"
+            ]
+          }
+        },
+        {
+          "key": "rdp_domain",
+          "label": "Domain",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "description": "Windows domain for NLA (optional).",
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "rdp_resolution",
+          "label": "Resolution",
+          "type": "select",
+          "binding": "config",
+          "default": "1280x800",
+          "options": [
+            {
+              "label": "1024×768",
+              "value": "1024x768"
+            },
+            {
+              "label": "1280×720",
+              "value": "1280x720"
+            },
+            {
+              "label": "1280×800",
+              "value": "1280x800"
+            },
+            {
+              "label": "1366×768",
+              "value": "1366x768"
+            },
+            {
+              "label": "1600×900",
+              "value": "1600x900"
+            },
+            {
+              "label": "1920×1080",
+              "value": "1920x1080"
+            },
+            {
+              "label": "2560×1440",
+              "value": "2560x1440"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "rdp_certificate_policy",
+          "label": "Certificate policy",
+          "type": "select",
+          "binding": "config",
+          "default": "prompt",
+          "options": [
+            {
+              "label": "Ask on mismatch",
+              "value": "prompt"
+            },
+            {
+              "label": "Strict (reject mismatch)",
+              "value": "strict"
+            },
+            {
+              "label": "Accept temporarily",
+              "value": "accept-temporarily"
+            }
+          ],
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "rdp"
+            ]
+          }
+        },
+        {
+          "key": "rdp_clipboard",
+          "label": "Share clipboard",
+          "type": "boolean",
+          "binding": "config",
+          "default": true,
+          "visible_when": {
+            "field": "protocol",
+            "one_of": [
+              "rdp"
+            ]
+          }
+        }
+      ],
+      "workbench": "net.iborshell.workbench",
+      "filesystem_provider": "net.iborshell.files",
+      "actions": [
+        {
+          "id": "import-private-key",
+          "label": "Import private key",
+          "description": "Pick a private key file on this machine; its content fills the key content field and is stored in the vault on save. Desktop only.",
+          "variant": "outline",
+          "when": "always",
+          "requires_valid_form": false,
+          "timeout_ms": 120000
+        },
+        {
+          "id": "import-sessions",
+          "label": "Import connections",
+          "description": "Choose a source (MobaXterm, Xshell, WindTerm, SecureCRT, FinalShell, Electerm, Termius or an OpenSSH config), then pick its export file; the first session fills this form (passwords and key contents are never filled). Desktop only; bulk import lives in the workbench import wizard.",
+          "variant": "outline",
+          "when": "create",
+          "requires_valid_form": false,
+          "timeout_ms": 120000
+        }
+      ],
+      "capabilities": [
+        "test",
+        "connect",
+        "disconnect"
+      ]
+    },
+    {
+      "type": "connection-provider",
+      "id": "net.iborshell.local",
+      "label": "Local shell",
+      "icon": "assets/plugin.svg",
+      "database_type": "local",
+      "description": "Run scheduled commands on the machine running DBX itself through a local shell. No network endpoint and no credentials; the shell resolves from the connection form or the DBX default-shell chain.",
+      "fields": [
+        {
+          "key": "display_name",
+          "label": "Connection name",
+          "type": "text",
+          "binding": "name",
+          "required": true,
+          "default": "Local shell"
+        },
+        {
+          "key": "shell",
+          "label": "Shell",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "placeholder": "/bin/bash",
+          "description": "Absolute shell path used to run the task's commands. Leave empty to use the DBX default shell (the same chain the local terminal uses)."
+        },
+        {
+          "key": "cwd",
+          "label": "Working directory",
+          "type": "text",
+          "binding": "config",
+          "default": "",
+          "placeholder": "/home/user/projects/demo",
+          "description": "Absolute directory the shell starts in. Leave empty to use the home directory; reopening the terminal keeps following the shell's last directory."
+        },
+        {
+          "key": "env",
+          "label": "Environment variables",
+          "type": "textarea",
+          "binding": "config",
+          "default": "",
+          "placeholder": "EDITOR=/usr/bin/vim\nMY_PROJECT_ENV=dev",
+          "description": "Additional environment variables, one NAME=value per line. TERM, COLORTERM and TERM_PROGRAM are managed by the terminal; empty or malformed lines are ignored."
+        }
+      ],
+      "workbench": "net.iborshell.workbench",
+      "capabilities": [
+        "test",
+        "connect",
+        "disconnect"
+      ]
+    },
+    {
+      "type": "workbench",
+      "id": "net.iborshell.workbench",
+      "label": "Terminal",
+      "description": "Terminal, SFTP file manager, and remote operations workspace.",
+      "icon": "assets/plugin.svg"
+    },
+    {
+      "type": "workbench",
+      "id": "net.iborshell.tunnels",
+      "label": "Port forwards",
+      "description": "Manage SSH port forwards without opening a terminal.",
+      "icon": "assets/plugin.svg"
+    },
+    {
+      "type": "workbench",
+      "id": "net.iborshell.tunnels.quick",
+      "label": "Start saved port forwards",
+      "description": "Start every saved SSH port forward for this connection.",
+      "icon": "assets/plugin.svg"
+    },
+    {
+      "type": "context-menu",
+      "id": "manage-tunnels",
+      "label": "Port forwards",
+      "menu": "connection",
+      "dynamic": true
+    },
+    {
+      "type": "filesystem-provider",
+      "id": "net.iborshell.files",
+      "label": "SFTP files",
+      "description": "Remote filesystem exposed through SFTP.",
+      "schemes": [
+        "sftp"
+      ],
+      "root_uri": "sftp:/",
+      "capabilities": [
+        "read",
+        "write",
+        "delete",
+        "rename",
+        "mkdir"
+      ]
+    },
+    {
+      "type": "command",
+      "id": "open-local-terminal",
+      "label": "Terminal",
+      "description": "Open a terminal on this machine.",
+      "icon": "assets/local-terminal.svg",
+      "action": {
+        "type": "open-workbench",
+        "workbench": "net.iborshell.workbench",
+        "presentation": "panel",
+        "reuse": "singleton",
+        "instance_key": "local-terminal",
+        "restore": "none",
+        "context": {
+          "plugin": {
+            "mode": "local-terminal"
+          }
+        },
+        "options_action": "local/terminal/launch-options",
+        "connection_targets": true
+      }
+    },
+    {
+      "type": "menus",
+      "id": "local-terminal-entrypoints",
+      "items": [
+        {
+          "location": "commandPalette",
+          "command": "open-local-terminal",
+          "group": "primary",
+          "order": 100
+        },
+        {
+          "location": "appToolbar",
+          "command": "open-local-terminal",
+          "group": "navigation",
+          "order": 100,
+          "default_visible": true
+        }
+      ]
+    }
+  ],
+  "localizations": {
+    "en": {
+      "name": "iBorShell",
+      "description": "iBorShell: a secure SSH terminal for DBX — interactive sessions, SFTP file transfer, multi-host exec, clone session and live server stats. Fork of jinpy's Terminal plugin.",
+      "contributions": {
+        "net.iborshell.connection": {},
+        "net.iborshell.local": {},
+        "net.iborshell.open-local-terminal": {
+          "label": "Terminal",
+          "description": "Open a terminal on this machine."
+        },
+        "net.iborshell.local-terminal-entrypoints": {},
+        "net.iborshell.tunnels": {
+          "label": "Port forwards",
+          "description": "Manage SSH port forwards without opening a terminal."
+        },
+        "net.iborshell.manage-tunnels": {
+          "label": "Port forwards"
+        },
+        "net.iborshell.tunnels.quick": {
+          "label": "Start saved port forwards"
+        },
+        "net.iborshell.start-saved-tunnels": {
+          "label": "Start saved port forwards"
+        }
+      }
+    },
+    "es": {
+      "name": "Terminal",
+      "description": "Terminal SSH, gestor SFTP y operaciones remotas en DBX.",
+      "contributions": {
+        "net.iborshell.local": {
+          "label": "Shell local",
+          "description": "Ejecuta comandos programados en la propia máquina donde corre DBX mediante un shell local. Sin endpoint de red ni credenciales; el shell se resuelve desde el formulario de conexión o la cadena de shell predeterminado de DBX.",
+          "fields": {
+            "display_name": {
+              "label": "Nombre de conexión"
+            },
+            "shell": {
+              "label": "Shell",
+              "description": "Ruta absoluta del shell que ejecutará los comandos de la tarea. Déjelo vacío para usar el shell predeterminado de DBX (la misma cadena que el terminal local)."
+            },
+            "cwd": {
+              "label": "Directorio de trabajo",
+              "description": "Directorio absoluto donde inicia el shell. Déjelo vacío para usar el directorio personal; al reabrir el terminal se conserva el último directorio del shell."
+            },
+            "env": {
+              "label": "Variables de entorno",
+              "description": "Variables de entorno adicionales, una línea NAME=value cada una. TERM, COLORTERM y TERM_PROGRAM los gestiona el terminal; las líneas vacías o mal formadas se ignoran."
+            }
+          }
+        },
+        "net.iborshell.connection": {
+          "label": "Servidor SSH",
+          "description": "Conexión SSH y SFTP con contraseña, clave privada, agente o sin autenticación.",
+          "fields": {
+            "display_name": {
+              "label": "Nombre de conexión"
+            },
+            "protocol": {
+              "label": "Protocolo",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "Serie",
+                "rdp": "RDP (experimental)"
+              },
+              "description": "Protocolo de sesión de esta conexión. Las conexiones Telnet, VNC y RDP abren su propia vista de sesión en el espacio de trabajo (las opciones por protocolo están ahí); las conexiones serie usan un dispositivo local y omiten los campos TCP. RDP es experimental."
+            },
+            "serial_port": {
+              "label": "Dispositivo serie",
+              "description": "Ruta del dispositivo serie local, p. ej. /dev/ttyUSB0 (Linux/macOS) o COM3 (Windows)."
+            },
+            "serial_baud": {
+              "label": "Baudios",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "Bits de datos",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "Paridad",
+              "options": {
+                "none": "Ninguna",
+                "even": "Par",
+                "odd": "Impar"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "Bits de parada",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "Retroceso envía",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "Dominio",
+              "description": "Dominio de Windows para NLA (opcional)."
+            },
+            "rdp_resolution": {
+              "label": "Resolución",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "Política de certificados",
+              "options": {
+                "prompt": "Preguntar si no coincide",
+                "strict": "Estricto (rechazar sin coincidencia)",
+                "accept-temporarily": "Aceptar temporalmente"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "Compartir portapapeles"
+            },
+            "host": {
+              "label": "Host"
+            },
+            "port": {
+              "label": "Puerto",
+              "description": "Puerto TCP, 1-65535 (predeterminado 22). El host rechaza la conexión si es 0 o queda fuera de rango."
+            },
+            "username": {
+              "label": "Usuario"
+            },
+            "authentication": {
+              "label": "Autenticación",
+              "options": {
+                "password": "Contraseña",
+                "private-key": "Clave privada",
+                "private-key-password": "Clave privada y después contraseña",
+                "agent": "Agente SSH",
+                "auto": "Automático (probar en orden)",
+                "none": "Sin autenticación"
+              },
+              "description": "Cómo iniciar sesión en el servidor: contraseña, clave privada, agente SSH, sin autenticación o automático (prueba contraseña, clave privada, preguntas interactivas y agente SSH en orden hasta que uno funcione)."
+            },
+            "password": {
+              "label": "Contraseña",
+              "description": "Contraseña para «Contraseña», «Clave privada y después contraseña» y «Automático»; obligatoria cuando «Origen de la contraseña» es «Escribir en este formulario». Las conexiones Telnet, VNC y RDP usan esta contraseña directamente. Para obtenerla con un comando local, cambia ese origen a «Comando local». Automático prueba cada método en orden, así que esta es una de sus posibles fuentes."
+            },
+            "password_source": {
+              "label": "Origen de la contraseña",
+              "options": {
+                "direct": "Escribir en este formulario",
+                "command": "Comando local"
+              },
+              "description": "Define de dónde sale la contraseña de acceso. «Escribir en este formulario» exige el campo Contraseña; «Comando local» exige Comando de contraseña, que se ejecuta con tus permisos al conectar."
+            },
+            "private_key_path": {
+              "label": "Ruta de clave privada",
+              "description": "Escribe la ruta de la clave o elígela: la lista de sugerencias (escritorio) y el botón de archivo rellenan este campo; en Web/Docker el botón sube la clave al campo «Contenido de la clave privada» y vacía este. Ruta o contenido: al menos uno de los dos."
+            },
+            "private_key_passphrase": {
+              "label": "Frase de contraseña de la clave",
+              "description": "Frase que desbloquea el archivo de la clave privada; es distinta de la contraseña de la cuenta."
+            },
+            "private_key": {
+              "label": "Contenido de la clave privada",
+              "description": "Pega el contenido de la clave (OpenSSH, PEM o PPK); en Web/Docker el botón de archivo de arriba lo sube aquí. Un contenido no vacío tiene prioridad sobre la ruta, se guarda en el almacén de secretos y no se vuelve a mostrar; elegir un archivo arriba borra este campo."
+            },
+            "agent_socket": {
+              "label": "Socket del agente",
+              "description": "Anulación opcional de SSH_AUTH_SOCK. Déjelo vacío para usar el valor del entorno o Pageant en Windows."
+            },
+            "connect_timeout_secs": {
+              "label": "Tiempo de espera SSH (s)",
+              "description": "Tiempo de espera del handshake y la autenticación SSH."
+            },
+            "keepalive_interval_secs": {
+              "label": "Keepalive SSH (s)",
+              "description": "Intervalo de keepalive SSH; 0 lo desactiva."
+            },
+            "terminal_keepalive_secs": {
+              "label": "Keepalive del terminal (s)",
+              "description": "Keepalive de inactividad del terminal; 0 lo desactiva."
+            },
+            "set_env": {
+              "label": "Entorno (SetEnv)",
+              "description": "Entradas KEY=VALUE opcionales para los canales de terminal, exec y sudo.",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "Reglas de respuesta automática",
+              "description": "Reglas Expect de tssh/JSON para responder automáticamente. Un servidor puede falsificar prompts y recibir respuestas configuradas. Vacío desactiva.",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
+            },
+            "trigger_answer_1": {
+              "label": "Ranura secreta 1",
+              "description": "Secreto enviado al usar sendSecretKey. Un servidor puede falsificar el prompt."
+            },
+            "trigger_answer_2": {
+              "label": "Ranura secreta 2",
+              "description": "Secreto enviado al usar sendSecretKey. Un servidor puede falsificar el prompt."
+            },
+            "password_command": {
+              "label": "Comando de contraseña",
+              "description": "Comando local para obtener la contraseña de acceso. Se usa stdout sin el último salto de línea. Obligatorio cuando «Origen de la contraseña» es «Comando local»; se ejecuta con tus permisos."
+            },
+            "passphrase_command": {
+              "label": "Comando de passphrase",
+              "description": "Comando local para obtener la passphrase de una clave ausente. Se usa stdout sin el último salto de línea. Se ejecuta con tus permisos."
+            },
+            "remote_command": {
+              "label": "Comando remoto",
+              "description": "Se ejecuta en lugar del shell al abrir el terminal. Vacío usa un shell normal."
+            },
+            "sudo_source": {
+              "label": "Credenciales sudo",
+              "options": {
+                "custom": "Personalizado (esta conexión)",
+                "global": "Perfil Quick Sudo global",
+                "off": "Desactivado"
+              },
+              "description": "Elige el origen de las credenciales sudo: selecciona Personalizado (esta conexión) o un perfil global Quick Sudo solo si este host necesita sudo; si no, deja Desactivado. Se ignora en conexiones de solo lectura. Desactivado no gestiona credenciales sudo; el campo 2FA siguiente sigue sirviendo al MFA del inicio de sesión."
+            },
+            "sudo_profile": {
+              "label": "Perfil Quick Sudo",
+              "description": "Perfil global Quick Sudo opcional."
+            },
+            "sudo_password": {
+              "label": "Contraseña sudo",
+              "description": "Contraseña para sudo; vacía reutiliza la de inicio de sesión."
+            },
+            "totp_secret": {
+              "label": "Secretos TOTP",
+              "description": "Uno por línea: URI otpauth:// o clave base32 para códigos automáticos, o un código de recuperación estático. Déjalo vacío para introducir un código rotatorio de app, token físico o SMS al conectar; no guardes aquí el código actual de seis dígitos."
+            },
+            "auth_flow_mode": {
+              "label": "2FA",
+              "description": "Controla las respuestas OTP automáticas para el inicio de sesión y sudo. Elige «Contraseña y OTP combinados» para hosts que piden el código primero o unen contraseña y código. Desactivado solo deshabilita la respuesta automática; las preguntas keyboard-interactive sin respuesta se muestran en un diálogo enmascarado al conectar cuando el host DBX lo admite. Las conexiones existentes conservan su modo guardado.",
+              "options": {
+                "off": "Desactivado (nunca responder al OTP)",
+                "password_then_otp": "Primero contraseña, después OTP",
+                "password_plus_otp": "Contraseña y OTP combinados",
+                "password_only": "Solo contraseña"
+              }
+            },
+            "password_prompt_hint": {
+              "label": "Prompt de contraseña",
+              "description": "Texto opcional para reconocer prompts de contraseña. El texto de OTP va en el campo de prompt de OTP de arriba: una pista aquí solo coincide con prompts de contraseña."
+            },
+            "totp_prompt_hint": {
+              "label": "Prompt de OTP",
+              "description": "Texto adicional opcional para reconocer prompts de OTP. Los patrones integrados ya cubren textos habituales como «[OTP Code]» o «Please Enter MFA Code.»; añade una pista solo si el servidor lo pide de otra forma."
+            },
+            "sudo_use_pty": {
+              "label": "Solicitar PTY para sudo",
+              "description": "Solicita un TTY para los prompts de sudo."
+            },
+            "read_only": {
+              "label": "Solo lectura",
+              "description": "Rechaza las operaciones de escritura en esta conexión."
+            },
+            "sudo_whitelist": {
+              "label": "Lista blanca sudo",
+              "description": "Lista opcional de comandos sudo, uno por línea. Vacía permite todos."
+            },
+            "triggers_enabled": {
+              "label": "Activar respuestas automáticas",
+              "description": "Activa reglas Expect de tssh/JSON. Desactivado por defecto; las reglas guardadas permanecen inactivas."
+            },
+            "advanced_options": {
+              "label": "Mostrar opciones avanzadas",
+              "description": "Muestra los ajustes menos usados: tiempos de espera, keepalive, entorno, respuestas automáticas y solo lectura. Desactivado por defecto."
+            }
+          },
+          "actions": {
+            "import-private-key": {
+              "label": "Importar clave privada",
+              "description": "Elige un archivo de clave privada en este equipo; su contenido rellena el campo de contenido de la clave y se guarda en la bóveda al guardar. Solo escritorio."
+            },
+            "import-sessions": {
+              "label": "Importar conexiones",
+              "description": "Elige un origen (MobaXterm, Xshell, WindTerm, SecureCRT, FinalShell, Electerm, Termius o un config de OpenSSH) y después su archivo de exportación; la primera sesión rellena este formulario (las contraseñas y el contenido de las claves privadas nunca se rellenan). Solo escritorio; la importación masiva está en el asistente de importación del espacio de trabajo."
+            }
+          }
+        },
+        "net.iborshell.workbench": {
+          "label": "Terminal",
+          "description": "Terminal, gestor SFTP y operaciones remotas."
+        },
+        "net.iborshell.files": {
+          "label": "Archivos SFTP",
+          "description": "Sistema de archivos remoto mediante SFTP."
+        },
+        "net.iborshell.open-local-terminal": {
+          "label": "Terminal",
+          "description": "Abrir una terminal en esta máquina."
+        },
+        "net.iborshell.local-terminal-entrypoints": {},
+        "net.iborshell.tunnels": {
+          "label": "Redirecciones de puertos",
+          "description": "Administra redirecciones SSH sin abrir una terminal."
+        },
+        "net.iborshell.manage-tunnels": {
+          "label": "Redirecciones de puertos"
+        },
+        "net.iborshell.tunnels.quick": {
+          "label": "Iniciar redirecciones guardadas"
+        },
+        "net.iborshell.start-saved-tunnels": {
+          "label": "Iniciar redirecciones guardadas"
+        }
+      }
+    },
+    "it": {
+      "name": "Terminal",
+      "description": "Terminale SSH, gestore SFTP e operazioni remote in DBX.",
+      "contributions": {
+        "net.iborshell.local": {
+          "label": "Shell locale",
+          "description": "Esegue i comandi pianificati sulla macchina che esegue DBX stessa tramite una shell locale. Nessun endpoint di rete e nessuna credenziale; la shell viene risolta dal modulo di connessione o dalla catena della shell predefinita di DBX.",
+          "fields": {
+            "display_name": {
+              "label": "Nome connessione"
+            },
+            "shell": {
+              "label": "Shell",
+              "description": "Percorso assoluto della shell che esegue i comandi dell'attività. Lasciare vuoto per usare la shell predefinita di DBX (la stessa catena del terminale locale)."
+            },
+            "cwd": {
+              "label": "Directory di lavoro",
+              "description": "Directory assoluta in cui la shell si avvia. Lasciare vuoto per usare la home; riaprendo il terminale si mantiene l'ultima directory della shell."
+            },
+            "env": {
+              "label": "Variabili d'ambiente",
+              "description": "Variabili d'ambiente aggiuntive, una riga NAME=value ciascuna. TERM, COLORTERM e TERM_PROGRAM sono gestite dal terminale; le righe vuote o malformate vengono ignorate."
+            }
+          }
+        },
+        "net.iborshell.connection": {
+          "label": "Server SSH",
+          "description": "Connessione SSH e SFTP con password, chiave privata, agent o senza autenticazione.",
+          "fields": {
+            "display_name": {
+              "label": "Nome connessione"
+            },
+            "protocol": {
+              "label": "Protocollo",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "Seriale",
+                "rdp": "RDP (sperimentale)"
+              },
+              "description": "Protocollo di sessione di questa connessione. Le connessioni Telnet, VNC e RDP aprono la propria vista di sessione nel workbench (le opzioni per protocollo si configurano lì); le connessioni seriali usano un dispositivo locale e omettono i campi TCP. RDP è sperimentale."
+            },
+            "serial_port": {
+              "label": "Dispositivo seriale",
+              "description": "Percorso del dispositivo seriale locale, es. /dev/ttyUSB0 (Linux/macOS) o COM3 (Windows)."
+            },
+            "serial_baud": {
+              "label": "Baud",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "Bit di dati",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "Parità",
+              "options": {
+                "none": "Nessuna",
+                "even": "Pari",
+                "odd": "Dispari"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "Bit di stop",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "Il backspace invia",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "Dominio",
+              "description": "Dominio Windows per NLA (facoltativo)."
+            },
+            "rdp_resolution": {
+              "label": "Risoluzione",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "Politica dei certificati",
+              "options": {
+                "prompt": "Chiedi se non corrisponde",
+                "strict": "Rigoroso (rifiuta se non corrisponde)",
+                "accept-temporarily": "Accetta temporaneamente"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "Condividi appunti"
+            },
+            "host": {
+              "label": "Host"
+            },
+            "port": {
+              "label": "Porta",
+              "description": "Porta TCP, 1-65535 (predefinita 22). L'host rifiuta la connessione se è 0 o fuori intervallo."
+            },
+            "username": {
+              "label": "Nome utente"
+            },
+            "authentication": {
+              "label": "Autenticazione",
+              "options": {
+                "password": "Password",
+                "private-key": "Chiave privata",
+                "private-key-password": "Chiave privata, poi password",
+                "agent": "SSH Agent",
+                "auto": "Automatico (prova in ordine)",
+                "none": "Nessuna autenticazione"
+              },
+              "description": "Come accedere al server: password, chiave privata, agent, nessuna autenticazione o automatico (prova password, chiave privata, prompt interattivi e agent SSH in ordine finché uno funziona)."
+            },
+            "password": {
+              "label": "Password",
+              "description": "Password per «Password», «Chiave privata, poi password» e «Automatico»; obbligatoria quando «Origine password» è «Inserisci nel modulo». Le connessioni Telnet, VNC e RDP usano questa password direttamente. Per recuperarla con un comando locale, cambia l'origine in «Comando locale». Automatico prova ogni metodo in ordine, quindi questa è una delle possibili fonti."
+            },
+            "password_source": {
+              "label": "Origine password",
+              "options": {
+                "direct": "Inserisci nel modulo",
+                "command": "Comando locale"
+              },
+              "description": "Da dove arriva la password di accesso. «Inserisci nel modulo» richiede il campo Password; «Comando locale» richiede Comando password, eseguito con i tuoi privilegi alla connessione."
+            },
+            "private_key_path": {
+              "label": "Percorso chiave privata",
+              "description": "Digita il percorso o scegli una chiave: l'elenco dei suggerimenti (desktop) e il pulsante file riempiono questo campo; in Web/Docker il pulsante carica la chiave nel campo «Contenuto della chiave privata» e svuota questo. Percorso o contenuto: almeno uno dei due."
+            },
+            "private_key_passphrase": {
+              "label": "Passphrase chiave privata",
+              "description": "Passphrase che sblocca il file della chiave privata; è diversa dalla password dell'account."
+            },
+            "private_key": {
+              "label": "Contenuto della chiave privata",
+              "description": "Incolla il contenuto della chiave (OpenSSH, PEM o PPK); in Web/Docker il pulsante file qui sopra lo carica qui. Un contenuto non vuoto ha precedenza sul percorso, resta nell'archivio segreti e non viene più mostrato; scegliere un file sopra cancella questo campo."
+            },
+            "agent_socket": {
+              "label": "Socket agent",
+              "description": "Override facoltativo di SSH_AUTH_SOCK. Lasciare vuoto per il valore predefinito dell'ambiente o Pageant su Windows."
+            },
+            "set_env": {
+              "label": "Ambiente (SetEnv)",
+              "description": "Voci KEY=VALUE opzionali per i canali terminale, exec e sudo.",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "Regole di risposta automatica",
+              "description": "Regole Expect tssh/JSON per risposte automatiche. Un server può falsificare i prompt e ricevere le risposte configurate. Vuoto disabilita.",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
+            },
+            "trigger_answer_1": {
+              "label": "Slot segreto 1",
+              "description": "Segreto inviato quando viene usato da sendSecretKey. Un server può falsificare il prompt."
+            },
+            "trigger_answer_2": {
+              "label": "Slot segreto 2",
+              "description": "Segreto inviato quando viene usato da sendSecretKey. Un server può falsificare il prompt."
+            },
+            "password_command": {
+              "label": "Comando password",
+              "description": "Comando locale per recuperare la password di accesso. Usa lo stdout senza l'ultimo ritorno a capo. Obbligatorio quando «Origine password» è «Comando locale»; viene eseguito con i tuoi privilegi."
+            },
+            "passphrase_command": {
+              "label": "Comando passphrase",
+              "description": "Comando locale per recuperare la passphrase di una chiave mancante. Usa lo stdout senza l'ultimo ritorno a capo. Viene eseguito con i tuoi privilegi."
+            },
+            "remote_command": {
+              "label": "Comando remoto",
+              "description": "Eseguito al posto della shell all'apertura del terminale. Vuoto usa una shell normale."
+            },
+            "sudo_source": {
+              "label": "Credenziali sudo",
+              "options": {
+                "custom": "Personalizzato (questa connessione)",
+                "global": "Profilo Quick Sudo globale",
+                "off": "Disattivato"
+              },
+              "description": "Scegli la fonte delle credenziali sudo: seleziona Personalizzato (questa connessione) o un profilo globale Quick Sudo solo se questo host richiede sudo, altrimenti lascia Disattivato. Ignorato sulle connessioni di sola lettura. Disattivato non gestisce credenziali sudo; il campo 2FA seguente serve comunque all'MFA dell'accesso."
+            },
+            "sudo_profile": {
+              "label": "Profilo Quick Sudo",
+              "description": "Profilo globale Quick Sudo opzionale."
+            },
+            "read_only": {
+              "label": "Sola lettura",
+              "description": "Rifiuta le operazioni di scrittura su questa connessione."
+            },
+            "sudo_whitelist": {
+              "label": "Allowlist sudo",
+              "description": "Allowlist opzionale dei comandi sudo, uno per riga. Vuota consente tutti i comandi."
+            },
+            "auth_flow_mode": {
+              "description": "Controlla le risposte OTP automatiche per accesso e sudo. Scegli «Password e OTP combinati» per host che chiedono prima il codice o uniscono password e codice. Disattivato blocca solo la risposta automatica; le domande keyboard-interactive senza risposta vengono mostrate in una finestra mascherata durante la connessione quando l'host DBX lo supporta. Le connessioni esistenti mantengono il modo salvato.",
+              "label": "2FA",
+              "options": {
+                "off": "Disattivato (non rispondere all'OTP)",
+                "password_then_otp": "Prima password, poi OTP",
+                "password_plus_otp": "Password e OTP combinati",
+                "password_only": "Solo password"
+              }
+            },
+            "sudo_password": {
+              "label": "Password sudo",
+              "description": "Password per sudo; se vuota riusa quella di accesso."
+            },
+            "sudo_use_pty": {
+              "label": "Richiedi PTY per sudo",
+              "description": "Richiede un TTY per i prompt sudo."
+            },
+            "totp_secret": {
+              "label": "Segreti TOTP",
+              "description": "Uno per riga: URI otpauth:// o chiave base32 per codici automatici, oppure un codice di recupero statico. Lascia vuoto per inserire al momento della connessione un codice variabile da app, token hardware o SMS; non salvare qui il codice attuale di sei cifre."
+            },
+            "password_prompt_hint": {
+              "label": "Prompt password",
+              "description": "Testo opzionale per riconoscere i prompt della password. Il testo OTP va nel campo prompt OTP accanto: una pista qui corrisponde solo ai prompt della password."
+            },
+            "totp_prompt_hint": {
+              "label": "Prompt OTP",
+              "description": "Testo aggiuntivo opzionale per riconoscere i prompt OTP. I pattern integrati coprono già testi comuni come «[OTP Code]» o «Please Enter MFA Code.»; aggiungi una pista solo se il server chiede diversamente."
+            },
+            "connect_timeout_secs": {
+              "label": "Timeout SSH (secondi)",
+              "description": "Timeout per handshake e autenticazione SSH."
+            },
+            "keepalive_interval_secs": {
+              "label": "Keepalive SSH (secondi)",
+              "description": "Intervallo keepalive SSH; 0 lo disattiva."
+            },
+            "terminal_keepalive_secs": {
+              "label": "Keepalive terminale (secondi)",
+              "description": "Keepalive di inattività del terminale; 0 lo disattiva."
+            },
+            "triggers_enabled": {
+              "label": "Abilita risposte automatiche",
+              "description": "Abilita regole Expect tssh/JSON. Disattivato per impostazione predefinita; le regole salvate restano inattive."
+            },
+            "advanced_options": {
+              "label": "Mostra opzioni avanzate",
+              "description": "Mostra le impostazioni meno usate: timeout, keepalive, ambiente, risposte automatiche e sola lettura. Disattivato per impostazione predefinita."
+            }
+          },
+          "actions": {
+            "import-private-key": {
+              "label": "Importa chiave privata",
+              "description": "Scegli un file di chiave privata su questo computer; il contenuto riempie il campo del contenuto della chiave e viene salvato nel vault al salvataggio. Solo desktop."
+            },
+            "import-sessions": {
+              "label": "Importa connessioni",
+              "description": "Scegli un'origine (MobaXterm, Xshell, WindTerm, SecureCRT, FinalShell, Electerm, Termius o un config OpenSSH) e poi il suo file di esportazione; la prima sessione riempie questo modulo (password e contenuti delle chiavi private non vengono mai inseriti). Solo desktop; l'importazione in blocco si trova nella procedura guidata di importazione del workbench."
+            }
+          }
+        },
+        "net.iborshell.workbench": {
+          "label": "Terminale",
+          "description": "Terminale, gestore SFTP e operazioni remote."
+        },
+        "net.iborshell.files": {
+          "label": "File SFTP",
+          "description": "File system remoto tramite SFTP."
+        },
+        "net.iborshell.open-local-terminal": {
+          "label": "Terminale",
+          "description": "Apri un terminale su questa macchina."
+        },
+        "net.iborshell.local-terminal-entrypoints": {},
+        "net.iborshell.tunnels": {
+          "label": "Inoltri porta",
+          "description": "Gestisci gli inoltri SSH senza aprire un terminale."
+        },
+        "net.iborshell.manage-tunnels": {
+          "label": "Inoltri porta"
+        },
+        "net.iborshell.tunnels.quick": {
+          "label": "Avvia inoltri salvati"
+        },
+        "net.iborshell.start-saved-tunnels": {
+          "label": "Avvia inoltri salvati"
+        }
+      }
+    },
+    "ja": {
+      "name": "Terminal",
+      "description": "SSH ターミナル、SFTP ファイル管理、リモート運用をまとめた DBX プラグイン。",
+      "contributions": {
+        "net.iborshell.local": {
+          "label": "ローカルシェル",
+          "description": "DBX が動作しているマシン上でローカルシェルを介してスケジュール済みコマンドを実行します。ネットワークエンドポイントも資格情報も不要です。シェルは接続フォームまたは DBX のデフォルトシェル解決チェーンから決定されます。",
+          "fields": {
+            "display_name": {
+              "label": "接続名"
+            },
+            "shell": {
+              "label": "シェル",
+              "description": "タスクのコマンドを実行するシェルの絶対パス。空欄にすると DBX のデフォルトシェル（ローカルターミナルと同じ解決チェーン）を使用します。"
+            },
+            "cwd": {
+              "label": "作業ディレクトリ",
+              "description": "シェルの起動ディレクトリ（絶対パス）。空欄でホームディレクトリ。再オープン時はシェルの最終ディレクトリを引き継ぎます。"
+            },
+            "env": {
+              "label": "環境変数",
+              "description": "追加の環境変数（1 行に NAME=value）。TERM・COLORTERM・TERM_PROGRAM はターミナルが管理し、空行や不正な行は無視されます。"
+            }
+          }
+        },
+        "net.iborshell.connection": {
+          "label": "SSH サーバー",
+          "description": "パスワード、秘密鍵、エージェント、または認証なしの SSH/SFTP 接続。",
+          "fields": {
+            "display_name": {
+              "label": "接続名"
+            },
+            "protocol": {
+              "label": "プロトコル",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "シリアル",
+                "rdp": "RDP（実験的）"
+              },
+              "description": "この接続が扱うセッションプロトコル。Telnet・VNC・RDP 接続はワークベンチ内で各自のセッションビューを開きます（プロトコル固有の設定もそこにあります）。シリアル接続はローカルデバイスを直接使用し、TCP ホスト欄は不要です。RDP は実験的機能です。"
+            },
+            "serial_port": {
+              "label": "シリアルデバイス",
+              "description": "ローカルシリアルデバイスのパス。例: /dev/ttyUSB0（Linux/macOS）や COM3（Windows）。"
+            },
+            "serial_baud": {
+              "label": "ボーレート",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "データビット",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "パリティ",
+              "options": {
+                "none": "なし",
+                "even": "偶数",
+                "odd": "奇数"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "ストップビット",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "Backspace が送信する文字",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "ドメイン",
+              "description": "NLA 用の Windows ドメイン（任意）。"
+            },
+            "rdp_resolution": {
+              "label": "解像度",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "証明書ポリシー",
+              "options": {
+                "prompt": "不一致なら確認",
+                "strict": "厳格（不一致は拒否）",
+                "accept-temporarily": "一時的に受け入れる"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "クリップボード共有"
+            },
+            "host": {
+              "label": "ホスト"
+            },
+            "port": {
+              "label": "ポート",
+              "description": "TCP ポート（1〜65535、既定 22）。0 や範囲外の値ではホストが接続を拒否します。"
+            },
+            "username": {
+              "label": "ユーザー名"
+            },
+            "authentication": {
+              "label": "認証方式",
+              "options": {
+                "password": "パスワード",
+                "private-key": "秘密鍵",
+                "private-key-password": "秘密鍵の後にパスワード",
+                "agent": "SSH Agent",
+                "auto": "自動（順に試行）",
+                "none": "認証なし"
+              },
+              "description": "サーバーへのサインイン方法：パスワード、秘密鍵、SSH Agent、認証なし、または自動（パスワード→秘密鍵→対話プロンプト→SSH Agent の順に成功するまで試行します）。"
+            },
+            "password": {
+              "label": "パスワード",
+              "description": "「パスワード」「秘密鍵の後にパスワード」「自動」で使うパスワードです。「パスワードの取得方法」が「このフォームに入力」のときは必須です。Telnet・VNC・RDP 接続ではこのパスワードをそのまま使います。ローカルコマンドで取得する場合は取得方法を「ローカルコマンド」に切り替えてください。自動は各方式を順に試行するため、これは候補ソースの 1 つです。"
+            },
+            "password_source": {
+              "label": "パスワードの取得方法",
+              "options": {
+                "direct": "このフォームに入力",
+                "command": "ローカルコマンド"
+              },
+              "description": "ログインパスワードの取得方法です。「このフォームに入力」はパスワード欄が必須、「ローカルコマンド」はパスワードコマンドが必須で、接続時にユーザー権限で実行されます。"
+            },
+            "private_key_path": {
+              "label": "秘密鍵のパス",
+              "description": "パスを直接入力するか、右の候補リスト（デスクトップ）やファイル選択ボタンで指定します。Web/Docker ではファイル選択がアップロードになり、内容は下の「秘密鍵の内容」に入りこの欄はクリアされます。パスか内容のどちらか一方は必須です。"
+            },
+            "private_key_passphrase": {
+              "label": "秘密鍵のパスフレーズ",
+              "description": "秘密鍵ファイルの解除に使うパスフレーズ。アカウントのパスワードとは別です。"
+            },
+            "private_key": {
+              "label": "秘密鍵の内容",
+              "description": "秘密鍵の内容（OpenSSH・PEM・PPK）を貼り付けます。Web/Docker では上のファイル選択でアップロードした内容がここに入ります。内容が空でなければパスより優先され、シークレットストアに保存され再表示されません。上でファイルを選ぶとこの欄は消去されます。"
+            },
+            "agent_socket": {
+              "label": "エージェントソケット",
+              "description": "SSH_AUTH_SOCK の任意上書き。空欄なら環境の既定値（Windows では Pageant）を使用します。"
+            },
+            "connect_timeout_secs": {
+              "label": "SSH タイムアウト（秒）",
+              "description": "SSH ハンドシェイクと認証のタイムアウト。"
+            },
+            "keepalive_interval_secs": {
+              "label": "SSH キープアライブ（秒）",
+              "description": "SSH キープアライブ間隔。0 で無効。"
+            },
+            "terminal_keepalive_secs": {
+              "label": "ターミナル キープアライブ（秒）",
+              "description": "ターミナルのアイドル維持間隔。0 で無効。"
+            },
+            "set_env": {
+              "label": "環境（SetEnv）",
+              "description": "ターミナル、exec、sudo チャネルへ送る任意の KEY=VALUE。",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "自動応答ルール",
+              "description": "自動応答用の tssh/JSON Expect ルール。サーバーがプロンプトを偽装して設定済みの応答を受け取る可能性があります。空欄で無効。",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
+            },
+            "trigger_answer_1": {
+              "label": "シークレットスロット 1",
+              "description": "sendSecretKey で参照すると送信されるシークレット。サーバーがプロンプトを偽装する可能性があります。"
+            },
+            "trigger_answer_2": {
+              "label": "シークレットスロット 2",
+              "description": "sendSecretKey で参照すると送信されるシークレット。サーバーがプロンプトを偽装する可能性があります。"
+            },
+            "password_command": {
+              "label": "パスワードコマンド",
+              "description": "ログインパスワードを取得するローカルコマンド。末尾の改行 1 つを除く標準出力を使います。「パスワードの取得方法」が「ローカルコマンド」のときは必須で、ユーザー権限で実行されます。"
+            },
+            "passphrase_command": {
+              "label": "パスフレーズコマンド",
+              "description": "未設定の秘密鍵パスフレーズを取得するローカルコマンド。末尾の改行 1 つを除く標準出力を使います。ユーザー権限で実行されます。"
+            },
+            "remote_command": {
+              "label": "リモートコマンド",
+              "description": "ターミナル開始時にシェルの代わりに実行します。空欄なら通常のシェルです。"
+            },
+            "sudo_source": {
+              "label": "sudo 認証情報",
+              "options": {
+                "custom": "カスタム（この接続）",
+                "global": "グローバル Quick Sudo プロファイル",
+                "off": "オフ"
+              },
+              "description": "sudo 認証情報の取得元を選択します。このホストで sudo が必要な場合のみ「カスタム（この接続）」またはグローバルの Quick Sudo プロファイルを選び、不要ならオフのままにします。読み取り専用接続では無視されます。オフでは sudo 認証情報を扱いませんが、以下の 2FA フィールドはログイン時の MFA に引き続き使われます。"
+            },
+            "sudo_profile": {
+              "label": "Quick Sudo プロファイル",
+              "description": "任意のグローバル Quick Sudo プロファイル。"
+            },
+            "sudo_password": {
+              "label": "sudo パスワード",
+              "description": "sudo に渡すパスワード。空欄ならログインパスワードを再利用します。"
+            },
+            "totp_secret": {
+              "label": "TOTP シークレット",
+              "description": "1 行に 1 件：自動コード用の otpauth:// URI または base32 キー、あるいは静的なリカバリーコード。アプリ、ハードウェアトークン、SMS の変動コードは空欄にして接続時のダイアログで入力し、現在の 6 桁コードをここに保存しないでください。"
+            },
+            "auth_flow_mode": {
+              "label": "2FA",
+              "description": "ログインと sudo の OTP 自動応答を制御します。コードを先に聞くホストや、パスワードとコードを 1 つのプロンプトにまとめるホストでは「パスワードと OTP を連結」を選んでください。オフは自動応答だけを無効にし、DBX ホストが対応していれば未回答の keyboard-interactive 質問を接続時のマスク入力ダイアログで尋ねます。既存の接続は保存済みのモードを保持します。",
+              "options": {
+                "off": "オフ（OTP を自動応答しない）",
+                "password_then_otp": "パスワードの後に OTP",
+                "password_plus_otp": "パスワードと OTP を連結",
+                "password_only": "パスワードのみ"
+              }
+            },
+            "password_prompt_hint": {
+              "label": "パスワードプロンプト",
+              "description": "パスワードプロンプトを識別する任意の文字列。OTP の文言は隣の OTP プロンプト欄に入れてください（ここに入れた文字列はパスワードプロンプトにしか一致しません）。"
+            },
+            "totp_prompt_hint": {
+              "label": "OTP プロンプト",
+              "description": "OTP プロンプトを識別する追加文字列（任意）。「[OTP Code]」「Please Enter MFA Code.」などの一般的な文言は組み込みパターンで対応済みです。サーバーが別の文言を使う場合のみ指定してください。"
+            },
+            "sudo_use_pty": {
+              "label": "sudo で PTY を要求",
+              "description": "sudo プロンプト用に TTY を要求します。"
+            },
+            "read_only": {
+              "label": "読み取り専用",
+              "description": "この接続での書き込み操作を拒否します。"
+            },
+            "sudo_whitelist": {
+              "label": "sudo 許可リスト",
+              "description": "任意の sudo コマンド許可リスト。1 行 1 件。空欄ならすべて許可します。"
+            },
+            "triggers_enabled": {
+              "label": "自動応答を有効化",
+              "description": "tssh/JSON Expect ルールを有効にします。既定はオフで、保存済みルールも実行しません。"
+            },
+            "advanced_options": {
+              "label": "詳細オプションを表示",
+              "description": "タイムアウト・keepalive・環境変数・自動応答・読み取り専用などの詳細設定を表示します。既定はオフです。"
+            }
+          },
+          "actions": {
+            "import-private-key": {
+              "label": "秘密鍵をインポート",
+              "description": "このマシン上の秘密鍵ファイルを選択すると、内容がキー内容フィールドに入力され、保存時に vault に保存されます。デスクトップのみ。"
+            },
+            "import-sessions": {
+              "label": "接続をインポート",
+              "description": "ソース（MobaXterm・Xshell・WindTerm・SecureCRT・FinalShell・Electerm・Termius または OpenSSH config）を選び、そのエクスポートファイルを選択すると、最初のセッションがこのフォームに入力されます（パスワードと秘密鍵の内容は入力されません）。デスクトップのみ。一括インポートはワークベンチのインポートウィザードを利用してください。"
+            }
+          }
+        },
+        "net.iborshell.workbench": {
+          "label": "ターミナル",
+          "description": "ターミナル、SFTP ファイル管理、リモート運用。"
+        },
+        "net.iborshell.files": {
+          "label": "SFTP ファイル",
+          "description": "SFTP 経由のリモートファイルシステム。"
+        },
+        "net.iborshell.open-local-terminal": {
+          "label": "ターミナル",
+          "description": "このマシンでターミナルを開きます。"
+        },
+        "net.iborshell.local-terminal-entrypoints": {},
+        "net.iborshell.tunnels": {
+          "label": "ポート転送",
+          "description": "ターミナルを開かずに SSH ポート転送を管理します。"
+        },
+        "net.iborshell.manage-tunnels": {
+          "label": "ポート転送"
+        },
+        "net.iborshell.tunnels.quick": {
+          "label": "保存済みポート転送を開始"
+        },
+        "net.iborshell.start-saved-tunnels": {
+          "label": "保存済みポート転送を開始"
+        }
+      }
+    },
+    "pt-BR": {
+      "name": "Terminal",
+      "description": "Terminal SSH, gestor SFTP e operações remotas no DBX.",
+      "contributions": {
+        "net.iborshell.local": {
+          "label": "Shell local",
+          "description": "Executa comandos agendados na própria máquina onde o DBX está em execução, por meio de um shell local. Sem endpoint de rede e sem credenciais; o shell é resolvido pelo formulário de conexão ou pela cadeia do shell padrão do DBX.",
+          "fields": {
+            "display_name": {
+              "label": "Nome da conexão"
+            },
+            "shell": {
+              "label": "Shell",
+              "description": "Caminho absoluto do shell que executará os comandos da tarefa. Deixe vazio para usar o shell padrão do DBX (a mesma cadeia do terminal local)."
+            },
+            "cwd": {
+              "label": "Diretório de trabalho",
+              "description": "Diretório absoluto onde o shell inicia. Deixe vazio para usar o diretório pessoal; ao reabrir o terminal, o último diretório do shell é mantido."
+            },
+            "env": {
+              "label": "Variáveis de ambiente",
+              "description": "Variáveis de ambiente adicionais, uma linha NAME=value cada uma. TERM, COLORTERM e TERM_PROGRAM são gerenciados pelo terminal; linhas vazias ou malformadas são ignoradas."
+            }
+          }
+        },
+        "net.iborshell.connection": {
+          "label": "Servidor SSH",
+          "description": "Conexão SSH e SFTP com senha, chave privada, agente ou sem autenticação.",
+          "fields": {
+            "display_name": {
+              "label": "Nome da conexão"
+            },
+            "protocol": {
+              "label": "Protocolo",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "Serial",
+                "rdp": "RDP (experimental)"
+              },
+              "description": "Protocolo de sessão desta conexão. Conexões Telnet, VNC e RDP abrem sua própria visualização de sessão no workbench (as opções por protocolo ficam lá); conexões seriais usam um dispositivo local e dispensam os campos TCP. RDP é experimental."
+            },
+            "serial_port": {
+              "label": "Dispositivo serial",
+              "description": "Caminho do dispositivo serial local, ex.: /dev/ttyUSB0 (Linux/macOS) ou COM3 (Windows)."
+            },
+            "serial_baud": {
+              "label": "Baud rate",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "Bits de dados",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "Paridade",
+              "options": {
+                "none": "Nenhuma",
+                "even": "Par",
+                "odd": "Ímpar"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "Bits de parada",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "O que o Backspace envia",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "Domínio",
+              "description": "Domínio do Windows para NLA (opcional)."
+            },
+            "rdp_resolution": {
+              "label": "Resolução",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "Política de certificado",
+              "options": {
+                "prompt": "Perguntar em caso de divergência",
+                "strict": "Rígido (rejeitar divergência)",
+                "accept-temporarily": "Aceitar temporariamente"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "Compartilhar área de transferência"
+            },
+            "host": {
+              "label": "Host"
+            },
+            "port": {
+              "label": "Porta",
+              "description": "Porta TCP, 1-65535 (padrão 22). O host recusa a conexão quando é 0 ou está fora do intervalo."
+            },
+            "username": {
+              "label": "Usuário"
+            },
+            "authentication": {
+              "label": "Autenticação",
+              "options": {
+                "password": "Senha",
+                "private-key": "Chave privada",
+                "private-key-password": "Chave privada e depois senha",
+                "agent": "Agente SSH",
+                "auto": "Automático (tentar em ordem)",
+                "none": "Sem autenticação"
+              },
+              "description": "Como entrar no servidor: senha, chave privada, agente SSH, sem autenticação ou automático (tenta senha, chave privada, prompts interativos e agente SSH em ordem até que um funcione)."
+            },
+            "password": {
+              "label": "Senha",
+              "description": "Senha para «Senha», «Chave privada e depois senha» e «Automático»; obrigatória quando «Origem da senha» é «Digitar neste formulário». Conexões Telnet, VNC e RDP usam esta senha diretamente. Para obtê-la com um comando local, mude a origem para «Comando local». Automático tenta cada método em ordem, então esta é uma das possíveis fontes."
+            },
+            "password_source": {
+              "label": "Origem da senha",
+              "options": {
+                "direct": "Digitar neste formulário",
+                "command": "Comando local"
+              },
+              "description": "Define de onde vem a senha de login. «Digitar neste formulário» exige o campo Senha; «Comando local» exige Comando de senha, executado com seus privilégios ao conectar."
+            },
+            "private_key_path": {
+              "label": "Caminho da chave privada",
+              "description": "Digite o caminho ou escolha a chave: a lista de sugestões (desktop) e o botão de arquivo preenchem este campo; em Web/Docker o botão envia a chave para «Conteúdo da chave privada» e limpa este campo. Caminho ou conteúdo: pelo menos um dos dois."
+            },
+            "private_key_passphrase": {
+              "label": "Frase secreta da chave",
+              "description": "Frase que desbloqueia o arquivo da chave privada; é diferente da senha da conta."
+            },
+            "private_key": {
+              "label": "Conteúdo da chave privada",
+              "description": "Cole o conteúdo da chave (OpenSSH, PEM ou PPK); em Web/Docker o botão de arquivo acima envia para cá. Um conteúdo não vazio tem precedência sobre o caminho, fica no cofre de segredos e nunca é exibido novamente; escolher um arquivo acima apaga este campo."
+            },
+            "agent_socket": {
+              "label": "Socket do agente",
+              "description": "Substituição opcional do SSH_AUTH_SOCK. Deixe vazio para usar o padrão do ambiente ou o Pageant no Windows."
+            },
+            "set_env": {
+              "label": "Ambiente (SetEnv)",
+              "description": "Entradas KEY=VALUE opcionais para os canais de terminal, exec e sudo.",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "Regras de resposta automática",
+              "description": "Regras Expect de tssh/JSON para respostas automáticas. Um servidor pode falsificar prompts e receber respostas configuradas. Vazio desativa.",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
+            },
+            "trigger_answer_1": {
+              "label": "Slot secreto 1",
+              "description": "Segredo enviado quando referenciado por sendSecretKey. Um servidor pode falsificar o prompt."
+            },
+            "trigger_answer_2": {
+              "label": "Slot secreto 2",
+              "description": "Segredo enviado quando referenciado por sendSecretKey. Um servidor pode falsificar o prompt."
+            },
+            "password_command": {
+              "label": "Comando de senha",
+              "description": "Comando local para obter a senha de login. Usa o stdout sem a última quebra de linha. Obrigatório quando «Origem da senha» é «Comando local»; executado com seus privilégios."
+            },
+            "passphrase_command": {
+              "label": "Comando de frase secreta",
+              "description": "Comando local para obter a frase secreta de uma chave ausente. Usa o stdout sem a última quebra de linha. Executado com seus privilégios."
+            },
+            "remote_command": {
+              "label": "Comando remoto",
+              "description": "Executado no lugar do shell ao abrir o terminal. Vazio usa um shell normal."
+            },
+            "sudo_source": {
+              "label": "Credenciais sudo",
+              "options": {
+                "custom": "Personalizado (esta conexão)",
+                "global": "Perfil Quick Sudo global",
+                "off": "Desativado"
+              },
+              "description": "Escolha a origem das credenciais sudo: selecione Personalizado (esta conexão) ou um perfil global Quick Sudo apenas se este host exigir sudo; caso contrário, mantenha Desativado. Ignorado em conexões somente leitura. Desativado não trata credenciais sudo; o campo 2FA abaixo continua servindo ao MFA do login."
+            },
+            "sudo_profile": {
+              "label": "Perfil Quick Sudo",
+              "description": "Perfil global Quick Sudo opcional."
+            },
+            "read_only": {
+              "label": "Somente leitura",
+              "description": "Rejeita operações de escrita nesta conexão."
+            },
+            "sudo_whitelist": {
+              "label": "Lista de permissões sudo",
+              "description": "Lista opcional de comandos sudo, um por linha. Vazia permite todos."
+            },
+            "auth_flow_mode": {
+              "description": "Controla as respostas OTP automáticas no login e no sudo. Escolha «Senha e OTP combinados» para hosts que pedem o código primeiro ou juntam senha e código. Desativado só desliga a resposta automática; perguntas keyboard-interactive sem resposta aparecem em uma caixa mascarada durante a conexão quando o host DBX oferece suporte. Conexões existentes mantêm o modo salvo.",
+              "label": "2FA",
+              "options": {
+                "off": "Desativado (nunca responder OTP)",
+                "password_then_otp": "Senha primeiro, depois OTP",
+                "password_plus_otp": "Senha e OTP combinados",
+                "password_only": "Somente senha"
+              }
+            },
+            "sudo_password": {
+              "label": "Senha sudo",
+              "description": "Senha para o sudo; vazia, reutiliza a senha de login."
+            },
+            "sudo_use_pty": {
+              "label": "Solicitar PTY para sudo",
+              "description": "Solicita um TTY para os prompts do sudo."
+            },
+            "totp_secret": {
+              "label": "Segredos TOTP",
+              "description": "Um por linha: URI otpauth:// ou chave base32 para códigos automáticos, ou um código de recuperação estático. Deixe em branco para inserir um código rotativo de aplicativo, token físico ou SMS na conexão; não salve aqui o código atual de seis dígitos."
+            },
+            "password_prompt_hint": {
+              "label": "Prompt de senha",
+              "description": "Texto opcional para reconhecer prompts de senha. O texto de OTP pertence ao campo de prompt de OTP ao lado: uma pista aqui só corresponde a prompts de senha."
+            },
+            "totp_prompt_hint": {
+              "label": "Prompt de OTP",
+              "description": "Texto extra opcional para reconhecer prompts de OTP. Os padrões integrados já cobrem textos comuns como «[OTP Code]» ou «Please Enter MFA Code.»; adicione uma pista só se o servidor pedir de outra forma."
+            },
+            "connect_timeout_secs": {
+              "label": "Tempo limite SSH (segundos)",
+              "description": "Tempo limite do handshake e da autenticação SSH."
+            },
+            "keepalive_interval_secs": {
+              "label": "Keepalive SSH (segundos)",
+              "description": "Intervalo do keepalive SSH; 0 desativa."
+            },
+            "terminal_keepalive_secs": {
+              "label": "Keepalive do terminal (segundos)",
+              "description": "Keepalive de ociosidade do terminal; 0 desativa."
+            },
+            "triggers_enabled": {
+              "label": "Ativar respostas automáticas",
+              "description": "Ativa regras Expect de tssh/JSON. Desativado por padrão; regras salvas ficam inativas."
+            },
+            "advanced_options": {
+              "label": "Mostrar opções avançadas",
+              "description": "Mostra as configurações menos usadas: tempos limite, keepalive, ambiente, respostas automáticas e somente leitura. Desativado por padrão."
+            }
+          },
+          "actions": {
+            "import-private-key": {
+              "label": "Importar chave privada",
+              "description": "Escolha um arquivo de chave privada nesta máquina; o conteúdo preenche o campo de conteúdo da chave e é salvo no cofre ao salvar. Somente desktop."
+            },
+            "import-sessions": {
+              "label": "Importar conexões",
+              "description": "Escolha a origem (MobaXterm, Xshell, WindTerm, SecureCRT, FinalShell, Electerm, Termius ou um config do OpenSSH) e depois o arquivo de exportação; a primeira sessão preenche este formulário (senhas e conteúdo de chaves privadas nunca são preenchidos). Somente desktop; a importação em massa fica no assistente de importação do workbench."
+            }
+          }
+        },
+        "net.iborshell.workbench": {
+          "label": "Terminal",
+          "description": "Terminal, gestor SFTP e operações remotas."
+        },
+        "net.iborshell.files": {
+          "label": "Arquivos SFTP",
+          "description": "Sistema de arquivos remoto via SFTP."
+        },
+        "net.iborshell.open-local-terminal": {
+          "label": "Terminal",
+          "description": "Abrir um terminal nesta máquina."
+        },
+        "net.iborshell.local-terminal-entrypoints": {},
+        "net.iborshell.tunnels": {
+          "label": "Encaminhamentos de porta",
+          "description": "Gerencie encaminhamentos SSH sem abrir um terminal."
+        },
+        "net.iborshell.manage-tunnels": {
+          "label": "Encaminhamentos de porta"
+        },
+        "net.iborshell.tunnels.quick": {
+          "label": "Iniciar encaminhamentos salvos"
+        },
+        "net.iborshell.start-saved-tunnels": {
+          "label": "Iniciar encaminhamentos salvos"
+        }
+      }
+    },
+    "zh-CN": {
+      "name": "终端",
+      "description": "面向服务器运维的终端：交互式会话、SFTP 文件传输、远程命令和受控运维操作集中在一个界面。",
+      "contributions": {
+        "net.iborshell.local": {
+          "label": "本地 Shell",
+          "description": "通过本地 Shell 在运行 DBX 的机器上执行定时命令。无网络端点、无需凭据；Shell 由连接表单或 DBX 默认 Shell 解析链决定。",
+          "fields": {
+            "display_name": {
+              "label": "连接名称"
+            },
+            "shell": {
+              "label": "Shell",
+              "description": "运行任务命令所用的 Shell 绝对路径。留空则使用 DBX 默认 Shell（与本地终端同一解析链）。"
+            },
+            "cwd": {
+              "label": "工作目录",
+              "description": "Shell 启动所在的绝对目录。留空则使用家目录；重开终端会继承 Shell 最后所在目录。"
+            },
+            "env": {
+              "label": "环境变量",
+              "description": "追加的环境变量，每行一条 NAME=value。TERM、COLORTERM、TERM_PROGRAM 由终端托管；空行与格式非法的行将被忽略。"
+            }
+          }
+        },
+        "net.iborshell.connection": {
+          "label": "SSH 服务器",
+          "description": "支持密码、私钥、SSH Agent 或无认证的 SSH/SFTP 连接。",
+          "fields": {
+            "display_name": {
+              "label": "连接名称"
+            },
+            "protocol": {
+              "label": "协议",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "串口",
+                "rdp": "RDP（实验性）"
+              },
+              "description": "此连接承载的会话协议。Telnet、VNC 与 RDP 连接会在工作台内打开各自的会话视图（协议选项在工作台内设置）；串口连接直接使用本地设备，无需 TCP 主机字段。RDP 为实验能力。"
+            },
+            "serial_port": {
+              "label": "串口设备",
+              "description": "本地串口设备路径，如 /dev/ttyUSB0（Linux/macOS）或 COM3（Windows）。"
+            },
+            "serial_baud": {
+              "label": "波特率",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "数据位",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "校验位",
+              "options": {
+                "none": "无",
+                "even": "偶校验",
+                "odd": "奇校验"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "停止位",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "退格键发送",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "域",
+              "description": "Windows NLA 域（可选）。"
+            },
+            "rdp_resolution": {
+              "label": "分辨率",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "证书策略",
+              "options": {
+                "prompt": "不匹配时询问",
+                "strict": "严格（不匹配即拒绝）",
+                "accept-temporarily": "临时接受"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "共享剪贴板"
+            },
+            "host": {
+              "label": "主机"
+            },
+            "port": {
+              "label": "端口",
+              "description": "TCP 端口，取值 1-65535（默认 22）；填 0 或超出范围时宿主会拒绝连接。"
+            },
+            "username": {
+              "label": "用户名"
+            },
+            "authentication": {
+              "label": "认证方式",
+              "options": {
+                "password": "密码",
+                "private-key": "私钥",
+                "private-key-password": "私钥后密码",
+                "agent": "SSH Agent",
+                "auto": "自动（按序尝试）",
+                "none": "无认证"
+              },
+              "description": "选择登录服务器的方式：密码、私钥、SSH Agent、无认证或自动（按密码→私钥→交互式提问→SSH Agent 的顺序依次尝试，直到成功）。"
+            },
+            "password": {
+              "label": "密码",
+              "description": "供「密码」「私钥后密码」「自动」三种认证使用；「密码来源」选「在表单中填写」时必填。Telnet、VNC、RDP 连接直接使用此密码。若由本地命令取回，请把「密码来源」改为「本地命令取回」。自动按序尝试各认证方式，密码只是其中一种来源。"
+            },
+            "password_source": {
+              "label": "密码来源",
+              "options": {
+                "direct": "在表单中填写",
+                "command": "本地命令取回"
+              },
+              "description": "登录密码的来源。「在表单中填写」时密码为必填；「本地命令取回」时必填「密码命令」，命令以当前用户权限在连接时执行。"
+            },
+            "private_key_path": {
+              "label": "私钥路径",
+              "description": "可直接输入密钥路径，也可选：右侧建议下拉（桌面端）与「选择文件…」按钮都会填入本字段；Web/Docker 下「选择文件…」改为上传，内容写入下方「私钥内容」并清空本字段。本路径与「私钥内容」二选一，至少填一项。"
+            },
+            "private_key_passphrase": {
+              "label": "私钥口令",
+              "description": "用于解锁私钥文件的口令，与账号密码不同。"
+            },
+            "private_key": {
+              "label": "私钥内容",
+              "description": "粘贴私钥内容（OpenSSH/PEM/PPK）；Web/Docker 下上方「选择文件…」上传的内容也写入这里。内容非空时优先于路径，保存在密钥库中、不再回显；上方选了文件会清空本字段。"
+            },
+            "agent_socket": {
+              "label": "Agent Socket",
+              "description": "可选的 SSH_AUTH_SOCK 覆盖；留空则使用环境默认值（Windows 下为 Pageant）。"
+            },
+            "connect_timeout_secs": {
+              "label": "SSH 超时（秒）",
+              "description": "SSH 握手和认证超时时间。"
+            },
+            "keepalive_interval_secs": {
+              "label": "SSH 保活（秒）",
+              "description": "SSH 保活探测间隔；0 关闭。"
+            },
+            "terminal_keepalive_secs": {
+              "label": "终端保活（秒）",
+              "description": "终端空闲保活间隔；0 关闭。"
+            },
+            "set_env": {
+              "label": "环境变量（SetEnv）",
+              "description": "发送到终端、exec 和 sudo 通道的可选 KEY=VALUE。",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "自动应答规则",
+              "description": "用于自动应答的 tssh/JSON Expect 规则。恶意服务器可能伪造提示并收到配置的应答；留空关闭。",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
+            },
+            "trigger_answer_1": {
+              "label": "密文槽 1",
+              "description": "被 sendSecretKey 引用时发送的密文；服务器可能伪造提示获取它。"
+            },
+            "trigger_answer_2": {
+              "label": "密文槽 2",
+              "description": "被 sendSecretKey 引用时发送的密文；服务器可能伪造提示获取它。"
+            },
+            "password_command": {
+              "label": "密码命令",
+              "description": "用于取回登录密码的本地命令。使用 stdout（去掉一个结尾换行）；「密码来源」选「本地命令取回」时必填，并以当前用户权限执行。"
+            },
+            "passphrase_command": {
+              "label": "私钥口令命令",
+              "description": "私钥口令缺失时执行的本地命令。使用 stdout（去掉一个结尾换行）；命令以当前用户权限运行。"
+            },
+            "remote_command": {
+              "label": "远程命令",
+              "description": "打开终端时替代 shell 执行。留空使用普通 shell。"
+            },
+            "sudo_source": {
+              "label": "Sudo 凭据",
+              "options": {
+                "custom": "自定义（本连接）",
+                "global": "全局 Quick Sudo 配置",
+                "off": "关闭"
+              },
+              "description": "选择 sudo 凭据来源：本机需要提权时再选「自定义（本连接）」或「全局 Quick Sudo 配置」，否则保持「关闭」。只读连接上忽略。关闭时不处理 sudo 凭据，但下面的 2FA 字段仍服务登录期 MFA。"
+            },
+            "sudo_profile": {
+              "label": "Quick Sudo 配置",
+              "description": "可选的全局 Quick Sudo 配置。"
+            },
+            "sudo_password": {
+              "label": "sudo 密码",
+              "description": "传给 sudo 的密码；留空复用登录密码。"
+            },
+            "totp_secret": {
+              "label": "TOTP 密钥",
+              "description": "每行一条：用于自动生成验证码的 otpauth:// URI 或 base32 密钥，也可填写静态恢复码。手机、硬件令牌或短信中的动态码请留空，连接时会弹窗输入；不要把当前六位动态码长期保存在这里。"
+            },
+            "auth_flow_mode": {
+              "label": "2FA",
+              "description": "控制登录与 sudo 的 OTP 自动应答。先问验证码、或把密码与验证码合并成一条提问的主机请选「密码与 OTP 组合」；关闭仅禁用自动应答，登录期仍会在 DBX 宿主支持时通过密文弹窗询问未回答的 keyboard-interactive 提问。已有连接保留原设置。",
+              "options": {
+                "off": "关闭（不自动应答 OTP）",
+                "password_then_otp": "先密码，再 OTP",
+                "password_plus_otp": "密码与 OTP 组合",
+                "password_only": "仅密码"
+              }
+            },
+            "password_prompt_hint": {
+              "label": "密码提示",
+              "description": "用于识别密码提示的可选文本。OTP 文案请填相邻的 OTP 提示字段——填在这里只会匹配密码提问。"
+            },
+            "totp_prompt_hint": {
+              "label": "OTP 提示",
+              "description": "可选：用于识别 OTP 提示的额外文本。常见文案（「[OTP Code]」「Please Enter MFA Code.」）已由内置模式覆盖，只有服务器用别的写法时才需要填。"
+            },
+            "sudo_use_pty": {
+              "label": "sudo 请求 PTY",
+              "description": "为 sudo 提示申请 TTY。"
+            },
+            "read_only": {
+              "label": "只读",
+              "description": "拒绝此连接上的写操作。"
+            },
+            "sudo_whitelist": {
+              "label": "sudo 白名单",
+              "description": "可选的 sudo 命令白名单，每行一条。留空允许所有命令。"
+            },
+            "triggers_enabled": {
+              "label": "启用自动应答",
+              "description": "启用 tssh/JSON Expect 规则。默认关闭，已保存规则不会运行。"
+            },
+            "advanced_options": {
+              "label": "显示高级选项",
+              "description": "显示超时、保活、环境变量、自动应答与只读等进阶设置，默认关闭。"
+            }
+          },
+          "actions": {
+            "import-private-key": {
+              "label": "导入私钥",
+              "description": "选择本机私钥文件，内容将填入「私钥内容」字段，保存后存入密钥库。仅桌面端可用。"
+            },
+            "import-sessions": {
+              "label": "导入连接",
+              "description": "先选择来源类型（MobaXterm、Xshell、WindTerm、SecureCRT、FinalShell、Electerm、Termius 或 OpenSSH config），再选择对应的导出文件，首条会话将回填本表单（密码与私钥内容永不回填）。仅桌面端可用；批量导入请用工作台的导入向导。"
+            }
+          }
+        },
+        "net.iborshell.workbench": {
+          "label": "终端",
+          "description": "终端、SFTP 文件管理与远程运维。"
+        },
+        "net.iborshell.files": {
+          "label": "SFTP 文件",
+          "description": "通过 SFTP 访问远程文件系统。"
+        },
+        "net.iborshell.open-local-terminal": {
+          "label": "终端",
+          "description": "在本机打开一个终端。"
+        },
+        "net.iborshell.local-terminal-entrypoints": {},
+        "net.iborshell.tunnels": {
+          "label": "端口映射",
+          "description": "无需打开终端即可管理 SSH 端口转发。"
+        },
+        "net.iborshell.manage-tunnels": {
+          "label": "端口映射"
+        },
+        "net.iborshell.tunnels.quick": {
+          "label": "启用所有已保存端口映射"
+        },
+        "net.iborshell.start-saved-tunnels": {
+          "label": "启用所有已保存端口映射"
+        }
+      }
+    },
+    "zh-TW": {
+      "name": "終端機",
+      "description": "面向伺服器維運的終端機：互動式工作階段、SFTP 檔案傳輸、遠端命令與受控維運操作集中在一個介面。",
+      "contributions": {
+        "net.iborshell.local": {
+          "label": "本地 Shell",
+          "description": "透過本地 Shell 在執行 DBX 的機器上執行排程命令。無網路端點、無需憑證；Shell 由連線表單或 DBX 預設 Shell 解析鏈決定。",
+          "fields": {
+            "display_name": {
+              "label": "連線名稱"
+            },
+            "shell": {
+              "label": "Shell",
+              "description": "執行任務命令所用的 Shell 絕對路徑。留空則使用 DBX 預設 Shell（與本地終端機同一解析鏈）。"
+            },
+            "cwd": {
+              "label": "工作目錄",
+              "description": "Shell 啟動所在的絕對目錄。留空則使用家目錄；重新開啟終端機會繼承 Shell 最後所在目錄。"
+            },
+            "env": {
+              "label": "環境變數",
+              "description": "附加的環境變數，每行一條 NAME=value。TERM、COLORTERM、TERM_PROGRAM 由終端機託管；空行與格式非法的行將被忽略。"
+            }
+          }
+        },
+        "net.iborshell.connection": {
+          "label": "SSH 伺服器",
+          "description": "支援密碼、私鑰、SSH Agent 或無認證的 SSH 與 SFTP 連線。",
+          "fields": {
+            "display_name": {
+              "label": "連線名稱"
+            },
+            "protocol": {
+              "label": "協議",
+              "options": {
+                "ssh": "SSH",
+                "telnet": "Telnet",
+                "vnc": "VNC",
+                "serial": "串列埠",
+                "rdp": "RDP（實驗性）"
+              },
+              "description": "此連線承載的會話協議。Telnet、VNC 與 RDP 連線會在工作台內開啟各自的會話檢視（協議選項在工作台內設定）；串列埠連線直接使用本機裝置，無需 TCP 主機欄位。RDP 為實驗能力。"
+            },
+            "serial_port": {
+              "label": "串列埠裝置",
+              "description": "本機串列埠裝置路徑，如 /dev/ttyUSB0（Linux/macOS）或 COM3（Windows）。"
+            },
+            "serial_baud": {
+              "label": "鮑率",
+              "options": {
+                "9600": "9600",
+                "19200": "19200",
+                "38400": "38400",
+                "57600": "57600",
+                "115200": "115200",
+                "230400": "230400"
+              }
+            },
+            "serial_data_bits": {
+              "label": "資料位",
+              "options": {
+                "7": "7",
+                "8": "8"
+              }
+            },
+            "serial_parity": {
+              "label": "同位位元",
+              "options": {
+                "none": "無",
+                "even": "偶同位",
+                "odd": "奇同位"
+              }
+            },
+            "serial_stop_bits": {
+              "label": "停止位元",
+              "options": {
+                "1": "1",
+                "2": "2"
+              }
+            },
+            "serial_backspace": {
+              "label": "退格鍵送出",
+              "options": {
+                "del": "DEL (0x7F)",
+                "ctrl_h": "Ctrl+H (0x08)"
+              }
+            },
+            "rdp_domain": {
+              "label": "網域",
+              "description": "Windows NLA 網域（可選）。"
+            },
+            "rdp_resolution": {
+              "label": "解析度",
+              "options": {
+                "1024x768": "1024×768",
+                "1280x720": "1280×720",
+                "1280x800": "1280×800",
+                "1366x768": "1366×768",
+                "1600x900": "1600×900",
+                "1920x1080": "1920×1080",
+                "2560x1440": "2560×1440"
+              }
+            },
+            "rdp_certificate_policy": {
+              "label": "憑證策略",
+              "options": {
+                "prompt": "不符時詢問",
+                "strict": "嚴格（不符即拒絕）",
+                "accept-temporarily": "暫時接受"
+              }
+            },
+            "rdp_clipboard": {
+              "label": "共用剪貼簿"
+            },
+            "host": {
+              "label": "主機"
+            },
+            "port": {
+              "label": "連接埠",
+              "description": "TCP 連接埠，取值 1-65535（預設 22）；填 0 或超出範圍時宿主會拒絕連線。"
+            },
+            "username": {
+              "label": "使用者名稱"
+            },
+            "authentication": {
+              "label": "認證方式",
+              "options": {
+                "password": "密碼",
+                "private-key": "私鑰",
+                "private-key-password": "私鑰後密碼",
+                "agent": "SSH Agent",
+                "auto": "自動（依序嘗試）",
+                "none": "無認證"
+              },
+              "description": "選擇登入伺服器的方式：密碼、私鑰、SSH Agent、無認證或自動（按密碼→私鑰→互動式提問→SSH Agent 的順序依次嘗試，直到成功）。"
+            },
+            "password": {
+              "label": "密碼",
+              "description": "供「密碼」「私鑰後密碼」「自動」三種認證使用；「密碼來源」選「在表單中填寫」時必填。Telnet、VNC、RDP 連線直接使用此密碼。若由本機命令取回，請把「密碼來源」改為「本機命令取回」。自動依序嘗試各認證方式，密碼只是其中一種來源。"
+            },
+            "password_source": {
+              "label": "密碼來源",
+              "options": {
+                "direct": "在表單中填寫",
+                "command": "本機命令取回"
+              },
+              "description": "登入密碼的來源。「在表單中填寫」時密碼為必填；「本機命令取回」時必填「密碼命令」，命令以目前使用者權限於連線時執行。"
+            },
+            "private_key_path": {
+              "label": "私鑰路徑",
+              "description": "可直接輸入金鑰路徑，也可選：右側建議下拉（桌面端）與「選擇檔案…」按鈕都會填入本欄位；Web/Docker 下「選擇檔案…」改為上傳，內容寫入下方「私鑰內容」並清空本欄位。本路徑與「私鑰內容」二選一，至少填一項。"
+            },
+            "private_key_passphrase": {
+              "label": "私鑰密語",
+              "description": "用於解鎖私鑰檔案的密語，與帳號密碼不同。"
+            },
+            "private_key": {
+              "label": "私鑰內容",
+              "description": "貼上私鑰內容（OpenSSH/PEM/PPK）；Web/Docker 下上方「選擇檔案…」上傳的內容也會寫入這裡。內容非空時優先於路徑，儲存在金鑰庫中、不再回顯；上方選了檔案會清空本欄位。"
+            },
+            "agent_socket": {
+              "label": "Agent Socket",
+              "description": "選用的 SSH_AUTH_SOCK 覆寫；留空則使用環境預設值（Windows 下為 Pageant）。"
+            },
+            "connect_timeout_secs": {
+              "label": "SSH 逾時（秒）",
+              "description": "SSH 交握與認證逾時時間。"
+            },
+            "keepalive_interval_secs": {
+              "label": "SSH 保活（秒）",
+              "description": "SSH 保活探測間隔；0 表示關閉。"
+            },
+            "terminal_keepalive_secs": {
+              "label": "終端保活（秒）",
+              "description": "終端閒置保活間隔；0 表示關閉。"
+            },
+            "set_env": {
+              "label": "環境變數（SetEnv）",
+              "description": "傳送到終端、exec 與 sudo 通道的選用 KEY=VALUE。",
+              "placeholder": "LANG=zh_CN.UTF-8"
+            },
+            "triggers": {
+              "label": "自動回應規則",
+              "description": "用於自動回應的 tssh/JSON Expect 規則。惡意伺服器可能偽造提示並收到設定的回應；留空關閉。",
+              "placeholder": "#!! ExpectCount 1\n#!! ExpectPattern1 (?i)verification code\n#!! ExpectSendText1 654321\\r"
+            },
+            "trigger_answer_1": {
+              "label": "密文槽 1",
+              "description": "被 sendSecretKey 引用時傳送的密文；伺服器可能偽造提示取得它。"
+            },
+            "trigger_answer_2": {
+              "label": "密文槽 2",
+              "description": "被 sendSecretKey 引用時傳送的密文；伺服器可能偽造提示取得它。"
+            },
+            "password_command": {
+              "label": "密碼命令",
+              "description": "用於取回登入密碼的本機命令。使用 stdout（去掉一個結尾換行）；「密碼來源」選「本機命令取回」時必填，並以目前使用者權限執行。"
+            },
+            "passphrase_command": {
+              "label": "私鑰通關密語命令",
+              "description": "私鑰通關密語缺失時執行的本機命令。使用 stdout（去掉一個結尾換行）；命令以目前使用者權限執行。"
+            },
+            "remote_command": {
+              "label": "遠端命令",
+              "description": "開啟終端時取代 shell 執行。留空使用一般 shell。"
+            },
+            "sudo_source": {
+              "label": "Sudo 憑據",
+              "options": {
+                "custom": "自訂（本連線）",
+                "global": "全域 Quick Sudo 設定",
+                "off": "關閉"
+              },
+              "description": "選擇 sudo 憑據來源：本機需要提權時再選「自訂（本連線）」或「全域 Quick Sudo 設定」，否則保持「關閉」。唯讀連線上忽略。關閉時不處理 sudo 憑據，但下方的 2FA 欄位仍服務登入期 MFA。"
+            },
+            "sudo_profile": {
+              "label": "Quick Sudo 設定",
+              "description": "選用的全域 Quick Sudo 設定。"
+            },
+            "sudo_password": {
+              "label": "sudo 密碼",
+              "description": "傳給 sudo 的密碼；留空則重用登入密碼。"
+            },
+            "totp_secret": {
+              "label": "TOTP 金鑰",
+              "description": "每行一條：用於自動產生驗證碼的 otpauth:// URI 或 base32 金鑰，也可填寫靜態復原碼。手機、硬體權杖或簡訊中的動態碼請留空，連線時會彈窗輸入；不要把目前六位動態碼長期儲存在這裡。"
+            },
+            "auth_flow_mode": {
+              "label": "2FA",
+              "description": "控制登入與 sudo 的 OTP 自動應答。先問驗證碼、或把密碼與驗證碼合併成一條提問的主機請選「密碼與 OTP 組合」；關閉僅停用自動應答，登入時仍會在 DBX 主程式支援時，以遮罩彈窗詢問尚未回答的 keyboard-interactive 提問。現有連線保留原設定。",
+              "options": {
+                "off": "關閉（不自動應答 OTP）",
+                "password_then_otp": "先密碼，再 OTP",
+                "password_plus_otp": "密碼與 OTP 組合",
+                "password_only": "僅密碼"
+              }
+            },
+            "password_prompt_hint": {
+              "label": "密碼提示",
+              "description": "用於識別密碼提示的選用文字。OTP 文案請填相鄰的 OTP 提示欄位——填在這裡只會匹配密碼提問。"
+            },
+            "totp_prompt_hint": {
+              "label": "OTP 提示",
+              "description": "選用：用於識別 OTP 提示的額外文字。常見文案（「[OTP Code]」「Please Enter MFA Code.」）已由內建模式涵蓋，只有伺服器使用其他寫法時才需要填。"
+            },
+            "sudo_use_pty": {
+              "label": "sudo 請求 PTY",
+              "description": "為 sudo 提示請求 TTY。"
+            },
+            "read_only": {
+              "label": "唯讀",
+              "description": "拒絕此連線上的寫入操作。"
+            },
+            "sudo_whitelist": {
+              "label": "sudo 白名單",
+              "description": "選用的 sudo 命令白名單，每行一條。留空允許所有命令。"
+            },
+            "triggers_enabled": {
+              "label": "啟用自動回應",
+              "description": "啟用 tssh/JSON Expect 規則。預設關閉，已儲存規則不會執行。"
+            },
+            "advanced_options": {
+              "label": "顯示進階選項",
+              "description": "顯示逾時、保活、環境變數、自動應答與唯讀等進階設定，預設關閉。"
+            }
+          },
+          "actions": {
+            "import-private-key": {
+              "label": "匯入私鑰",
+              "description": "選擇本機私鑰檔案，內容將填入「私鑰內容」欄位，保存後存入金鑰庫。僅桌面端可用。"
+            },
+            "import-sessions": {
+              "label": "匯入連線",
+              "description": "先選擇來源類型（MobaXterm、Xshell、WindTerm、SecureCRT、FinalShell、Electerm、Termius 或 OpenSSH config），再選擇對應的匯出檔案，第一筆工作階段將回填本表單（密碼與私鑰內容永不回填）。僅桌面端可用；大量匯入請使用工作區的匯入精靈。"
+            }
+          }
+        },
+        "net.iborshell.workbench": {
+          "label": "終端",
+          "description": "終端、SFTP 檔案管理與遠端維運。"
+        },
+        "net.iborshell.files": {
+          "label": "SFTP 檔案",
+          "description": "透過 SFTP 存取遠端檔案系統。"
+        },
+        "net.iborshell.open-local-terminal": {
+          "label": "終端",
+          "description": "在本機開啟一個終端。"
+        },
+        "net.iborshell.local-terminal-entrypoints": {},
+        "net.iborshell.tunnels": {
+          "label": "連接埠映射",
+          "description": "無需開啟終端即可管理 SSH 連接埠轉發。"
+        },
+        "net.iborshell.manage-tunnels": {
+          "label": "連接埠映射"
+        },
+        "net.iborshell.tunnels.quick": {
+          "label": "啟用所有已儲存連接埠映射"
+        },
+        "net.iborshell.start-saved-tunnels": {
+          "label": "啟用所有已儲存連接埠映射"
+        }
+      }
+    }
+  }
+}

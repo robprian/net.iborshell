@@ -1,0 +1,121 @@
+interface DbxPluginBinaryEvent {
+  channel: string;
+  /** 当前宿主桥投递零拷贝字节；旧桥（Host API 1.0）投递 base64 字符串。 */
+  data?: Uint8Array;
+  dataBase64?: string;
+}
+
+interface DbxPluginBackendEvent {
+  type?: "event";
+  method: string;
+  params: Record<string, unknown>;
+}
+
+// 当前 SDK 经 onEvent 同时投递后端事件与宿主环境更新（真桥
+// pluginHostBridge updateLocale/updateTheme 以 {type:"env", locale?, theme?}
+// 推送；真桥不存在 onLocaleChange/onContextChange 订阅）。
+interface DbxPluginEnvironmentEvent {
+  type: "env";
+  locale?: string;
+  theme?: DbxPluginTheme;
+}
+
+type DbxPluginEvent = DbxPluginBackendEvent | DbxPluginEnvironmentEvent;
+
+interface DbxPluginFileTransferApi {
+  pick(options?: { accept?: string; multiple?: boolean }): Promise<{ files: Array<{ handleId: string; name: string; size: number; contentType: string }> }>;
+  read(handleId: string, offset: number, length?: number): Promise<{ dataBase64: string; length: number; eof: boolean }>;
+  beginSave(options: { name: string; contentType?: string; size?: number }): Promise<{ handleId: string; chunkBytes: number }>;
+  write(handleId: string, offset: number, data: Uint8Array | ArrayBuffer | string): Promise<{ written: number; nextOffset: number }>;
+  finish(handleId: string): Promise<void>;
+  cancel(handleId: string): Promise<void>;
+  onDragState(listener: (active: boolean) => void): () => void;
+  /** onDrop 条目：relativePath 为可选增量——宿主遍历拖入目录后按树内相对路径
+   * （`/` 分隔，含文件名）附带，文件夹上传据此重建目录结构；旧宿主不带。
+   * drop 为第二参数：truncated 表示宿主目录展开撞上限（如单文件夹 2000 文件）
+   * 只交付了前缀——宿主桥对旧监听器保持单参兼容，插件按需消费。 */
+  onDrop(listener: (files: Array<{ handleId: string; name: string; size: number; contentType: string; relativePath?: string }>, drop?: { dropId?: string; truncated?: boolean }) => void): () => void;
+}
+
+interface DbxPluginTheme {
+  appearance: "light" | "dark";
+  /** 宿主根节点解析后的设计令牌（--color-* / --radius-* / --font-*），Host API 1.0 无此字段。 */
+  tokens: Record<string, string>;
+}
+
+interface DbxPluginAppearance {
+  colorScheme: "light" | "dark";
+  colors: {
+    background: string;
+    foreground: string;
+    muted: string;
+    mutedForeground: string;
+    accent: string;
+    accentForeground: string;
+    border: string;
+    destructive: string;
+  };
+  terminal: { fontFamily: string; fontSize: number };
+  ui?: { fontFamily: string };
+}
+
+interface DbxPluginApi {
+  ready: Promise<Record<string, unknown>>;
+  readonly context?: Record<string, unknown>;
+  readonly appearance?: DbxPluginAppearance;
+  readonly theme?: DbxPluginTheme;
+  readonly locale: string;
+  /** 宿主能力位（Host API 1.2 起）；storage 缺失表示该宿主无持久化桥，clipboard* 在 Host API 1.3 起引入。
+   *  ai（Warp AI 对齐批）：宿主 AI 面板桥在位（host.ai.openConversation 可调）；
+   *  旧宿主缺省即不支持，消费方经 lib/aiBridge.aiBridgeAvailable 降级。 */
+  readonly capabilities?: { storage?: boolean; clipboardRead?: boolean; clipboardWrite?: boolean; ai?: boolean; aiCompletion?: boolean; aiRecommendations?: boolean };
+  /** 持久化 UI 状态桥（单值 256 KiB / 总量 1 MiB）；配 capabilities.storage 使用，经 shared/frontend/pluginStorage 读写。 */
+  readonly storage?: {
+    get(key: string): Promise<unknown>;
+    set(key: string, value: unknown): Promise<unknown>;
+    delete(key: string): Promise<unknown>;
+  };
+  request<T = unknown>(method: string, params?: unknown): Promise<T>;
+  invoke<T = unknown>(method: string, params?: unknown, options?: { timeoutMs?: number }): Promise<T>;
+  notify(method: string, params?: unknown): Promise<void>;
+  /** `target: "tab"`：面板 webview 显式请求主工作台 tab 落点（宿主桥扩展；旧宿主/不支持的面板忽略该选项，保持原落点）。 */
+  openWorkbench?(contributionId: string, context?: Record<string, unknown>, options?: { forceNew?: boolean; target?: "tab" }): Promise<void>;
+  /** 请宿主按当前最新配置重开连接（含 vault 最新凭据回推）。Host API 1.2+；旧宿主无此方法。 */
+  reopenConnection?(connectionId: string): Promise<unknown>;
+  sendBinary(channel: string, data: Uint8Array | ArrayBuffer | string): Promise<void>;
+  onEvent(listener: (event: DbxPluginEvent) => void): () => void;
+  onBinary(listener: (event: DbxPluginBinaryEvent) => void): () => void;
+  onAppearanceChange?(listener: (appearance: DbxPluginAppearance) => void): () => void;
+  /** 当前桥：context 推送（初始 context 仍经 api.ready / host.getContext 获取）。 */
+  onContext?(listener: (context: Record<string, unknown>) => void): () => void;
+  /** Legacy optional callback; current bridges use onContext. */
+  onContextChange?(listener: (context: Record<string, unknown>) => void): () => void;
+  decodeBase64(value: string): Uint8Array;
+  encodeBase64(value: Uint8Array | ArrayBuffer): string;
+  readonly fileTransfer?: DbxPluginFileTransferApi;
+  /** 宿主单次落盘桥（Host API 1.1+，早于 fileTransfer）：字节交宿主顶层页面保存——
+   * 沙箱 iframe 自身点击 <a download> 会被浏览器静默丢弃（issue #93）。
+   * 宿主上限 512 MiB；桌面端走原生保存对话框，取消返回 null。 */
+  saveFile?(options: { fileName: string; contentType?: string }, data: Uint8Array | ArrayBuffer | string): Promise<{ path: string } | null>;
+  readonly workbenchState?: { set(state: Record<string, unknown>): Promise<void> };
+  readonly clipboard?: { readText(): Promise<string>; writeText(text: string): Promise<void> };
+  /** §8.3 workbench/close 两段式关闭：宿主拆除 webview 前通知插件释放 workbench scope
+   * （PTY 会话、订阅、临时状态）；监听器 settle 后 SDK 自动回 ack。Host API 1.2+；旧宿主无此方法。 */
+  readonly workbench?: { onClose(listener: () => void | Promise<void>): () => void };
+}
+
+interface DbxGifSaveFileHandle {
+  createWritable(): Promise<{
+    write(data: Uint8Array): Promise<void>;
+    close(): Promise<void>;
+  }>;
+}
+
+interface Window {
+  dbxPlugin: DbxPluginApi;
+  /** File System Access API: lets desktop webviews choose both folder and filename. */
+  showSaveFilePicker?: (options: {
+    suggestedName?: string;
+    types?: Array<{ description?: string; accept: Record<string, string[]> }>;
+  }) => Promise<DbxGifSaveFileHandle>;
+}

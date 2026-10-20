@@ -1,0 +1,448 @@
+name: SSH plugin CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per branch/PR: superseded pushes cancel instead of queueing (same
+# policy as files/kafka; main-branch in-flight runs are kept).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  PLUGIN_CLI_VERSION: "0.1.3"
+  # aws-lc-sys falls back to its bundled prebuilt NASM objects when the
+  # assembler is missing on the MSVC toolchain; harmless on every other OS.
+  AWS_LC_SYS_PREBUILT_NASM: "1"
+  # Windows runners default python stdout to cp1252; the smoke script prints
+  # Unicode (→, ✓) and would die on UnicodeEncodeError. UTF-8 mode is a no-op
+  # on the other platforms.
+  PYTHONUTF8: "1"
+  # sccache caches rustc invocations. It matters because `dbx-plugin package`
+  # rebuilds the sidecar from a staging copy with its own target dir, so
+  # rust-cache's target-dir reuse cannot help that step — sccache's
+  # content-keyed compilation cache can (same setup as files/ci.yml, which
+  # measured a full ~374-unit rebuild on every packaging run). Storage is a
+  # local dir persisted via actions/cache: a restore miss degrades to a cold
+  # build instead of a failure. Incremental must stay off for sccache Rust
+  # hits.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache-cache
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  validate:
+    name: Validate repository contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - run: python3 scripts/validate_repo.py
+      - run: node scripts/connection-forms/verify.mjs
+      # 方法注册四路比对：backend 分派臂 ↔ mock 桩 ↔ 前端 invoke ↔ 文档。
+      # 前端调用后端不存在的方法会在运行时静默落 "Method not found"，
+      # 这里是唯一的机器看护点。
+      - run: node scripts/mock_host_registry_check.mjs
+
+  frontend:
+    name: Frontend checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.24.0
+      # setup-node 的 pnpm 缓存需要 pnpm 已在 PATH 中，故置于 pnpm/action-setup 之后
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - run: pnpm --dir frontend install --frozen-lockfile
+      - run: pnpm --dir frontend typecheck
+      - run: pnpm --dir frontend test
+      - run: pnpm --dir frontend build
+      # Upload the target-independent UI once; the candidate matrix jobs unpack
+      # it as ui/ and package it as-is (DBX_PREBUILT_UI semantics) instead of
+      # rebuilding the frontend 5x.
+      - name: Upload prebuilt UI
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-ui-ssh
+          # Glob (not a bare directory) pins the artifact root at ui/, so the
+          # packaging jobs can unpack it straight as ui/index.html.
+          path: ui/**
+          if-no-files-found: error
+          retention-days: 3
+      # UI e2e 门禁：架构 WATCH —— 环境损坏不得与测试通过共享静默绿路径。
+      # playwright-core 按脚本约定装在仓库外的 runner 路径（/tmp/dbx-ui-mock，
+      # 与本地 SKIP 语义同一定位），项目 package.json 保持依赖冻结；版本由
+      # 受控 lockfile 精确固定，禁止 CI 隐式安装 latest。
+      # ubuntu-24.04 runner 自带 google-chrome-stable，脚本经 playwright
+      # channel:"chrome" 命中（Linux Chrome 探测已加入两脚本）。
+      # DBX_SMOKE_STRICT=1 把依赖缺失的 SKIP 变为非零失败。
+      - name: Install locked playwright-core outside the repo
+        run: |
+          rm -rf /tmp/dbx-ui-mock
+          cp -R scripts/ui-smoke-deps /tmp/dbx-ui-mock
+          npm ci --prefix /tmp/dbx-ui-mock --ignore-scripts
+      - name: UI smoke walkthroughs (strict gate)
+        env:
+          DBX_SMOKE_STRICT: "1"
+        run: |
+          node scripts/smoke_ui_mock.mjs
+          node scripts/smoke_ui_settings.mjs
+      # ui/index.html 已脱库：发布与候选打包各自现构建前端，
+      # 不再用「重建后 git diff 必须为空」的 freshness 门卡主仓。
+
+  backend:
+    name: Rust sidecar checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native dependencies
+        # libdbus-1-dev / nasm 已移除：secret-service（dbus）在 Linux 被 cfg
+        # 门控掉（走 keyfile 层），nasm 只服务 aws-lc-sys 的 MSVC 预置对象路径。
+        # libudev-dev：serialport 4 的 Linux 后端经 libudev-sys 枚举端口。
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.sccache-cache
+          # sccache is content-keyed, so an unchanged lock hash keeps the key
+          # stable and new code just adds entries. The primary key carries the
+          # job so parallel saves never collide; the restore prefix lets
+          # sibling jobs on the same OS share compilations.
+          key: sccache-${{ runner.os }}-${{ github.job }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ github.job }}-
+            sccache-${{ runner.os }}-
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
+      # docs/RDP_VENDOR_FORK_PLAN.zh-CN.md §6：vendored RDP 链锁步断言，
+      # 漂移（vendor/ 与 [patch.crates-io] / Cargo.lock 不一致）即红。先于
+      # fmt/clippy/test 执行，坏锁秒失败。
+      - name: Assert vendored RDP chain lockstep
+        run: python3 scripts/check_vendor_lockstep.py
+      - name: Verify vendored RDP provenance registration
+        # --require-recorded-hashes: 六个 crate 必须登记 tarball + 树双哈希，
+        # 树哈希与实际 vendored 内容逐文件比对（backend/vendor/README.md）。
+        run: python3 scripts/verify_rdp_vendor_integrity.py --require-recorded-hashes
+      - run: cargo fmt --manifest-path backend/Cargo.toml --check
+      # -D warnings keeps new lints out; a stable-toolchain update that
+      # introduces a new lint fails here and is fixed like any other red CI.
+      - run: cargo clippy --locked --manifest-path backend/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --locked --manifest-path backend/Cargo.toml
+
+  windows-regression:
+    name: Windows connection-config regression
+    runs-on: windows-2022
+    needs: [validate]
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.sccache-cache
+          key: sccache-${{ runner.os }}-${{ github.job }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ github.job }}-
+            sccache-${{ runner.os }}-
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
+      - name: Validate connection form contract
+        run: node scripts/connection-forms/verify.mjs
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path backend/Cargo.toml --check
+      - name: Run native Windows backend regression tests
+        run: cargo test --locked --manifest-path backend/Cargo.toml
+      - name: Build and smoke the Windows sidecar
+        shell: pwsh
+        run: |
+          cargo build --locked --release --manifest-path backend/Cargo.toml
+          # windows-2022 runner 的 docker daemon 偶发 15s 探测超时（main 近
+          # 5 次 CI 两次闪红均为此因，构建与 MCP 校验本体全过）；重试一次。
+          $ok = $false
+          foreach ($i in 1..2) {
+            python scripts/smoke_mcp.py --binary backend/target/release/net-iborshell.exe
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "::warning::smoke_mcp.py attempt $i failed (docker daemon probe timeout?); retrying..."
+            Start-Sleep -Seconds 15
+          }
+          if (-not $ok) { exit 1 }
+
+  ssh-smoke:
+    name: SSH container smoke
+    runs-on: ubuntu-24.04
+    needs: [validate]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.sccache-cache
+          key: sccache-${{ runner.os }}-${{ github.job }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ github.job }}-
+            sccache-${{ runner.os }}-
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
+      # Same container recipe scripts/test.sh uses locally (linuxserver/
+      # openssh-server): password auth, NOPASSWD sudo for the sudo capability
+      # cases, TCP forwarding for tunnel semantics, AcceptEnv so the setEnv
+      # round-trip verifies end to end instead of skipping.
+      - name: Start OpenSSH test container
+        run: |
+          docker run -d --name dbx-ssh-test -p 2222:2222 \
+            -e USER_NAME=sshuser -e USER_PASSWORD=DbxTest2026 \
+            -e PASSWORD_ACCESS=true linuxserver/openssh-server@sha256:96b9a4d3b5106746d08d43a6911650d4d21f7d5c7f2ac9660e792bdb5e63157c
+          # s6 init materializes /config/sshd/sshd_config on first boot;
+          # fresh runners exec within ~0.3s, so wait for the file first.
+          for i in $(seq 1 30); do
+            docker exec dbx-ssh-test test -f /config/sshd/sshd_config 2>/dev/null && break
+            sleep 2
+          done
+          docker exec dbx-ssh-test test -f /config/sshd/sshd_config
+          docker exec dbx-ssh-test sh -c \
+            'echo "sshuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/sshuser && chmod 440 /etc/sudoers.d/sshuser'
+          docker exec dbx-ssh-test sh -c 'sed -i "s/^#\?AllowTcpForwarding.*/AllowTcpForwarding yes/" /config/sshd/sshd_config; grep -q "^AllowTcpForwarding yes" /config/sshd/sshd_config || echo "AllowTcpForwarding yes" >> /config/sshd/sshd_config; grep -q "^AcceptEnv DBX_SMOKE_ENV" /config/sshd/sshd_config || echo "AcceptEnv DBX_SMOKE_ENV" >> /config/sshd/sshd_config'
+          docker restart dbx-ssh-test
+          for i in $(seq 1 60); do
+            (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null && break
+            sleep 2
+          done
+          (exec 3<>/dev/tcp/127.0.0.1/2222)
+      - run: cargo build --locked --release --manifest-path backend/Cargo.toml
+      - name: Sidecar smoke against the live container
+        env:
+          DBX_PLUGIN_SIDECAR: ${{ github.workspace }}/backend/target/release/net-iborshell
+          # One-shot test-container credential (also visible in the docker
+          # run step above); via env so it never shows up on a command line.
+          DBX_SSH_SMOKE_PASSWORD: DbxTest2026
+        run: |
+          python3 scripts/smoke_test.py
+          python3 scripts/smoke_fs_test.py
+          # WT-3/WT-4 end-to-end regression: ssh-config import and
+          # same-transport command sessions against the live endpoint
+          # (defaults match the container above; sidecar via DBX_PLUGIN_SIDECAR).
+          python3 scripts/smoke_ssh_config_import.py
+          python3 scripts/smoke_spawn_session_test.py
+          # MCP stdio live section: real tools/call round-trips over the
+          # container endpoint (test/browse/exec/sftp family/run_bg/metrics/
+          # transfer + live enum/pipelining tail).
+          python3 scripts/smoke_mcp.py \
+            --binary backend/target/release/net-iborshell \
+            --host 127.0.0.1 --port 2222 --username sshuser
+
+  candidate:
+    name: Package candidate (${{ matrix.target }})
+    needs: [validate, frontend, backend]
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux 候选走全静态 musl（rust_target 喂 rustup targets 与
+          # CARGO_BUILD_TARGET）：glibc 构建在老发行版上动态加载失败。
+          - os: linux
+            runner: ubuntu-24.04
+            target: linux-x64
+            rust_target: x86_64-unknown-linux-musl
+            python: python3
+          - os: linux
+            runner: ubuntu-24.04-arm
+            target: linux-arm64
+            rust_target: aarch64-unknown-linux-musl
+            python: python3
+          - os: macos
+            runner: macos-15
+            target: darwin-arm64
+            python: python3
+          - os: macos
+            runner: macos-15-intel
+            target: darwin-x64
+            python: python3
+          - os: windows
+            runner: windows-2022
+            target: windows-x64
+            python: python
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      SIDECAR_BINARY: backend/target/release/net-iborshell${{ matrix.os == 'windows' && '.exe' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install native dependencies
+        if: matrix.os == 'linux'
+        # musl-tools 提供 musl-gcc（aws-lc-sys 在 musl target 下仍要编 C）。
+        # libdbus-1-dev / nasm 已移除：Linux 不走 secret-service，nasm 仅服务
+        # aws-lc-sys 的 MSVC 预置对象路径。
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev musl-tools
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.sccache-cache
+          # Primary key carries matrix.target so the five parallel saves
+          # never collide.
+          key: sccache-${{ runner.os }}-${{ github.job }}-${{ matrix.target }}-${{ hashFiles('backend/Cargo.lock') }}
+          restore-keys: |
+            sccache-${{ runner.os }}-${{ github.job }}-${{ matrix.target }}-
+            sccache-${{ runner.os }}-
+      # rust-cache 的 key 自动包含 job 名与 matrix 值，五个 target 各自缓存；
+      # 直接构建这一步靠它复用。`dbx-plugin package` 的 staging 副本构建
+      # 不复用 target，改由 sccache 按编译单元提速。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+          cache-on-failure: true
+      # UI 构建一次（frontend job 产物），矩阵 job 直接取 ui/ 打包，
+      # 不再每个平台重复 pnpm build。
+      - name: Download prebuilt UI
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-ui-ssh
+          path: ui
+      # CARGO_BUILD_TARGET 经环境变量传导给本步与 package 步内 CLI 的
+      # cargo build（CLI 不传 --target）；非 linux 条目 RUST_TARGET 为空。
+      - name: Build sidecar
+        env:
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          if [ -n "$RUST_TARGET" ]; then export CARGO_BUILD_TARGET="$RUST_TARGET"; fi
+          cargo build --locked --release --manifest-path backend/Cargo.toml
+      # cargo 带 target 时输出在 target/<triple>/release/，而 Offline MCP smoke 的
+      # SIDECAR_BINARY 指向裸 target/release/——预放一份 musl 产物兜底。
+      - name: Stage musl binary at the default target path
+        if: matrix.os == 'linux'
+        run: |
+          mkdir -p backend/target/release
+          cp -f "backend/target/${{ matrix.rust_target }}/release/net-iborshell" backend/target/release/net-iborshell
+      - name: Offline MCP smoke
+        run: ${{ matrix.python }} scripts/smoke_mcp.py --binary "$SIDECAR_BINARY"
+      - run: npm install --global "@dbx-app/plugin-cli@${PLUGIN_CLI_VERSION}"
+      - name: Package .dbxp candidate
+        # plugin-cli 自带 CARGO_TARGET_DIR=<dist/.build-rust-*> 调 cargo 且不传
+        # --target，随后固定从 <dir>/release/ 拷贝；CARGO_BUILD_TARGET（musl）会把
+        # 产物重定向到 <dir>/<triple>/release/。经 PATH 注入 cargo 垫片
+        # （scripts/cargo_target_shim.sh），在构建后把二进制同步回 CLI 的拷贝源。
+        env:
+          DBX_PLUGIN_TARGET: ${{ matrix.target }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+          NO_COLOR: "1"
+        run: |
+          if [ -n "$RUST_TARGET" ]; then
+            export CARGO_BUILD_TARGET="$RUST_TARGET"
+            shim_dir="$(mktemp -d)"
+            printf '#!/usr/bin/env bash\nexport REAL_CARGO="%s"\nexec bash "%s" "$@"\n' "$(command -v cargo)" "${{ github.workspace }}/scripts/cargo_target_shim.sh" > "$shim_dir/cargo"
+            chmod +x "$shim_dir/cargo"
+            export PATH="$shim_dir:$PATH"
+          fi
+          # 不设 DBX_PLUGIN_SDK_ROOT 时 npm 包装器会注入 CLI 自带 sdk-root，
+          # vendored SDK（shared/sdk/）的本地修复进不了出货 sidecar——指向垫片。
+          export DBX_PLUGIN_SDK_ROOT="$(bash scripts/sdk_root_shim.sh)"
+          dbx-plugin package .
+          PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+          "$PY" scripts/verify_packaged_sdk.py
+      # 出货把关一：包内 Linux 二进制必须全静态（glibc 地板修复）。
+      - name: Verify packaged linux binary is statically linked
+        if: matrix.os == 'linux'
+        run: |
+          pkg="$(ls -t dist/*.dbxp | head -1)"
+          tmp="$(mktemp -d)"
+          unzip -q "$pkg" -d "$tmp"
+          bin="$(find "$tmp/bin" -type f -name net-iborshell | head -1)"
+          [ -n "$bin" ] || { echo "FAIL: packaged net-iborshell binary missing under $tmp/bin"; exit 1; }
+          file "$bin"
+          if file "$bin" | grep -q "dynamically linked"; then
+            echo "FAIL: packaged linux binary is dynamically linked; expected a static musl build" >&2
+            exit 1
+          fi
+      # 出货把关二：包内二进制在老 glibc（debian:11 = 2.31）与 musl 系统
+      # （alpine）里真实执行 --mcp（stdin EOF 即退出 0），复现并证明修复了
+      # 用户报的 "exited with status exit status: 1" 动态加载失败。
+      - name: Old-glibc and musl container smoke
+        if: matrix.os == 'linux'
+        run: |
+          if ! command -v docker >/dev/null 2>&1; then
+            echo "docker unavailable in this job context; skipping container smoke"
+            exit 0
+          fi
+          pkg="$(ls -t dist/*.dbxp | head -1)"
+          tmp="$(mktemp -d)"
+          unzip -q "$pkg" -d "$tmp"
+          bin="$(find "$tmp/bin" -type f -name net-iborshell | head -1)"
+          chmod +x "$bin"
+          for image in debian:11 alpine:3; do
+            echo "==> $image"
+            docker run --rm -v "$bin:/sidecar:ro" "$image" sh -c '/sidecar --mcp </dev/null'
+            echo "$image: sidecar executed and exited 0"
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: net-iborshell-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            dist/*.dbxp
+            dist/*.artifact.json
+
+  candidates-check:
+    name: Cross-target candidate checks
+    needs: [candidate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: net-iborshell-*
+          path: dist
+          merge-multiple: true
+      - run: python3 scripts/check_candidates.py dist --expect linux-x64,linux-arm64,darwin-arm64,darwin-x64,windows-x64

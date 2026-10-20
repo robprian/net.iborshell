@@ -1,0 +1,33 @@
+{
+  "name": "iBorShell",
+  "description": "iBorShell: a secure SSH terminal for DBX — interactive sessions, SFTP file transfer, multi-host exec, clone session and live server stats. Fork of jinpy's Terminal plugin.",
+  "icon": "assets/plugin.svg",
+  "tags": [
+    "ssh",
+    "terminal",
+    "sftp",
+    "remote"
+  ],
+  "permissions": [
+    "host.events",
+    "host.binary",
+    "host.filesystem",
+    "host.workbench",
+    "host.storage",
+    "host.clipboard:read"
+  ],
+  "source": "https://github.com/robprian/net.iborshell",
+  "homepage": "https://github.com/robprian/net.iborshell",
+  "license": "MIT",
+  "releaseNotes": "iBorShell 1.0.0: fork of jinpy's Terminal (io.dbx.ssh 0.7.9-beta.2), repacked as net.iborshell. Command history panel removed; adds Multi Exec panel, Clone Session and a live CPU/ping/disk stats strip.",
+  "localizations": {
+    "zh-CN": {
+      "name": "终端",
+      "description": "面向服务器运维的终端：交互式会话、SFTP 文件传输、远程命令和受控运维操作集中在一个界面。"
+    },
+    "zh-TW": {
+      "name": "終端",
+      "description": "為 DBX 提供終端、SFTP 檔案傳輸與受控遠端維運工作流程。"
+    }
+  }
+}

@@ -1,0 +1,2790 @@
+#!/usr/bin/env python3
+"""End-to-end smoke test for the fs/keys capability extensions (sftp_ext, sudo_fs, keys).
+
+Reuses the connection flow from smoke_test.py: initialize -> connection/connect ->
+connection/test (challenge auto-accepted) -> ssh/session/open, then exercises the
+new backend methods against the test container. The new methods may not be
+registered in main.rs yet; any "Method not found" answer is reported as SKIP so
+the script passes both before and after wiring (only connection setup failures
+or real method errors count as FAIL).
+
+Usage:
+    python3 scripts/smoke_fs_test.py                    # default test container
+    python3 scripts/smoke_fs_test.py --host H --port P --user U --password W
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+import os
+import re
+import secrets
+import shutil
+import struct
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from sidecar_client import SidecarClient, SidecarError, lifecycle_params
+
+
+def step(name: str):
+    print(f"\n==> {name}")
+
+
+class SkipSignal(Exception):
+    """Raised by a case to skip itself for environmental reasons (e.g. an
+    unstable container sudo configuration) without failing the run."""
+
+
+def fail(message: str, client: SidecarClient | None = None):
+    if client:
+        client.close()
+    print(f"\nFAIL: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def auto_accept_challenge(event: dict) -> dict | None:
+    """Auto-accept host-key challenges while a request is in flight."""
+    if event.get("method") != "connection/challenge":
+        return None
+    params = event.get("params", {}).get("params") or event.get("params", {})
+    if "challengeId" not in params:
+        return None
+    print(f"    host-key challenge: {params.get('keyType')} {str(params.get('fingerprint'))[:32]}...")
+    return {
+        "method": "ssh/host-key/resolve",
+        "params": {
+            "challengeId": params["challengeId"],
+            "operationId": params.get("operationId"),
+            "accept": True,
+            "remember": True,
+        },
+    }
+
+
+def missing_method(error: Exception) -> str | None:
+    """Return the unregistered method name if the error means 'Method not found'."""
+    text = str(error)
+    if "Method not found" not in text and "-32601" not in text:
+        return None
+    match = re.search(r"Method not found:\s*([\w./-]+)", text)
+    return match.group(1) if match else ""
+
+
+def entry_kind(result: dict) -> str:
+    """Entry kind across the plausible wire spellings ("?" when not reported)."""
+    kind = result.get("kind") or result.get("fileType") or result.get("type")
+    return str(kind) if kind else "?"
+
+
+def mode_is_0700(value) -> bool:
+    """Accept 0o700 in any plausible encoding: 448, "700", "0700", "rwx------"."""
+    digits = str(value).strip().lstrip("-")
+    if digits.isdigit():
+        try:
+            number = int(digits, 8)  # octal text like "700" / "0700"
+        except ValueError:
+            number = int(digits, 10)  # decimal like 448, or 0o100700-style ints
+        return number & 0o777 == 0o700
+    return "rwx------" in str(value)
+
+
+class Report:
+    """Per-case PASS/SKIP/FAIL bookkeeping with the smoke_test reporting style."""
+
+    def __init__(self):
+        self.passed: list[str] = []
+        self.skipped: list[tuple[str, str]] = []
+        self.failed: list[tuple[str, str]] = []
+
+    def run(self, title: str, method: str, case, needs: str | None = None):
+        """Run one case; SKIP on Method not found, FAIL on any other error.
+
+        `needs` gates chained cases: it must name a case that PASSED before
+        this one runs, otherwise this case is SKIPped as unreachable.
+        """
+        step(title)
+        if needs and needs not in self.passed:
+            print(f"SKIP: prerequisite '{needs}' did not pass")
+            self.skipped.append((title, f"prerequisite '{needs}' did not pass"))
+            return
+        try:
+            case()
+        except SkipSignal as reason:
+            print(f"SKIP: {reason}")
+            self.skipped.append((title, str(reason)))
+        except SidecarError as error:
+            missing = missing_method(error)
+            if missing is not None:
+                print(f"SKIP: {missing or method} not registered yet")
+                self.skipped.append((title, f"{missing or method} not registered yet"))
+            else:
+                print(f"FAIL: {error}")
+                self.failed.append((title, str(error)))
+        except Exception as error:
+            print(f"FAIL: {error}")
+            self.failed.append((title, str(error)))
+        else:
+            print("    PASS")
+            self.passed.append(title)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=2222)
+    parser.add_argument("--user", default="sshuser")
+    parser.add_argument("--password", default="DbxTest2026")
+    args = parser.parse_args()
+
+    started = time.monotonic()
+    # 本机落盘目录指向临时目录，避免污染开发者真实的 ~/Downloads；必须在
+    # sidecar 启动前注入（sidecar 启动时读取一次环境变量）。
+    download_dir = Path(tempfile.mkdtemp(prefix="dbx-ssh-smoke-downloads-"))
+    os.environ["DBX_SSH_DOWNLOAD_DIR"] = str(download_dir)
+    # watcher 组的 watch/start 有 desktop gate（can_save_local 探测）。CI
+    # runner 是 headless 环境，探针会误判为非桌面并拒绝注册——显式声明
+    # 桌面落盘语义（sidecar 子进程继承本环境，生产语义不受影响）。
+    os.environ["DBX_SSH_LOCAL_SAVE"] = "1"
+    client = SidecarClient.start(timeout=30)
+    try:
+        step("plugin/initialize")
+        info = client.initialize()
+        print(json.dumps(info, ensure_ascii=False)[:200])
+
+        connection_id = "smoke-fs-connection"
+        workbench_id = "smoke-fs"
+        connection = {
+            "id": connection_id,
+            "name": "smoke-fs",
+            "db_type": "ssh",
+            "host": args.host,
+            "port": args.port,
+            "username": args.user,
+            "password": args.password,
+            "external_config": {"authentication": "password"},
+        }
+
+        step("connection/connect")
+        result = client.request("connection/connect", lifecycle_params(connection))
+        print(json.dumps(result, ensure_ascii=False))
+
+        step("connection/test (challenge auto-accepted, remembered)")
+        test_started = time.monotonic()
+        result = client.request("connection/test", lifecycle_params(connection), timeout=90,
+                                on_event=auto_accept_challenge)
+        print(f"    test ok in {time.monotonic() - test_started:.1f}s: "
+              f"{json.dumps(result, ensure_ascii=False)[:100]}")
+
+        step("ssh/session/open")
+        session = client.request("ssh/session/open",
+                                 {"connectionId": connection_id, "workbenchId": workbench_id, "cols": 120, "rows": 30},
+                                 timeout=60, on_event=auto_accept_challenge)
+        session_id = session.get("sessionId", workbench_id)
+        print(f"    session {session_id} opened")
+
+        same_connection_session_state: dict = {}
+
+        def case_same_connection_sessions_are_independent():
+            """Two workbenches on one saved connection must get separate PTYs."""
+            second = req("ssh/session/open", {
+                "connectionId": connection_id,
+                "workbenchId": "smoke-fs-second-wb",
+                "cols": 120,
+                "rows": 30,
+            })
+            second_id = second.get("sessionId")
+            if not second_id or second_id == session_id:
+                raise AssertionError(f"same-connection open reused session: {second}")
+            same_connection_session_state["sessionId"] = second_id
+            inventory = req("ssh/sessions/list").get("sessions") or []
+            rows = [row for row in inventory if row.get("connectionId") == connection_id]
+            workbenches = {row.get("workbenchId") for row in rows}
+            if {workbench_id, "smoke-fs-second-wb"} - workbenches:
+                raise AssertionError(f"same-connection workbenches missing: {rows}")
+            print(f"    independent sessions {session_id} and {second_id}")
+
+        def case_dead_session_input_signal():
+            """Input into a session the sidecar no longer has must not vanish.
+
+            The binary-handler failure is mirrored as a ssh/terminal/error
+            event (same contract as sftp/upload/error) so the workbench can
+            run its reconnect ladder instead of showing a terminal that looks
+            alive while swallowing every keystroke. The session-gone replay
+            error is the second self-heal signal.
+            """
+            opened = req("ssh/session/open", {
+                "connectionId": connection_id,
+                "workbenchId": "smoke-fs-dead-input",
+                "cols": 80,
+                "rows": 24,
+            })
+            dead_id = opened.get("sessionId") or "smoke-fs-dead-input"
+            time.sleep(0.5)  # let the PTY settle so close cannot race the open
+            req("ssh/session/close", {"sessionId": dead_id})
+            client.events.clear()
+            client.send_binary(f"ssh/terminal/in/{dead_id}",
+                               struct.pack(">Q", 1) + b"echo dead\r")
+            event = client.wait_event("ssh/terminal/error", timeout=10.0)
+            if not event:
+                raise AssertionError("dead-session input produced no ssh/terminal/error event")
+            params = event.get("params", {})
+            if params.get("sessionId") != dead_id:
+                raise AssertionError(f"error event sessionId mismatch: {params!r}")
+            if "not found or expired" not in str(params.get("error", "")):
+                raise AssertionError(f"error not the session-gone contract: {params!r}")
+            try:
+                client.request("ssh/terminal/replay",
+                               {"sessionId": dead_id, "afterSequence": 0}, timeout=10)
+            except SidecarError as error:
+                if "not found or expired" not in str(error):
+                    raise AssertionError(f"dead-session replay errored oddly: {error}")
+            else:
+                raise AssertionError("replay on a dead session unexpectedly succeeded")
+            print(f"    dead session {dead_id[:8]}… mirrored input failure and refused replay")
+
+        step("sftp/home")
+        result = client.request("sftp/home", {"sessionId": session_id})
+        home = result.get("path") or "/config"
+        print(f"    home: {home}")
+
+        # remote scratch paths used by the cases below
+        ssh_dir = f"{home}/.ssh"
+        touch_path = f"{home}/.dbx-fs-smoke-touch"
+        write_path = f"{home}/.dbx-fs-smoke-write"
+        perms_path = f"{home}/.dbx-fs-smoke-perms.sh"
+        archive_path = f"{home}/.dbx-parity-test.tar.gz"
+        extract_dir = f"{home}/.dbx-parity-extract"
+        sudo_dir = f"{home}/.sudo-test"
+        sudo_file = f"{sudo_dir}/inner.txt"
+        sudo_file_renamed = f"{sudo_dir}/inner-renamed.txt"
+
+        def req(method: str, params: dict | None = None, timeout: float = 60.0) -> dict:
+            return client.request(method, params, timeout=timeout, on_event=auto_accept_challenge)
+
+        # -- sftp_ext group ------------------------------------------------------
+
+        def case_sftp_stat():
+            stat = req("sftp/stat", {"sessionId": session_id, "path": home})
+            print(f"    {home}: kind={entry_kind(stat)} size={stat.get('size')}")
+            if entry_kind(stat) != "directory":
+                raise AssertionError(f"{home} kind={entry_kind(stat)!r}, want 'directory'")
+
+        def case_sftp_exists():
+            present = req("sftp/exists", {"sessionId": session_id, "path": home})
+            if present.get("exists") is not True:
+                raise AssertionError(f"exists({home}) -> {json.dumps(present)[:120]}, want true")
+            absent = req("sftp/exists", {"sessionId": session_id, "path": f"{home}/no-such-path-xyz"})
+            if absent.get("exists") is not False:
+                raise AssertionError(f"exists(missing) -> {json.dumps(absent)[:120]}, want false")
+            print(f"    exists({home})=true, exists(no-such-path-xyz)=false")
+
+        def case_sftp_touch_stat():
+            req("sftp/touch", {"sessionId": session_id, "path": touch_path})
+            stat = req("sftp/stat", {"sessionId": session_id, "path": touch_path})
+            print(f"    {touch_path}: kind={entry_kind(stat)} size={stat.get('size')}")
+            if entry_kind(stat) != "file" or stat.get("size") != 0:
+                raise AssertionError(f"want empty file, got kind={entry_kind(stat)!r} size={stat.get('size')!r}")
+            req("sftp/delete", {"sessionId": session_id, "path": touch_path})
+
+        def case_sftp_write_read():
+            payload = b"hello parity\n"
+            req("sftp/write", {"sessionId": session_id, "remotePath": write_path,
+                               "dataBase64": base64.b64encode(payload).decode()})
+            read_back = client.request("sftp/read",
+                                       {"sessionId": session_id, "path": write_path, "maxBytes": 4096})
+            content = base64.b64decode(read_back.get("dataBase64", "")).decode(errors="replace")
+            if content != payload.decode():
+                raise AssertionError(f"read-back mismatch: {content!r}")
+            print(f"    wrote and read back {write_path}")
+            req("sftp/delete", {"sessionId": session_id, "path": write_path})
+
+        def case_sftp_write_preserves_permissions():
+            # Issue #37: saving over an existing file must not drop its
+            # permission bits (e.g. the executable bit of a script).
+            req("sftp/write", {"sessionId": session_id, "remotePath": perms_path,
+                               "dataBase64": base64.b64encode(b"#!/bin/sh\necho one\n").decode()})
+            req("sftp/chmod", {"sessionId": session_id, "path": perms_path, "mode": "0755"})
+            updated = b"#!/bin/sh\necho two\n"
+            req("sftp/write", {"sessionId": session_id, "remotePath": perms_path,
+                               "dataBase64": base64.b64encode(updated).decode()})
+            mode = req("sftp/stat", {"sessionId": session_id, "path": perms_path}).get("mode")
+            if mode != "0755":
+                raise AssertionError(f"mode after overwrite save={mode!r}, want '0755'")
+            read_back = req("sftp/read", {"sessionId": session_id, "path": perms_path, "maxBytes": 4096})
+            content = base64.b64decode(read_back.get("dataBase64", "")).decode(errors="replace")
+            if content != updated.decode():
+                raise AssertionError(f"read-back mismatch after overwrite: {content!r}")
+            print(f"    {perms_path}: mode stayed 0755 after overwrite save")
+            req("sftp/delete", {"sessionId": session_id, "path": perms_path})
+
+        def case_sftp_archive():
+            try:  # archive source must exist; create ~/.ssh if the container lacks it
+                req("sftp/createDirectory", {"sessionId": session_id, "path": ssh_dir})
+            except SidecarError:
+                pass
+            # "paths" and "sourcePaths" are both sent: the wire name is not frozen yet
+            req("sftp/archive", {"sessionId": session_id, "paths": [ssh_dir],
+                                 "sourcePaths": [ssh_dir], "archivePath": archive_path})
+            stat = req("sftp/stat", {"sessionId": session_id, "path": archive_path})
+            size = stat.get("size")
+            print(f"    {archive_path}: kind={entry_kind(stat)} size={size}")
+            if not isinstance(size, (int, float)) or size <= 0:
+                raise AssertionError(f"archive size={size!r}, want > 0")
+
+        def case_sftp_extract():
+            req("sftp/extract", {"sessionId": session_id, "archivePath": archive_path,
+                                 "destinationPath": extract_dir})
+            listing = client.request("sftp/list", {"sessionId": session_id, "path": home})
+            name = extract_dir.rsplit("/", 1)[-1]
+            entry = next((e for e in listing.get("entries", []) if e.get("name") == name), None)
+            kind = entry_kind(entry or {})
+            print(f"    extracted entry: {name} ({kind})")
+            if entry is None:
+                raise AssertionError(f"{extract_dir} missing from {home} listing")
+            if kind not in ("directory", "?"):
+                raise AssertionError(f"{extract_dir} kind={kind!r}, want directory")
+            req("sftp/delete", {"sessionId": session_id, "path": extract_dir, "recursive": True})
+            req("sftp/delete", {"sessionId": session_id, "path": archive_path})
+
+        def case_sftp_list_owner():
+            """issue #34: includeOwner 附加属主/属组；缺省时字段必须缺席。"""
+            # 不带 includeOwner：wire 与历史版本一致，不得出现 owner/group。
+            plain = client.request("sftp/list", {"sessionId": session_id, "path": home})
+            rows = plain.get("entries") or []
+            if not rows:
+                raise AssertionError(f"{home} listing unexpectedly empty")
+            leaked = [e.get("name") for e in rows if "owner" in e or "group" in e]
+            if leaked:
+                raise AssertionError(f"owner/group present without includeOwner: {leaked}")
+            # 带 includeOwner=true：条目应有 owner（名字或数字 uid，v3 增强失败
+            # 时保留数字；两者都是字符串）。服务器既无 shell 又不给 uid 的极端
+            # 情况跳过而不是失败。
+            enriched = client.request("sftp/list", {"sessionId": session_id, "path": home,
+                                                    "includeOwner": True})
+            erows = enriched.get("entries") or []
+            with_owner = [(e.get("name"), e.get("owner"), e.get("group")) for e in erows]
+            print(f"    sample: {with_owner[:3]}")
+            if all(owner is None for _, owner, _ in with_owner):
+                print("    SKIP: server reports neither names nor numeric uid/gid")
+                return
+            bad = [(name, owner) for name, owner, _ in with_owner
+                   if owner is not None and not isinstance(owner, str)]
+            if bad:
+                raise AssertionError(f"owner must be a string or absent: {bad}")
+
+        # -- sudo_fs group (container sshuser has NOPASSWD sudo) ------------------
+
+        def case_sudo_stat():
+            stat = req("sudo/stat", {"sessionId": session_id, "path": home})
+            print(f"    {home}: kind={entry_kind(stat)} mode={stat.get('mode', stat.get('permissions'))}")
+            if entry_kind(stat) != "directory":
+                raise AssertionError(f"{home} kind={entry_kind(stat)!r}, want 'directory'")
+
+        def case_sudo_exists():
+            present = req("sudo/exists", {"sessionId": session_id, "path": home})
+            if present.get("exists") is not True:
+                raise AssertionError(f"exists({home}) -> {json.dumps(present)[:120]}, want true")
+            absent = req("sudo/exists", {"sessionId": session_id, "path": f"{home}/no-such-path-xyz"})
+            if absent.get("exists") is not False:
+                raise AssertionError(f"exists(missing) -> {json.dumps(absent)[:120]}, want false")
+            print(f"    exists({home})=true, exists(no-such-path-xyz)=false")
+
+        def case_sudo_mkdir():
+            req("sudo/mkdir", {"sessionId": session_id, "path": sudo_dir})
+            print(f"    created {sudo_dir}")
+
+        def case_sudo_touch():
+            req("sudo/touch", {"sessionId": session_id, "path": sudo_file})
+            stat = req("sudo/stat", {"sessionId": session_id, "path": sudo_file})
+            print(f"    {sudo_file}: kind={entry_kind(stat)} size={stat.get('size')}")
+            if entry_kind(stat) != "file":
+                raise AssertionError(f"{sudo_file} kind={entry_kind(stat)!r}, want 'file'")
+
+        def case_sudo_listdir():
+            result = req("sudo/listDir", {"sessionId": session_id, "path": sudo_dir})
+            names = [str(e.get("name")) for e in result.get("entries", [])]
+            print(f"    {sudo_dir}: {names}")
+            if sudo_file.rsplit("/", 1)[-1] not in names:
+                raise AssertionError(f"inner file missing from listing: {names}")
+            # issue #34: ls -la 解析附带属主/属组，字段恒定存在。
+            for entry in result.get("entries", []):
+                owner, group = entry.get("owner"), entry.get("group")
+                if not isinstance(owner, str) or not isinstance(group, str) or not owner or not group:
+                    raise AssertionError(
+                        f"sudo/listDir entry {entry.get('name')!r} missing owner/group: "
+                        f"{owner!r}/{group!r}"
+                    )
+            print(f"    owners: {[(e.get('name'), e.get('owner'), e.get('group')) for e in result.get('entries', [])][:3]}")
+
+        def case_sudo_write_read():
+            payload = b"sudo parity\n"
+            req("sudo/writeFile", {"sessionId": session_id, "path": sudo_file,
+                               "dataBase64": base64.b64encode(payload).decode()})
+            read_back = req("sudo/readFile", {"sessionId": session_id, "path": sudo_file, "maxBytes": 4096})
+            content = base64.b64decode(read_back.get("dataBase64", "")).decode(errors="replace")
+            if content != payload.decode():
+                raise AssertionError(f"read-back mismatch: {content!r}")
+            print(f"    wrote and read back {sudo_file}")
+
+        def case_sudo_rename():
+            req("sudo/rename", {"sessionId": session_id, "sourcePath": sudo_file,
+                                "targetPath": sudo_file_renamed})
+            print(f"    renamed to {sudo_file_renamed}")
+
+        def case_sudo_chmod():
+            req("sudo/chmod", {"sessionId": session_id, "path": sudo_file_renamed, "mode": "0700"})
+            stat = req("sudo/stat", {"sessionId": session_id, "path": sudo_file_renamed})
+            mode = stat.get("mode", stat.get("permissions"))
+            print(f"    mode after chmod 0700: {mode}")
+            if not mode_is_0700(mode):
+                raise AssertionError(f"mode={mode!r}, want 0700")
+
+        def case_sudo_download():
+            # M14-C DownloadSudo: start -> sftp/download/next 循环 -> finish，
+            # 随后 sudo/listDir 确认同目录没有 .dbx-sudo-dl- 临时件残留。
+            stat = req("sudo/stat", {"sessionId": session_id, "path": sudo_file_renamed})
+            size = int(stat.get("size") or 0)
+            info = req("sudo/download/start", {"sessionId": session_id, "path": sudo_file_renamed})
+            task_id = str(info.get("taskId") or "")
+            if not task_id or info.get("size") != size:
+                raise AssertionError(f"sudo/download/start shape: {json.dumps(info)[:160]}")
+            if info.get("fileName") != sudo_file_renamed.rsplit("/", 1)[-1]:
+                raise AssertionError(f"fileName should be the source name: {info.get('fileName')!r}")
+            drained = 0
+            while drained < size:
+                chunk = req("sftp/download/next", {"taskId": task_id, "offset": drained})
+                drained += int(chunk.get("length") or 0)
+                if chunk.get("eof"):
+                    break
+            if drained != size:
+                raise AssertionError(f"drained {drained} of {size} bytes")
+            req("sftp/download/finish", {"taskId": task_id})
+            listing = req("sudo/listDir", {"sessionId": session_id, "path": sudo_dir})
+            leftovers = [str(e.get("name")) for e in listing.get("entries", [])
+                         if str(e.get("name")).startswith(".dbx-sudo-dl-")]
+            if leftovers:
+                raise AssertionError(f"staging temp leftovers in {sudo_dir}: {leftovers}")
+            print(f"    sudo download of {sudo_file_renamed} ({size} bytes) finished, no temp leftovers")
+
+        def case_sudo_upload():
+            # UploadSudo: sudo/upload/start -> binary chunks (sftp/upload/<taskId>)
+            # -> sudo/upload/finish。目标目录是 root 属主的 sudo_dir（登录用户
+            # 不可写），普通车道必 EACCES；完成后 sudo/readFile 校验内容、
+            # sudo/listDir 确认登录用户 home 没有 .dbx-sudo-ul- 暂存残留。
+            payload = b"dbx sudo upload smoke\n"
+            target = f"{sudo_dir}/.dbx-sudo-ul-smoke-target"
+            info = req("sudo/upload/start", {"sessionId": session_id, "remotePath": target, "size": len(payload)})
+            task_id = str(info.get("taskId") or "")
+            if not task_id:
+                raise AssertionError(f"sudo/upload/start shape: {json.dumps(info)[:160]}")
+            client.send_binary(f"sftp/upload/{task_id}", struct.pack(">Q", 0) + payload)
+            time.sleep(1)  # append_upload runs on the sidecar worker pool (smoke_test 同款)
+            req("sudo/upload/finish", {"taskId": task_id})
+            status = {}
+            for _ in range(100):
+                status = req("sftp/transfer/status", {"taskId": task_id})
+                if status.get("status") in ("completed", "failed", "cancelled"):
+                    break
+                time.sleep(0.1)
+            if status.get("status") != "completed":
+                raise AssertionError(f"sudo upload did not complete: {json.dumps(status)[:160]}")
+            read_back = req("sudo/readFile", {"sessionId": session_id, "path": target, "maxBytes": 4096})
+            content = base64.b64decode(str(read_back.get("dataBase64") or ""))
+            if content != payload:
+                raise AssertionError(f"sudo upload round-trip mismatch: {content!r}")
+            home_listing = req("sudo/listDir", {"sessionId": session_id, "path": home})
+            leftovers = [str(e.get("name")) for e in home_listing.get("entries", [])
+                         if str(e.get("name")).startswith(".dbx-sudo-ul-")]
+            if leftovers:
+                raise AssertionError(f"staging temp leftovers in home: {leftovers}")
+            req("sudo/remove", {"sessionId": session_id, "path": target})
+            print(f"    sudo upload of {len(payload)} bytes into {sudo_dir} finished, no staging leftovers")
+
+        def case_sudo_rename_unique():
+            # sftp/rename-unique 的 sudo 探测（UploadSudo 配套）：空闲名直赢，
+            # 撞名让位 name(1)——探测走 sudo test -e，不可读目录也准确。
+            base_name = "smoke-unique.bin"
+            first = req("sftp/rename-unique", {"sessionId": session_id, "dir": sudo_dir,
+                                               "name": base_name, "sudo": True})
+            if first.get("name") != base_name:
+                raise AssertionError(f"free name should win: {json.dumps(first)[:160]}")
+            req("sudo/touch", {"sessionId": session_id, "path": f"{sudo_dir}/{base_name}"})
+            second = req("sftp/rename-unique", {"sessionId": session_id, "dir": sudo_dir,
+                                                "name": base_name, "sudo": True})
+            if second.get("name") != "smoke-unique(1).bin":
+                raise AssertionError(f"conflict should defer: {json.dumps(second)[:160]}")
+            req("sudo/remove", {"sessionId": session_id, "path": f"{sudo_dir}/{base_name}"})
+            print(f"    sudo rename-unique defers to {second.get('name')}")
+
+        def case_sudo_extract():
+            # 文件夹整包上传车道的远端半边（sftp/extract sudo）：python tarfile
+            # 打 .tar.gz（含嵌套子目录）→ sudo/upload 车道上传 → sudo:true 解包
+            # 到 root 属主的 sudo_dir → sudo/readFile 校验内容 → 清理归档与产物。
+            buf = io.BytesIO()
+            alpha, beta = b"dbx sudo extract alpha\n", b"beta-payload"
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                info = tarfile.TarInfo("pack-a.txt")
+                info.size = len(alpha)
+                tar.addfile(info, io.BytesIO(alpha))
+                nested = tarfile.TarInfo("sub/pack-b.txt")
+                nested.size = len(beta)
+                tar.addfile(nested, io.BytesIO(beta))
+            archive = buf.getvalue()
+            archive_path = f"{sudo_dir}/.dbx-sudo-extract-pack.tar.gz"
+            info = req("sudo/upload/start", {"sessionId": session_id, "remotePath": archive_path, "size": len(archive)})
+            task_id = str(info.get("taskId") or "")
+            if not task_id:
+                raise AssertionError(f"sudo/upload/start shape: {json.dumps(info)[:160]}")
+            client.send_binary(f"sftp/upload/{task_id}", struct.pack(">Q", 0) + archive)
+            time.sleep(1)
+            req("sudo/upload/finish", {"taskId": task_id})
+            status = {}
+            for _ in range(100):
+                status = req("sftp/transfer/status", {"taskId": task_id})
+                if status.get("status") in ("completed", "failed", "cancelled"):
+                    break
+                time.sleep(0.1)
+            if status.get("status") != "completed":
+                raise AssertionError(f"archive upload did not complete: {json.dumps(status)[:160]}")
+            req("sftp/extract", {"sessionId": session_id, "archivePath": archive_path,
+                                 "destinationPath": sudo_dir, "overwrite": True, "sudo": True})
+            for name, expected in (("pack-a.txt", alpha), ("sub/pack-b.txt", beta)):
+                read_back = req("sudo/readFile", {"sessionId": session_id, "path": f"{sudo_dir}/{name}", "maxBytes": 4096})
+                content = base64.b64decode(str(read_back.get("dataBase64") or ""))
+                if content != expected:
+                    raise AssertionError(f"extracted {name} mismatch: {content!r}")
+            req("sudo/remove", {"sessionId": session_id, "path": archive_path})
+            req("sudo/remove", {"sessionId": session_id, "path": f"{sudo_dir}/pack-a.txt"})
+            req("sudo/removeAll", {"sessionId": session_id, "path": f"{sudo_dir}/sub"})
+            print(f"    sudo extract of {len(archive)}-byte archive unpacked and verified")
+
+        def case_sudo_remove_all():
+            req("sudo/removeAll", {"sessionId": session_id, "path": sudo_dir})
+            try:  # verify via sudo/exists when that method is wired too
+                final = req("sudo/exists", {"sessionId": session_id, "path": sudo_dir})
+                if final.get("exists") is not False:
+                    raise AssertionError(f"{sudo_dir} still present after removeAll")
+            except SidecarError as error:
+                if missing_method(error) is None:
+                    raise
+            print(f"    removed {sudo_dir}")
+
+        # -- quick sudo profiles group (local config store, session-less) -------
+
+        profile_state: dict = {}
+        # 测试专用密钥：运行时拼装，绝不使用真实凭据。
+        profile_secret = f"smoke-{uuid.uuid4().hex}"
+
+        def case_profiles_list_initial():
+            result = req("sudo/profiles/list", {})
+            if "profiles" not in result:
+                raise AssertionError(f"missing profiles key: {json.dumps(result)[:160]}")
+            print(f"    {len(result['profiles'])} profile(s) initially")
+
+        def case_batch_bar_state_broadcast():
+            # 纯广播方法：无 SSH 会话依赖，只要应答 Ok 即视为注册且可用。
+            result = req("ssh/batchBar/state", {
+                "source": "smoke-source",
+                "draft": "echo smoke",
+                "quickPickId": "",
+                "open": True,
+            })
+            if result.get("broadcast") is not True:
+                raise AssertionError(f"want broadcast=true: {json.dumps(result)[:160]}")
+
+        def case_profiles_save_create():
+            result = req("sudo/profiles/save", {
+                "name": "smoke-ops",
+                "sudoPassword": profile_secret,
+                "totpSecret": "JBSWY3DPEHPK3PXP",
+                "authFlowMode": "password_plus_otp",
+                "sudoUsePty": True,
+            })
+            profile = result.get("profile") or {}
+            profile_state["id"] = profile.get("id")
+            if result.get("created") is not True:
+                raise AssertionError(f"want created=true: {json.dumps(result)[:160]}")
+            if profile.get("sudoPasswordSet") is not True or profile.get("totpConfigured") is not True:
+                raise AssertionError(f"secret flags missing: {json.dumps(profile)[:160]}")
+            if profile_secret in json.dumps(result):
+                raise AssertionError("save response echoed the secret")
+
+        def case_profiles_duplicate_name():
+            error = None
+            try:
+                req("sudo/profiles/save", {"name": "SMOKE-OPS"})
+            except SidecarError as raised:
+                error = str(raised)
+                if missing_method(raised) is not None:
+                    raise
+            if error is None:
+                raise AssertionError("duplicate name was accepted")
+            if "already in use" not in error:
+                raise AssertionError(f"unexpected duplicate error: {error}")
+
+        def case_profiles_update_keeps_secret():
+            profile_id = profile_state.get("id")
+            if not profile_id:
+                raise AssertionError("no profile id from create case")
+            result = req("sudo/profiles/save", {
+                "id": profile_id,
+                "name": "smoke-ops",
+                "sudoPassword": "",
+                "sudoUsePty": True,
+            })
+            profile = result.get("profile") or {}
+            if profile.get("sudoPasswordSet") is not True:
+                raise AssertionError("blank sudoPassword dropped the stored secret")
+            if profile.get("sudoUsePty") is not True:
+                raise AssertionError("sudoUsePty not updated")
+
+        def case_profiles_list_hides_secrets():
+            result = req("sudo/profiles/list", {})
+            if profile_secret in json.dumps(result):
+                raise AssertionError("list response echoed the secret")
+            names = [profile.get("name") for profile in result.get("profiles") or []]
+            if "smoke-ops" not in names:
+                raise AssertionError(f"smoke-ops missing from list: {names}")
+
+        def case_profiles_reveal():
+            # 工作台专用回显：原值返回；list 视图仍保持 flag-only。
+            profile_id = profile_state.get("id")
+            if not profile_id:
+                raise AssertionError("no profile id from create case")
+            result = req("sudo/profiles/reveal", {"id": profile_id})
+            profile = result.get("profile") or {}
+            if profile.get("sudoPassword") != profile_secret:
+                raise AssertionError(
+                    f"reveal did not return the stored secret: {json.dumps(profile)[:160]}")
+            if profile.get("totpSecret") != "JBSWY3DPEHPK3PXP":
+                raise AssertionError("reveal did not return the stored TOTP secret")
+            error = None
+            try:
+                req("sudo/profiles/reveal", {"id": "smoke-missing"})
+            except SidecarError as raised:
+                error = str(raised)
+                if missing_method(raised) is not None:
+                    raise
+            if error is None:
+                raise AssertionError("unknown profile id was accepted")
+            list_result = req("sudo/profiles/list", {})
+            if profile_secret in json.dumps(list_result):
+                raise AssertionError("list still echoes the secret after reveal landed")
+            print("    reveal returned the stored values; list stays flag-only")
+
+        def case_profiles_options():
+            result = req("sudo/profiles/options", {})
+            options = result.get("options")
+            if not isinstance(options, list):
+                raise AssertionError(f"missing options list: {json.dumps(result)[:160]}")
+            if profile_secret in json.dumps(result):
+                raise AssertionError("options response echoed the secret")
+            profile_id = profile_state.get("id")
+            match = next((entry for entry in options if entry.get("value") == profile_id), None)
+            if match is None:
+                raise AssertionError(f"created profile missing from options: {json.dumps(result)[:200]}")
+            if match.get("label") != "smoke-ops":
+                raise AssertionError(f"option label mismatch: {json.dumps(match)}")
+            print(f"    {len(options)} option(s) for the connection-form dropdown")
+
+        def case_profiles_settings_binding():
+            profile_id = profile_state.get("id")
+            if not profile_id:
+                raise AssertionError("no profile id from create case")
+            bound = req("ssh/settings/set", {"sessionId": session_id, "quickSudoProfileId": profile_id})
+            if bound.get("quickSudoProfileId") != profile_id:
+                raise AssertionError(f"binding not reported: {json.dumps(bound)[:160]}")
+            if bound.get("quickSudoProfileName") != "smoke-ops":
+                raise AssertionError(f"binding name missing: {json.dumps(bound)[:160]}")
+            cleared = req("ssh/settings/set", {"sessionId": session_id, "quickSudoProfileId": ""})
+            if cleared.get("quickSudoProfileId"):
+                raise AssertionError(f"binding not cleared: {json.dumps(cleared)[:160]}")
+
+        def case_profiles_off_flow_and_reject():
+            # 0.4.77：authFlowMode 新增 off（2FA 关闭）选项；未知值仍拒绝。
+            # 测试专用密钥：运行时拼装，绝不使用真实凭据。
+            off_secret = f"smoke-off-{uuid.uuid4().hex}"
+            created = req("sudo/profiles/save", {
+                "name": "smoke-ops-off",
+                "sudoPassword": off_secret,
+                "authFlowMode": "off",
+            })
+            profile = created.get("profile") or {}
+            if created.get("created") is not True:
+                raise AssertionError(f"want created=true: {json.dumps(created)[:160]}")
+            if profile.get("authFlowMode") != "off":
+                raise AssertionError(
+                    f"off flow not persisted: {json.dumps(profile)[:160]}"
+                )
+            error = None
+            try:
+                req("sudo/profiles/save", {"name": "smoke-ops-bogus", "authFlowMode": "bogus"})
+            except SidecarError as raised:
+                error = str(raised)
+                if missing_method(raised) is not None:
+                    raise
+            if error is None or "Unsupported authFlowMode" not in error:
+                raise AssertionError(f"bogus flow not rejected: {error}")
+            removed = req("sudo/profiles/delete", {"id": profile.get("id")})
+            if removed.get("removed") is not True:
+                raise AssertionError(f"cleanup delete failed: {json.dumps(removed)[:160]}")
+
+        def case_profiles_delete():
+            profile_id = profile_state.get("id")
+            if not profile_id:
+                raise AssertionError("no profile id from create case")
+            removed = req("sudo/profiles/delete", {"id": profile_id})
+            if removed.get("removed") is not True:
+                raise AssertionError(f"want removed=true: {json.dumps(removed)[:160]}")
+            again = req("sudo/profiles/delete", {"id": profile_id})
+            if again.get("removed") is not False:
+                raise AssertionError(f"repeat delete should be a no-op: {json.dumps(again)[:160]}")
+
+        def case_connection_action_import_sessions():
+            # 连接表单「导入连接」：path 注入跳过来源选择与文件两段系统对话框
+            # （宿主从不携带这些参数），断言复用导入解析器、首条会话回填、
+            # 凭据结构性缺位。真实对话框链路仅桌面真机可测；source 跳过来源
+            # 选择、WindTerm 主密码指回向导的分支在 Rust 单测覆盖。此处顺带
+            # 校验未知 action 被显式拒绝（原 quick-sudo-profiles 摘要动作的
+            # 契约测试随按钮移除并入这里）。
+            fixture_dir = Path(tempfile.mkdtemp(prefix="dbx-ssh-smoke-import-"))
+            fixture = fixture_dir / "sessions.mxtsessions"
+            fixture.write_text(
+                "[Bookmarks]\n"
+                "SubRep=Prod\\Web\n"
+                "web1=#109#0%192.168.1.10%22%deploy%pw%...\n"
+                "db1=#109#0%10.0.0.5%%%pw%...\n",
+                encoding="utf-8",
+            )
+            try:
+                result = req("connection/action",
+                             {"action": {"id": "import-sessions"}, "path": str(fixture)})
+                values = result.get("fieldValues") or {}
+                for key in ("display_name", "host", "port", "username", "authentication"):
+                    if key not in values:
+                        raise AssertionError(f"fieldValues missing {key}: {json.dumps(values)[:200]}")
+                if values.get("display_name") != "web1" or values.get("host") != "192.168.1.10":
+                    raise AssertionError(f"first session not mapped: {json.dumps(values)[:200]}")
+                if values.get("authentication") != "none" or "password" in values:
+                    raise AssertionError(f"credential material in fieldValues: {json.dumps(values)[:200]}")
+                message = str(result.get("message") or "")
+                if "1 of 2" not in message:
+                    raise AssertionError(f"message missing batch hint: {message[:200]}")
+                unknown = None
+                try:
+                    req("connection/action", {"action": {"id": "no-such-action"}})
+                except SidecarError as raised:
+                    unknown = str(raised)
+                    if missing_method(raised) is not None:
+                        raise
+                if unknown is None or "Unknown connection action" not in unknown:
+                    raise AssertionError(f"unknown action not rejected: {unknown}")
+                empty = None
+                try:
+                    no_sessions = fixture_dir / "empty.config"
+                    no_sessions.write_text("# only a comment\n", encoding="utf-8")
+                    req("connection/action",
+                        {"action": {"id": "import-sessions"}, "path": str(no_sessions)})
+                except SidecarError as raised:
+                    empty = str(raised)
+                    if missing_method(raised) is not None:
+                        raise
+                if empty is None or "No SSH sessions" not in empty:
+                    raise AssertionError(f"session-less file not rejected: {empty}")
+            finally:
+                shutil.rmtree(fixture_dir, ignore_errors=True)
+
+        # -- keys group ------------------------------------------------------------
+
+        def case_keys_discover():
+            result = req("keys/discover", {})
+            keys = result.get("keys") or []
+            print(f"    discovered {len(keys)} key(s)")
+            for key in keys[:3]:
+                fingerprint = str(key.get("fingerprint", ""))[:16]
+                print(f"      - {key.get('path')} {key.get('algorithm', '')} fp={fingerprint}...")
+
+        def case_keys_discover_options():
+            # 宿主下拉数据源（manifest options_action）形态：label 就是路径本身
+            # （不塞算法/指纹，避免控件被撑长），只出元数据、不出密钥材料。
+            # 注意：连接表单目前不声明 options_action（否则字段会变成纯下拉、
+            # 无法手输），该 RPC 保留给宿主/其他集成方使用。
+            result = req("keys/discover/options", {})
+            options = result.get("options") or []
+            print(f"    {len(options)} key option(s)")
+            for option in options[:3]:
+                label = str(option.get("label", ""))
+                value = str(option.get("value", ""))
+                if not value or not label:
+                    raise AssertionError(f"malformed option: {option}")
+                if label != value:
+                    raise AssertionError(f"option label must be the key path: {option}")
+                if "PRIVATE KEY" in label:
+                    raise AssertionError("key material leaked into option label")
+                print(f"      - {label}")
+                print(f"        {value}")
+
+        def case_known_hosts():
+            result = req("ssh/knownHosts/list", {})
+            entries = result.get("entries") or []
+            print(f"    {len(entries)} known-host entries")
+
+        # -- agent terminal group ----------------------------------------------
+
+        # A second registered connection with no open terminal session drives
+        # the "no open terminal session" guidance error.
+        agent_conn_id = "smoke-fs-agent-conn"
+        agent_connection = dict(connection, id=agent_conn_id, name="smoke-fs-agent")
+
+        def call_tool_embedded(tool: str, arguments: dict, connection_id: str = connection_id,
+                               on_event=None, timeout: float = 90.0) -> dict:
+            """Drive the DBX embedded bridge path (mcp/call + lifecycle).
+
+            Tool results arrive MCP-style wrapped in content[0].text; tool
+            errors surface as RPC errors (SidecarError) from mcp/call.
+            """
+            params = {
+                "tool": tool,
+                "arguments": arguments,
+                "lifecycle": lifecycle_params(dict(agent_connection, id=connection_id,
+                                                   name=connection_id)),
+            }
+            result = client.request("mcp/call", params, timeout=timeout, on_event=on_event)
+            if result.get("isError"):
+                raise SidecarError(str(result))
+            return json.loads(result["content"][0]["text"])
+
+        def approve_agent_prompt(event: dict) -> dict | None:
+            if event.get("method") != "ssh/agent/prompt":
+                return None
+            params = event.get("params", {})
+            print(f"    agent approval: risk={params.get('risk')} "
+                  f"command={str(params.get('command'))[:60]!r}")
+            return {"method": "ssh/agent/resolve",
+                    "params": {"challengeId": params["challengeId"], "decision": "approve"}}
+
+        def deny_agent_prompt(event: dict) -> dict | None:
+            if event.get("method") != "ssh/agent/prompt":
+                return None
+            return {"method": "ssh/agent/resolve",
+                    "params": {"challengeId": event["params"]["challengeId"],
+                               "decision": "deny"}}
+
+        def case_agent_mode_roundtrip():
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "auto"})
+            got = req("ssh/settings/get", {"sessionId": session_id}).get("agentTerminalMode")
+            if got != "auto":
+                raise AssertionError(f"agentTerminalMode={got!r}, want 'auto'")
+
+        def case_agent_mode_get_probe():
+            # Connection-scoped probe consumed by the host bridge: the live
+            # connection reports its mode plus session presence, while an
+            # unknown id degrades to off/False instead of erroring.
+            probe = req("ssh/agent/mode/get", {"connectionId": connection_id})
+            if probe.get("agentTerminalMode") != "auto":
+                raise AssertionError(f"probe mode={probe.get('agentTerminalMode')!r}, want 'auto'")
+            if probe.get("hasTerminalSession") is not True:
+                raise AssertionError(f"probe hasTerminalSession={probe.get('hasTerminalSession')!r}, want True")
+            ghost = req("ssh/agent/mode/get", {"connectionId": "smoke-fs-ghost-conn"})
+            if ghost.get("agentTerminalMode") != "off" or ghost.get("hasTerminalSession") is not False:
+                raise AssertionError(f"ghost probe={ghost!r}, want off/False")
+
+        def case_agent_no_session_error():
+            try:
+                call_tool_embedded("ssh_exec", {"command": "echo smoke", "runInTerminal": True},
+                                   connection_id=agent_conn_id)
+            except SidecarError as error:
+                message = str(error)
+                if "No open terminal session" not in message:
+                    raise AssertionError(f"unexpected error: {message}")
+                print(f"    guidance error ok: {message[:90]}")
+                return
+            raise AssertionError("terminal exec without a session unexpectedly succeeded")
+
+        def case_agent_terminal_exec():
+            marker = f"agent-terminal-ok-{int(time.time())}"
+            result = call_tool_embedded("ssh_exec", {"command": f"echo {marker}"})
+            if result.get("mode") != "terminal":
+                raise AssertionError(f"mode={result.get('mode')!r}, want 'terminal'")
+            if marker not in str(result.get("output", "")):
+                raise AssertionError(f"output missing marker: {str(result.get('output'))[:200]}")
+            if result.get("incomplete") is not False:
+                raise AssertionError(f"incomplete={result.get('incomplete')!r}, want False")
+            print(f"    routed output: {str(result.get('output'))[:80]!r}")
+
+        def case_agent_strict_approval():
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "strict"})
+            marker = f"agent-approved-{int(time.time())}"
+            result = call_tool_embedded("ssh_exec", {"command": f"echo {marker}"},
+                                        on_event=approve_agent_prompt)
+            if marker not in str(result.get("output", "")):
+                raise AssertionError(f"approved exec output missing marker: "
+                                     f"{str(result.get('output'))[:200]}")
+
+        def case_agent_deny():
+            marker = f"agent-denied-{int(time.time())}"
+            try:
+                call_tool_embedded("ssh_exec", {"command": f"echo {marker}"},
+                                   on_event=deny_agent_prompt)
+            except SidecarError as error:
+                if "denied" not in str(error):
+                    raise AssertionError(f"unexpected deny error: {error}")
+                print(f"    denied as expected: {str(error)[:80]}")
+            else:
+                raise AssertionError("denied command unexpectedly succeeded")
+            finally:
+                req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "off"})
+
+        # -- 审批记忆 + 审计 + 告警分诊 group ------------------------------------
+        # （docs/IMPL_PLAN_SSH_APPROVAL_AUDIT_ALERT.zh-CN.md §2）
+
+        def remember_agent_prompt(event: dict) -> dict | None:
+            # 批准并记住：把弹窗命令原样提交 + remember 标记。
+            if event.get("method") != "ssh/agent/prompt":
+                return None
+            params = event.get("params", {})
+            print(f"    agent approval (remember): risk={params.get('risk')} "
+                  f"command={str(params.get('command'))[:60]!r}")
+            return {"method": "ssh/agent/resolve",
+                    "params": {"challengeId": params["challengeId"],
+                               "decision": "approve",
+                               "command": params.get("command"),
+                               "remember": True}}
+
+        def case_agent_remember_approval():
+            # strict 模式 approve+remember：第一次弹审批并记住；同一命令第二次
+            # 调用命中免审批清单 → 不带审批回调直接执行（若仍弹审批，调用会
+            # 撞 90s 超时即失败）。
+            marker_cmd = "echo smoke-remember-ok"
+            req("ssh/settings/set", {"sessionId": session_id, "rememberedCommands": []})
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "strict"})
+            first = call_tool_embedded("ssh_exec", {"command": marker_cmd},
+                                       on_event=remember_agent_prompt)
+            if "smoke-remember-ok" not in str(first.get("output", "")):
+                raise AssertionError(f"first approved exec missing marker: "
+                                     f"{str(first.get('output'))[:200]}")
+            second = call_tool_embedded("ssh_exec", {"command": marker_cmd})
+            if "smoke-remember-ok" not in str(second.get("output", "")):
+                raise AssertionError(f"remembered exec missing marker: "
+                                     f"{str(second.get('output'))[:200]}")
+            print("    remembered command re-ran without an approval prompt")
+
+        def case_agent_remember_listing_and_cleanup():
+            got = req("ssh/settings/get", {"sessionId": session_id}).get("rememberedCommands")
+            if not isinstance(got, list) or "echo smoke-remember-ok" not in got:
+                raise AssertionError(f"rememberedCommands={got!r} missing remembered entry")
+            # 全量替换语义：换一批通配形态的行。
+            req("ssh/settings/set", {"sessionId": session_id,
+                                     "rememberedCommands": ["echo a *", "echo b"]})
+            got = req("ssh/settings/get", {"sessionId": session_id}).get("rememberedCommands")
+            if got != ["echo a *", "echo b"]:
+                raise AssertionError(f"rememberedCommands after replace={got!r}")
+            # 破坏性行拒绝（IMPL_PLAN D2，错误信息带行号）。
+            try:
+                req("ssh/settings/set", {"sessionId": session_id,
+                                         "rememberedCommands": ["echo ok", "rm -rf /"]})
+            except SidecarError as error:
+                if "destructive" not in str(error).lower():
+                    raise AssertionError(f"unexpected destructive-line error: {error}")
+                print(f"    destructive line refused: {str(error)[:90]}")
+            else:
+                raise AssertionError("destructive rememberedCommands line unexpectedly accepted")
+            req("ssh/settings/set", {"sessionId": session_id, "rememberedCommands": []})
+
+        def case_alert_triage():
+            payload = json.dumps({
+                "alertId": "smoke-1", "title": "CPU 使用率过高", "severity": "CRITICAL",
+                "source": "prometheus", "message": "node-1 cpu_usage above 0.9",
+                "data": {"instance": "node-1"},
+            })
+            result = req("ssh/alert/triage", {"payload": payload})
+            normalized = result.get("normalized") or {}
+            if normalized.get("alertId") != "smoke-1" or normalized.get("severity") != "critical":
+                raise AssertionError(f"normalized={normalized!r}")
+            if result.get("category") != "cpu":
+                raise AssertionError(f"category={result.get('category')!r}, want 'cpu'")
+            suggestions = result.get("suggestions") or []
+            if not suggestions or not all(item.get("command") for item in suggestions):
+                raise AssertionError(f"suggestions={suggestions!r}")
+            if any("sudo" in str(item.get("command", "")) for item in suggestions):
+                raise AssertionError(f"sudo leaked into playbook: {suggestions!r}")
+            # 非 JSON 纯文本回退（整包作为 message）+ 双语分类。
+            fallback = req("ssh/alert/triage", {"payload": "磁盘空间不足 disk full"})
+            if fallback.get("category") != "disk":
+                raise AssertionError(f"fallback category={fallback.get('category')!r}")
+            if (fallback.get("normalized") or {}).get("message") != "磁盘空间不足 disk full":
+                raise AssertionError(f"fallback normalized={fallback.get('normalized')!r}")
+            print(f"    cpu suggestions={len(suggestions)}, fallback category=disk")
+
+        def case_audit_list():
+            result = req("ssh/audit/list", {"limit": 100})
+            entries = result.get("entries") or []
+            if not entries:
+                raise AssertionError("audit ledger empty after prior tool calls")
+            sample = entries[-1]
+            for field in ("tsMs", "tool", "connectionId", "gate", "approval",
+                          "outcome", "exitCode", "durationMs", "mode", "error"):
+                if field not in sample:
+                    raise AssertionError(f"audit entry missing {field}: {sample!r}")
+            gates = {entry.get("gate") for entry in entries}
+            approvals = {entry.get("approval") for entry in entries}
+            if "pass" not in gates:
+                raise AssertionError(f"no pass gate recorded: {gates!r}")
+            if "remembered" not in approvals:
+                raise AssertionError(f"remembered approval not audited: {approvals!r}")
+            print(f"    {len(entries)} audit entries; gates={sorted(g for g in gates if g)}; "
+                  f"approvals={sorted(a for a in approvals if a)}")
+
+        # -- agent terminal extension group --------------------------------------
+        # All routed commands below rely on agentTerminalMode=auto, re-armed by
+        # case_agent_shell_state_reuse right after the deny case turned it off.
+
+        # Ctrl-C goes straight into the session PTY exactly like the workbench
+        # interrupt button (binary frames carry a u64 BE sequence prefix).
+        input_seq = [0]
+
+        def send_ctrl_c():
+            input_seq[0] += 1
+            client.send_binary(f"ssh/terminal/in/{session_id}",
+                               struct.pack(">Q", input_seq[0]) + b"\x03")
+
+        def call_tools_embedded_batch(entries: list[tuple[str, dict, str]],
+                                      timeout: float = 90.0) -> list[dict]:
+            """Fire several mcp/call requests through one pump (request_batch).
+
+            entries: [(tool, arguments, connectionId), ...] — same envelope as
+            call_tool_embedded, just batched so the calls overlap server-side.
+            """
+            specs = [{"method": "mcp/call",
+                      "params": {"tool": tool, "arguments": arguments,
+                                 "lifecycle": lifecycle_params(dict(agent_connection,
+                                                                    id=conn, name=conn))},
+                      "timeout": timeout}
+                     for tool, arguments, conn in entries]
+            return client.request_batch(specs, on_event=auto_accept_challenge)
+
+        def tool_result(entry: dict, label: str) -> dict:
+            """Unwrap one batch entry (an mcp/call result) like call_tool_embedded."""
+            if "__error" in entry:
+                raise AssertionError(f"{label} errored: {entry['__error']}")
+            if entry.get("isError"):
+                raise AssertionError(f"{label} failed: {str(entry)[:160]}")
+            return json.loads(entry["content"][0]["text"])
+
+        def case_agent_shell_state_reuse():
+            # Connection reuse: the routed commands land in the SAME
+            # interactive shell, so an export must survive across calls.
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "auto"})
+            got = req("ssh/settings/get", {"sessionId": session_id}).get("agentTerminalMode")
+            if got != "auto":
+                raise AssertionError(f"agentTerminalMode={got!r}, want 'auto'")
+            ts = int(time.time())
+            call_tool_embedded("ssh_exec", {"command": f"export AGENT_SMOKE_TOKEN={ts}"})
+            second = call_tool_embedded("ssh_exec", {"command": "echo $AGENT_SMOKE_TOKEN"})
+            output = str(second.get("output", ""))
+            if str(ts) not in output:
+                raise AssertionError(f"shell state lost between calls: {output[:160]}")
+            print(f"    token survived across calls: {output.strip()[:40]!r}")
+
+        def case_agent_cwd_reuse():
+            call_tool_embedded("ssh_exec", {"command": "cd /tmp && pwd"})
+            second = call_tool_embedded("ssh_exec", {"command": "pwd"})
+            output = str(second.get("output", ""))
+            if "/tmp" not in output:
+                raise AssertionError(f"cwd lost between calls: {output[:160]}")
+            print(f"    cwd survived across calls: {output.strip()[:40]!r}")
+
+        def case_agent_serialized_concurrent():
+            # Two routed commands on the same session: the per-session exec
+            # lock must serialize them (each capture free of the other's
+            # markers) instead of interleaving keystrokes on one PTY.
+            ts = int(time.time())
+            entries = [
+                ("ssh_exec", {"command": f"sleep 6 && echo AONLY-{ts}"}, connection_id),
+                ("ssh_exec", {"command": f"echo BONLY-{ts}"}, connection_id),
+            ]
+            started = time.monotonic()
+            results = call_tools_embedded_batch(entries, timeout=90.0)
+            out_a = str(tool_result(results[0], "serialized A").get("output", ""))
+            out_b = str(tool_result(results[1], "serialized B").get("output", ""))
+            if f"AONLY-{ts}" not in out_a or f"BONLY-{ts}" in out_a:
+                raise AssertionError(f"A capture polluted: {out_a[:160]!r}")
+            if f"BONLY-{ts}" not in out_b or f"AONLY-{ts}" in out_b:
+                raise AssertionError(f"B capture polluted: {out_b[:160]!r}")
+            print(f"    serialized pair clean in {time.monotonic() - started:.1f}s")
+
+        agent_session_state: dict = {}
+
+        def case_open_agent_session():
+            # Second live PTY on the agent connection for cross-connection
+            # parallelism (the connection itself was opened earlier).
+            session = req("ssh/session/open",
+                          {"connectionId": agent_conn_id, "workbenchId": "smoke-fs-agent-wb",
+                           "cols": 120, "rows": 30})
+            agent_session_state["sessionId"] = session.get("sessionId", "smoke-fs-agent-wb")
+            print(f"    agent session {agent_session_state['sessionId']} opened")
+
+        def case_agent_parallel_cross_connection():
+            # Different sessions (different connections) must run in parallel:
+            # 2 x sleep 4 in ~4.5s; a serialized lock would need >= 8s.
+            ts = int(time.time())
+            entries = [
+                ("ssh_exec", {"command": f"sleep 4 && echo P1-{ts}"}, connection_id),
+                ("ssh_exec", {"command": f"sleep 4 && echo P2-{ts}"}, agent_conn_id),
+            ]
+            started = time.monotonic()
+            results = call_tools_embedded_batch(entries, timeout=90.0)
+            elapsed = time.monotonic() - started
+            out_p1 = str(tool_result(results[0], "parallel P1").get("output", ""))
+            out_p2 = str(tool_result(results[1], "parallel P2").get("output", ""))
+            if f"P1-{ts}" not in out_p1:
+                raise AssertionError(f"P1 output missing: {out_p1[:160]!r}")
+            if f"P2-{ts}" not in out_p2:
+                raise AssertionError(f"P2 output missing: {out_p2[:160]!r}")
+            if elapsed >= 7.0:
+                raise AssertionError(f"cross-connection calls took {elapsed:.1f}s "
+                                     f"(serialized would be >= 8s; budget 7s)")
+            print(f"    parallel pair ok in {elapsed:.1f}s (< 7s)")
+
+        def case_agent_large_output_cap():
+            # 2 MiB into the 1 MiB bounded recorder window: the head is
+            # evicted, the capture stays valid and the response normal. The
+            # trailing echo puts the fresh prompt on its own line, otherwise
+            # the best-effort stripper would treat the whole (single-line)
+            # capture as a prompt line and drop it.
+            result = call_tool_embedded("ssh_exec",
+                                        {"command": "head -c 2097152 /dev/zero | tr '\\0' x; echo"},
+                                        timeout=120.0)
+            output = str(result.get("output", ""))
+            if not output.strip():
+                raise AssertionError("empty output for a 2 MiB stream")
+            if result.get("incomplete") is not False:
+                raise AssertionError(f"incomplete={result.get('incomplete')!r}, want False")
+            # Loose bound only (no exact-length assertion): a window that kept
+            # everything would exceed the produced 2 MiB minus overhead.
+            if len(output) > 1536 * 1024:
+                raise AssertionError(f"capture not bounded: {len(output)} bytes")
+            print(f"    captured {len(output)} bytes of the 2 MiB stream (bounded)")
+
+        def case_agent_ansi_stripped():
+            # The escape reaches the shell as printf text (sanitize only strips
+            # raw control bytes from the injected command); the *captured
+            # output* must come back ANSI-free.
+            result = call_tool_embedded("ssh_exec",
+                                        {"command": "printf '\\033[31mREDTEXT\\033[0m\\n'"})
+            output = str(result.get("output", ""))
+            if "REDTEXT" not in output:
+                raise AssertionError(f"output missing REDTEXT: {output[:160]!r}")
+            if "\x1b" in output:
+                raise AssertionError("captured output still contains ESC bytes")
+            print(f"    colored text captured clean: {output.strip()[:40]!r}")
+
+        def case_agent_multiline_runs_line_by_line():
+            # Known limitation, pinned here on purpose: a multi-line command
+            # executes line by line, and both lines' output must be captured.
+            result = call_tool_embedded("ssh_exec", {"command": "echo L1\necho L2"})
+            output = str(result.get("output", ""))
+            if "L1" not in output or "L2" not in output:
+                raise AssertionError(f"multi-line output incomplete: {output[:160]!r}")
+            print(f"    both lines executed: {output.strip()[:60]!r}")
+
+        def case_agent_hidden_channel_opt_out():
+            # runInTerminal:false in auto mode forces the audited hidden exec
+            # channel, whose response carries no mode/incomplete fields.
+            result = call_tool_embedded("ssh_exec",
+                                        {"command": "echo legacy", "runInTerminal": False})
+            if "legacy" not in str(result.get("output", "")):
+                raise AssertionError(f"hidden exec output missing: {str(result)[:160]}")
+            if "mode" in result:
+                raise AssertionError(f"hidden-channel response leaks mode: {result}")
+            print(f"    hidden channel: {str(result.get('output')).strip()[:40]!r}, no mode field")
+
+        def case_agent_sudo_approval_chain():
+            # Approval (elevated) -> terminal injection of `sudo whoami` -> the
+            # terminal's auto-sudo state machine (or NOPASSWD sudo) answers ->
+            # root. An unstable container sudo setup is SKIP, not FAIL.
+            req("ssh/settings/set", {"sessionId": session_id, "sudoPassword": args.password})
+            result = call_tool_embedded("ssh_exec_sudo",
+                                        {"command": "whoami", "runInTerminal": True},
+                                        on_event=approve_agent_prompt)
+            output = str(result.get("output", ""))
+            if "root" not in output:
+                lowered = output.lower()
+                if "sudo" in lowered and ("password" in lowered or "incorrect" in lowered
+                                          or "not in the sudoers" in lowered):
+                    raise SkipSignal(f"container sudo configuration unstable: {output[:120]}")
+                raise AssertionError(f"sudo whoami output missing root: {output[:160]}")
+            print(f"    sudo whoami -> {output.strip()[:40]!r}")
+
+        def case_agent_timeout_incomplete_and_recover():
+            # 5s budget against a 25s command: the AI gets partial output with
+            # incomplete:true while the command keeps running; a Ctrl-C into
+            # the PTY (as the workbench banner button does) clears it and the
+            # shell takes new commands.
+            result = call_tool_embedded("ssh_exec",
+                                        {"command": "sleep 25", "timeoutSecs": 5,
+                                         "runInTerminal": True})
+            if result.get("incomplete") is not True:
+                raise AssertionError(f"incomplete={result.get('incomplete')!r}, want True")
+            send_ctrl_c()
+            # Give the ^C time to land and the shell to return to a prompt so
+            # the recovery call's capture starts clean (its settle window can
+            # otherwise fire on the ^C-echo prompt before the recovery line).
+            time.sleep(0.5)
+            recovered = call_tool_embedded("ssh_exec", {"command": "echo recovered"})
+            output = str(recovered.get("output", ""))
+            if "recovered" not in output:
+                raise AssertionError(f"shell not recovered after Ctrl-C: {output[:160]}")
+            print("    incomplete reported, leftover sleep cleared, shell recovered")
+
+        def case_agent_manual_interrupt():
+            # Human-intervention semantics: a Ctrl-C typed into the terminal
+            # aborts the running command. Two timing hazards are pinned here
+            # (both observed as real CI flakes on loaded runners):
+            # - a ^C fired before the injected command reaches the shell lands
+            #   on an empty prompt (or mid-line: bash saw "leep") and is
+            #   wasted, so the interrupts are gated on the command echo
+            #   appearing in the PTY stream (binary_frames) before starting;
+            # - the captured output contains the echoed command line, so the
+            #   success marker is assembled by the shell ("N""OTDONE") and the
+            #   echo itself can never match the assertion.
+            ts = int(time.time())
+            go_marker = f"INJGO-{ts}"
+            stop = threading.Event()
+            sends = {"count": 0}
+
+            def interrupt_loop():
+                # Wait for the command echo, then mash ^C until the call ends.
+                # The echo can be split across binary frames, so scan a rolling
+                # tail over the concatenated stream instead of single frames.
+                # Each frame payload carries an 8-byte BE sequence prefix, and
+                # the echo can be split across a frame boundary — strip the
+                # prefix first or the interleaved sequence bytes break the
+                # marker in two forever (observed CI flake root cause).
+                gate = time.monotonic() + 20.0
+                consumed = len(client.binary_frames)
+                tail = b""
+                while not stop.is_set() and time.monotonic() < gate:
+                    frames = client.binary_frames
+                    # Frame layout is [u8 stream][u8 BE sequence(8)][data]
+                    # (TerminalFrame::encode) — 9 prefix bytes, not 8.
+                    tail = (tail + b"".join(payload[9:]
+                                            for _, payload in frames[consumed:]))[-2048:]
+                    consumed = len(frames)
+                    if go_marker in tail.decode(errors="replace"):
+                        gate_state["phase"] = "echo-seen"
+                        break
+                    stop.wait(0.05)
+                gate_state["phase"] = "fired"
+                gate_state["frames_at_gate_exit"] = len(client.binary_frames)
+                deadline = time.monotonic() + 15.0
+                while not stop.is_set() and time.monotonic() < deadline:
+                    send_ctrl_c()
+                    sends["count"] += 1
+                    stop.wait(1.0)
+
+            gate_state = {"phase": "waiting-for-echo", "frames_at_gate_exit": 0}
+            worker = threading.Thread(target=interrupt_loop, daemon=True)
+            worker.start()
+            started = time.monotonic()
+            try:
+                result = call_tool_embedded(
+                    "ssh_exec",
+                    {"command": f"echo {go_marker} >/dev/null && "
+                                f"sleep 20 && echo \"N\"\"OTDONE-{ts}\""})
+            finally:
+                stop.set()
+                worker.join(timeout=5)
+            elapsed = time.monotonic() - started
+            output = str(result.get("output", ""))
+            if f"NOTDONE-{ts}" in output:
+                # sends=0 means the gate never saw the command echo (PTY output
+                # delivery stalled); sends>0 means the ^C frames were written
+                # but the command still survived — log it either way.
+                raise AssertionError("interrupted command still completed "
+                                     f"(gate={gate_state['phase']} "
+                                     f"frames={gate_state['frames_at_gate_exit']} "
+                                     f"elapsed={elapsed:.1f}s sends={sends['count']})")
+            if result.get("incomplete") is not False:
+                raise AssertionError(f"incomplete={result.get('incomplete')!r}, want False")
+            if elapsed >= 15.0:
+                raise AssertionError(f"interrupted call took {elapsed:.1f}s (budget 15s)")
+            print(f"    Ctrl-C returned in {elapsed:.1f}s without NOTDONE")
+
+        def case_agent_settings_restored():
+            restored = req("ssh/settings/set", {"sessionId": session_id,
+                                                "agentTerminalMode": "off",
+                                                "sudoPassword": ""})
+            if restored.get("agentTerminalMode") != "off":
+                raise AssertionError(f"agentTerminalMode={restored.get('agentTerminalMode')!r}, "
+                                     "want 'off'")
+            print("    agentTerminalMode=off, sudo password back to login fallback")
+
+
+        report = Report()
+        print("\n--- session isolation group ---")
+        report.run("same connection opens independent sessions", "ssh/session/open",
+                   case_same_connection_sessions_are_independent)
+        report.run("dead session mirrors input failure as event", "ssh/session/close",
+                   case_dead_session_input_signal)
+
+        print("\n--- sftp_ext group ---")
+        report.run("sftp/stat /config", "sftp/stat", case_sftp_stat)
+        report.run("sftp/exists true/false", "sftp/exists", case_sftp_exists)
+        report.run("sftp/touch + sftp/stat empty file", "sftp/touch", case_sftp_touch_stat)
+        report.run("sftp/write + sftp/read round-trip", "sftp/write", case_sftp_write_read)
+        report.run("sftp/write overwrite keeps chmod 0755", "sftp/write",
+                   case_sftp_write_preserves_permissions)
+        archive_case = "sftp/archive .ssh -> tar.gz"
+        report.run(archive_case, "sftp/archive", case_sftp_archive)
+        report.run("sftp/extract tar.gz -> directory", "sftp/extract", case_sftp_extract, needs=archive_case)
+        report.run("sftp/list includeOwner owner/group", "sftp/list", case_sftp_list_owner)
+
+        print("\n--- sudo_fs group ---")
+        report.run("sudo/stat /config", "sudo/stat", case_sudo_stat)
+        report.run("sudo/exists true/false", "sudo/exists", case_sudo_exists)
+        report.run("sudo/mkdir .sudo-test", "sudo/mkdir", case_sudo_mkdir)
+        report.run("sudo/touch inner file", "sudo/touch", case_sudo_touch,
+                   needs="sudo/mkdir .sudo-test")
+        report.run("sudo/listDir .sudo-test", "sudo/listDir", case_sudo_listdir,
+                   needs="sudo/touch inner file")
+        report.run("sudo/write + sudo/read round-trip", "sudo/writeFile", case_sudo_write_read,
+                   needs="sudo/touch inner file")
+        report.run("sudo/rename inner file", "sudo/rename", case_sudo_rename,
+                   needs="sudo/touch inner file")
+        report.run("sudo/chmod 0700 + verify mode", "sudo/chmod", case_sudo_chmod,
+                   needs="sudo/rename inner file")
+        report.run("sudo/download + temp cleanup", "sudo/download/start", case_sudo_download,
+                   needs="sudo/chmod 0700 + verify mode")
+        report.run("sudo/upload + staging cleanup", "sudo/upload/start", case_sudo_upload,
+                   needs="sudo/chmod 0700 + verify mode")
+        report.run("sudo/rename-unique collision probe", "sftp/rename-unique",
+                   case_sudo_rename_unique, needs="sudo/chmod 0700 + verify mode")
+        report.run("sudo/extract folder archive", "sftp/extract", case_sudo_extract,
+                   needs="sudo/chmod 0700 + verify mode")
+        report.run("sudo/removeAll .sudo-test", "sudo/removeAll", case_sudo_remove_all,
+                   needs="sudo/mkdir .sudo-test")
+
+        print("\n--- quick sudo profiles group ---")
+        report.run("sudo/profiles/list initial", "sudo/profiles/list", case_profiles_list_initial)
+        report.run("sudo/profiles/save create", "sudo/profiles/save", case_profiles_save_create)
+        report.run("sudo/profiles/save duplicate name rejected", "sudo/profiles/save",
+                   case_profiles_duplicate_name, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/save update keeps secret", "sudo/profiles/save",
+                   case_profiles_update_keeps_secret, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/list hides secrets", "sudo/profiles/list",
+                   case_profiles_list_hides_secrets, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/reveal returns stored secrets", "sudo/profiles/reveal",
+                   case_profiles_reveal, needs="sudo/profiles/save create")
+        report.run("sudo/profiles/options dropdown payload", "sudo/profiles/options",
+                   case_profiles_options, needs="sudo/profiles/save create")
+        report.run("ssh/settings binds profile", "ssh/settings/set",
+                   case_profiles_settings_binding, needs="sudo/profiles/save create")
+        report.run("connection/action import-sessions", "connection/action",
+                   case_connection_action_import_sessions)
+        report.run("sudo/profiles/off flow accepted + bogus rejected", "sudo/profiles/save",
+                   case_profiles_off_flow_and_reject)
+        report.run("sudo/profiles/delete + repeat", "sudo/profiles/delete",
+                   case_profiles_delete, needs="sudo/profiles/save create")
+
+        print("\n--- keys group ---")
+        report.run("ssh/batchBar/state broadcast", "ssh/batchBar/state", case_batch_bar_state_broadcast)
+        report.run("keys/discover", "keys/discover", case_keys_discover)
+        report.run("keys/discover/options", "keys/discover/options", case_keys_discover_options)
+        report.run("ssh/knownHosts/list", "ssh/knownHosts/list", case_known_hosts)
+
+        print("\n--- agent terminal group ---")
+        report.run("agent mode settings round-trip", "ssh/settings/set", case_agent_mode_roundtrip)
+        report.run("agent mode get probe", "ssh/agent/mode/get", case_agent_mode_get_probe,
+                   needs="agent mode settings round-trip")
+        report.run("connection/connect agent conn", "connection/connect",
+                   lambda: req("connection/connect", lifecycle_params(agent_connection)))
+        report.run("agent exec without session errors with guidance", "mcp/call",
+                   case_agent_no_session_error, needs="connection/connect agent conn")
+        report.run("agent terminal exec routes to PTY", "mcp/call", case_agent_terminal_exec,
+                   needs="agent mode settings round-trip")
+        report.run("agent strict approval approve", "mcp/call", case_agent_strict_approval,
+                   needs="agent terminal exec routes to PTY")
+        report.run("agent strict approval deny", "mcp/call", case_agent_deny,
+                   needs="agent strict approval approve")
+        report.run("agent approval remembered skips later prompts", "mcp/call",
+                   case_agent_remember_approval, needs="agent strict approval deny")
+        report.run("agent remembered list settings + destructive refused", "ssh/settings/set",
+                   case_agent_remember_listing_and_cleanup,
+                   needs="agent approval remembered skips later prompts")
+        report.run("agent mode re-armed + shell state reused", "ssh/settings/set",
+                   case_agent_shell_state_reuse,
+                   needs="agent remembered list settings + destructive refused")
+        report.run("agent cwd reused across calls", "mcp/call", case_agent_cwd_reuse,
+                   needs="agent mode re-armed + shell state reused")
+        report.run("agent same-session concurrency serialized", "mcp/call",
+                   case_agent_serialized_concurrent,
+                   needs="agent cwd reused across calls")
+        report.run("agent second connection terminal opened", "ssh/session/open",
+                   case_open_agent_session,
+                   needs="agent mode re-armed + shell state reused")
+        report.run("agent cross-connection parallelism", "mcp/call",
+                   case_agent_parallel_cross_connection,
+                   needs="agent second connection terminal opened")
+        report.run("agent 2 MiB output stays bounded", "mcp/call",
+                   case_agent_large_output_cap,
+                   needs="agent same-session concurrency serialized")
+        report.run("agent ANSI sequences stripped", "mcp/call", case_agent_ansi_stripped,
+                   needs="agent 2 MiB output stays bounded")
+        report.run("agent multi-line command runs line by line", "mcp/call",
+                   case_agent_multiline_runs_line_by_line,
+                   needs="agent ANSI sequences stripped")
+        report.run("agent runInTerminal=false keeps hidden channel", "mcp/call",
+                   case_agent_hidden_channel_opt_out,
+                   needs="agent multi-line command runs line by line")
+        report.run("agent sudo approval chain reaches root", "mcp/call",
+                   case_agent_sudo_approval_chain,
+                   needs="agent runInTerminal=false keeps hidden channel")
+        report.run("agent timeout returns incomplete then recovers", "mcp/call",
+                   case_agent_timeout_incomplete_and_recover,
+                   needs="agent runInTerminal=false keeps hidden channel")
+        report.run("agent manual Ctrl-C interrupt", "mcp/call", case_agent_manual_interrupt,
+                   needs="agent timeout returns incomplete then recovers")
+        report.run("agent settings restored (off + sudo password cleared)", "ssh/settings/set",
+                   case_agent_settings_restored,
+                   needs="agent mode re-armed + shell state reused")
+
+        # -- F1/F2/F3 group: resume / processes / recording -----------------
+
+        resume_src = f"{home}/.dbx-smoke-resume-src"
+
+        def case_transfer_resumable_shape():
+            result = req("sftp/transfer/resumable", {})
+            tasks = result.get("tasks")
+            if not isinstance(tasks, list):
+                raise AssertionError(f"resumable -> {json.dumps(result)[:120]}, want tasks list")
+            for task in tasks:
+                for key in ("taskId", "remotePath", "fileName", "size", "resumableBytes"):
+                    if key not in task:
+                        raise AssertionError(f"resumable task missing {key}: {json.dumps(task)[:160]}")
+            print(f"    resumable tasks: {len(tasks)}")
+
+        def case_download_resume_offset():
+            raw = b"resume-smoke-payload-19"
+            payload = base64.b64encode(raw).decode()
+            req("sftp/write", {"sessionId": session_id, "remotePath": resume_src, "dataBase64": payload})
+            size = len(raw)
+            # offset == size 合法：空传输直接可 finish。
+            info = req("sftp/download/start", {"sessionId": session_id, "remotePath": resume_src, "offset": size})
+            if info.get("resumeOffset") != size:
+                raise AssertionError(f"resumeOffset={info.get('resumeOffset')!r}, want {size}")
+            req("sftp/download/finish", {"taskId": info["taskId"]})
+            # offset > size 拒绝。
+            try:
+                req("sftp/download/start", {"sessionId": session_id, "remotePath": resume_src, "offset": size + 1})
+            except SidecarError as error:
+                if "beyond" not in str(error):
+                    raise AssertionError(f"unexpected resume error: {error}")
+            else:
+                raise AssertionError("offset beyond size accepted")
+            print(f"    resume offset {size} accepted, {size + 1} refused")
+
+        def case_upload_resume_rejects_unknown_task():
+            try:
+                req("sftp/upload/start", {"sessionId": session_id, "remotePath": resume_src,
+                                          "size": 8, "resumeTaskId": "no-such-task"})
+            except SidecarError as error:
+                if "resumable" not in str(error).lower():
+                    raise AssertionError(f"unexpected resume error: {error}")
+            else:
+                raise AssertionError("resume with unknown taskId accepted")
+
+        def case_local_capabilities_shape():
+            caps = req("local/capabilities")
+            if not isinstance(caps.get("canSaveLocal"), bool):
+                raise AssertionError(f"canSaveLocal missing: {json.dumps(caps)[:120]}")
+            if not isinstance(caps.get("downloadsDir"), str) or not caps["downloadsDir"]:
+                raise AssertionError(f"downloadsDir missing: {json.dumps(caps)[:120]}")
+            if not isinstance(caps.get("platform"), str) or not caps["platform"]:
+                raise AssertionError(f"platform missing: {json.dumps(caps)[:120]}")
+            print(f"    canSaveLocal={caps['canSaveLocal']} dir={caps['downloadsDir']} platform={caps['platform']}")
+
+        def case_local_metrics_shape():
+            # 本地终端的系统信息带数据面：本机 shell 跑同一采集脚本。Windows
+            # 无捆绑 sh 时结构化报错（"local metrics unavailable"），按环境
+            # 缺失 SKIP 而非 FAIL。
+            try:
+                sample = req("local/metrics", {})
+            except SidecarError as error:
+                if "local metrics unavailable" in str(error):
+                    raise SkipSignal(f"local sh unavailable on this host: {error}") from error
+                raise
+            for key in ("cpu", "memory", "network"):
+                if sample.get(key) is None:
+                    raise AssertionError(f"{key} section missing: {json.dumps(sample)[:160]}")
+            if "gpu" in sample:
+                raise AssertionError(f"gpu probe must stay ssh-only: {json.dumps(sample)[:160]}")
+            print(f"    cpu={json.dumps(sample['cpu'])[:80]}")
+
+        def case_local_sink_download_roundtrip():
+            raw = b"local-sink-smoke-payload-2026"
+            sink_src = f"{home}/.dbx-fs-smoke-sink"
+            req("sftp/write", {"sessionId": session_id, "remotePath": sink_src,
+                               "dataBase64": base64.b64encode(raw).decode()})
+            # saveToLocal + offset 互斥（续传语义要求调用方持有前缀）。
+            try:
+                req("sftp/download/start", {"sessionId": session_id, "remotePath": sink_src,
+                                            "offset": 1, "saveToLocal": True})
+            except SidecarError as error:
+                if "resume" not in str(error).lower():
+                    raise AssertionError(f"unexpected sink+resume error: {error}")
+            else:
+                raise AssertionError("saveToLocal with resume offset accepted")
+            info = req("sftp/download/start", {"sessionId": session_id, "remotePath": sink_src,
+                                               "saveToLocal": True})
+            if not info.get("saveToLocal"):
+                raise AssertionError(f"saveToLocal not echoed: {json.dumps(info)[:120]}")
+            task_id, size = info["taskId"], info["size"]
+            assert size == len(raw), f"size {size} != {len(raw)}"
+            offset = 0
+            while True:
+                result = req("sftp/download/next", {"taskId": task_id, "offset": offset})
+                offset += result["length"]
+                if result["eof"]:
+                    break
+                if offset >= size:
+                    break
+            finish = req("sftp/download/finish", {"taskId": task_id})
+            local_path = finish.get("localPath")
+            if not local_path:
+                raise AssertionError(f"finish returned no localPath: {json.dumps(finish)[:160]}")
+            saved = Path(local_path)
+            if not saved.is_file() or saved.read_bytes() != raw:
+                raise AssertionError(f"local file missing/mismatched: {local_path}")
+            print(f"    saved {len(raw)} bytes -> {local_path}")
+            # localPath 進歷史，才允許 reveal；任意路径必须被拒绝。
+            history = req("sftp/transfer/history", {"limit": 50})
+            row = next((t for t in history.get("tasks", []) if t.get("taskId") == task_id), None)
+            if not row or row.get("localPath") != local_path or row.get("status") != "completed":
+                raise AssertionError(f"history row missing localPath: {json.dumps(row)[:160]}")
+            try:
+                req("local/reveal", {"path": str(download_dir.parent / "not-recorded.txt")})
+            except SidecarError as error:
+                if "not saved by a completed download" not in str(error):
+                    raise AssertionError(f"unexpected reveal error: {error}")
+            else:
+                raise AssertionError("local/reveal accepted an unrecorded path")
+            print("    reveal refused unrecorded path")
+
+        def case_local_sink_download_chunk_binary_frames():
+            # 与 case_local_sink_download_roundtrip 分开的轻量校验：分块二进制帧
+            # 仍按 [8B offset][data] 形状发出（前端兼容依赖）。
+            raw = b"0123456789abcdef"
+            src = f"{home}/.dbx-fs-smoke-sink2"
+            req("sftp/write", {"sessionId": session_id, "remotePath": src,
+                               "dataBase64": base64.b64encode(raw).decode()})
+            info = req("sftp/download/start", {"sessionId": session_id, "remotePath": src,
+                                               "saveToLocal": True})
+            before = len(client.binary_frames)
+            result = req("sftp/download/next", {"taskId": info["taskId"], "offset": 0})
+            frames = [f for f in client.binary_frames[before:]
+                      if f[0] == f"sftp/download/{info['taskId']}"]
+            if not frames:
+                raise AssertionError("no binary frame emitted for download chunk")
+            channel, payload = frames[-1]
+            (frame_offset,) = struct.unpack(">Q", payload[:8])
+            if frame_offset != 0 or payload[8:] != raw[:result["length"]]:
+                raise AssertionError(f"binary frame shape mismatch: offset={frame_offset}")
+            req("sftp/download/finish", {"taskId": info["taskId"]})
+
+        def case_processes_list_and_kill():
+            listing = req("ssh/processes/list", {"sessionId": session_id}, timeout=30)
+            processes = listing.get("processes")
+            if not isinstance(processes, list) or not processes:
+                raise AssertionError(f"processes/list -> {json.dumps(listing)[:160]}")
+            row = processes[0]
+            for key in ("pid", "ppid", "user", "cpuPercent", "memPercent", "command"):
+                if key not in row:
+                    raise AssertionError(f"process row missing {key}: {json.dumps(row)[:160]}")
+            # pid 1 在后端校验层就被拒绝。
+            try:
+                req("ssh/processes/kill", {"sessionId": session_id, "pid": 1, "signal": 15})
+            except SidecarError as error:
+                if "Refusing" not in str(error):
+                    raise AssertionError(f"unexpected pid-1 error: {error}")
+            else:
+                raise AssertionError("kill pid 1 accepted")
+            # 起一个真实进程再终止，验证 kill 全链路。
+            spawned = req("ssh/exec", {"sessionId": session_id,
+                                       "command": "sleep 297 >/dev/null 2>&1 & echo $!"}, timeout=30)
+            pid_text = (spawned.get("output") or "").strip().splitlines()[-1].strip() if spawned.get("output") else ""
+            if not pid_text.isdigit():
+                raise SkipSignal(f"could not spawn test process: {json.dumps(spawned)[:120]}")
+            pid = int(pid_text)
+            req("ssh/processes/kill", {"sessionId": session_id, "pid": pid, "signal": 15})
+            time.sleep(0.5)
+            check = req("ssh/exec", {"sessionId": session_id,
+                                     "command": f"kill -0 {pid} 2>/dev/null; echo exit=$?"}, timeout=30)
+            if "exit=0" in (check.get("output") or ""):
+                raise AssertionError(f"pid {pid} still alive after SIGTERM")
+            print(f"    listed {len(processes)} rows; spawned+terminated pid {pid}")
+
+        def case_metrics_history():
+            req("ssh/metrics", {"sessionId": session_id}, timeout=60)
+            history = req("ssh/metrics/history", {"sessionId": session_id, "limit": 100}, timeout=30)
+            samples = history.get("samples")
+            if not isinstance(samples, list):
+                raise AssertionError(f"metrics/history -> {json.dumps(history)[:160]}")
+            if samples:
+                row = samples[-1]
+                for key in ("connectionId", "ts", "rxRate", "txRate"):
+                    if key not in row:
+                        raise AssertionError(f"sample missing {key}: {json.dumps(row)[:160]}")
+            print(f"    history samples: {len(samples)}")
+
+        def case_recording_flow():
+            marker = f"smoke-rec-{uuid.uuid4().hex[:8]}"
+            start = req("ssh/recording/start", {"sessionId": session_id})
+            recording_id = start.get("recordingId")
+            if not recording_id:
+                raise AssertionError(f"recording/start -> {json.dumps(start)[:160]}")
+            try:
+                client.send_binary(f"ssh/terminal/in/{session_id}", struct.pack(">Q", 910) + f"echo {marker}\r".encode())
+                time.sleep(2.0)
+            finally:
+                summary = req("ssh/recording/stop", {"sessionId": session_id})
+            if summary.get("recordingId") != recording_id:
+                raise AssertionError(f"stop -> {json.dumps(summary)[:160]}")
+            listing = req("ssh/recording/list", {})
+            if not any(item.get("recordingId") == recording_id for item in listing.get("recordings", [])):
+                raise AssertionError(f"recording {recording_id} not listed: {json.dumps(listing)[:160]}")
+            page = req("ssh/recording/get", {"recordingId": recording_id, "offset": 0, "limit": 500})
+            blob = json.dumps(page.get("events", []), ensure_ascii=False)
+            if marker not in blob:
+                raise AssertionError(f"marker {marker} not captured in recording ({page.get('total')} events)")
+            if page.get("hasMore"):
+                raise AssertionError("unexpected hasMore with limit 500 and cap below page size")
+            req("ssh/recording/delete", {"recordingId": recording_id})
+            after = req("ssh/recording/list", {})
+            if any(item.get("recordingId") == recording_id for item in after.get("recordings", [])):
+                raise AssertionError(f"recording {recording_id} still listed after delete")
+            print(f"    recorded {summary.get('events')} events, captured {marker}, deleted")
+
+        def case_local_recording_flow():
+            # 本地终端录制（dock 本地终端录制按钮的数据面）：本地 PTY 会话
+            # 上挂同一 asciicast 录制器，录出来的文件进同一 recordings 目录，
+            # ssh/recording/list|get|delete 全家族照常可用。
+            marker = f"smoke-local-rec-{uuid.uuid4().hex[:8]}"
+            opened = req("local/terminal/start", {"workbenchId": "smoke-fs-local-rec",
+                                                  "cols": 100, "rows": 24})
+            local_id = opened.get("sessionId")
+            if not local_id:
+                raise AssertionError(f"local/terminal/start -> {json.dumps(opened)[:160]}")
+            try:
+                start = req("local/recording/start", {"sessionId": local_id})
+                recording_id = start.get("recordingId")
+                if not recording_id:
+                    raise AssertionError(f"local/recording/start -> {json.dumps(start)[:160]}")
+                try:
+                    req("local/recording/start", {"sessionId": local_id})
+                    raise AssertionError("double local/recording/start accepted")
+                except SidecarError as error:
+                    if "already being recorded" not in str(error):
+                        raise
+                client.send_binary(f"local/terminal/in/{local_id}",
+                                   struct.pack(">Q", 1) + f"echo {marker}\r".encode())
+                time.sleep(2.0)
+            finally:
+                summary = req("local/recording/stop", {"sessionId": local_id})
+            if summary.get("recordingId") != recording_id:
+                raise AssertionError(f"stop -> {json.dumps(summary)[:160]}")
+            if not summary.get("events"):
+                raise AssertionError(f"no events captured: {json.dumps(summary)[:160]}")
+            try:
+                req("local/recording/stop", {"sessionId": local_id})
+                raise AssertionError("stop without active recording accepted")
+            except SidecarError as error:
+                if "no active recording" not in str(error):
+                    raise
+            listing = req("ssh/recording/list", {})
+            entry = next((item for item in listing.get("recordings", [])
+                          if item.get("recordingId") == recording_id), None)
+            if not entry:
+                raise AssertionError(f"recording {recording_id} not listed: {json.dumps(listing)[:160]}")
+            page = req("ssh/recording/get", {"recordingId": recording_id, "offset": 0, "limit": 500})
+            blob = json.dumps(page.get("events", []), ensure_ascii=False)
+            if marker not in blob:
+                raise AssertionError(f"marker {marker} not captured ({page.get('total')} events)")
+            req("ssh/recording/delete", {"recordingId": recording_id})
+            print(f"    local shell recorded {summary.get('events')} events, captured {marker}, deleted")
+            req("local/session/close", {"sessionId": local_id})
+
+        def case_audit_clear():
+            req("ssh/audit/clear", {})
+            result = req("ssh/audit/list", {"limit": 100})
+            if result.get("entries"):
+                raise AssertionError(f"ledger not empty after clear: {result.get('entries')[:2]!r}")
+            if result.get("truncated"):
+                raise AssertionError("unexpected truncated after clear")
+            # 新事件照常落账（clear 后新一代账本）：审计只记终端执行路径，
+            # 普通 RPC 读操作与隐藏通道不产生条目——切 auto 模式跑一次低危
+            # exec（终端直执 + 落账），验证完还原 off。
+            req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "auto"})
+            try:
+                call_tool_embedded("ssh_exec", {"command": "echo audit-after-clear"})
+            finally:
+                req("ssh/settings/set", {"sessionId": session_id, "agentTerminalMode": "off"})
+            after = req("ssh/audit/list", {"limit": 10})
+            entries = after.get("entries") or []
+            if not entries:
+                raise AssertionError("audit ledger did not record after clear")
+            # 执行行 wire shape 无 command 字段（协议刻意）；tool+mode+outcome
+            # 足以证明是 clear 之后新落的执行条目。
+            if not any(entry.get("tool") == "ssh_exec" and entry.get("mode") == "embedded"
+                       and entry.get("outcome") == "ok" for entry in entries):
+                raise AssertionError(f"no post-clear execution entry: {entries[:2]!r}")
+            print("    cleared, then new entries recorded again")
+
+        print("\n--- resume / processes / recording group ---")
+        report.run("sftp/transfer/resumable shape", "sftp/transfer/resumable", case_transfer_resumable_shape)
+        report.run("sftp download resume offset accepted/refused", "sftp/download/start",
+                   case_download_resume_offset)
+        report.run("sftp upload resume unknown task refused", "sftp/upload/start",
+                   case_upload_resume_rejects_unknown_task)
+        report.run("local/capabilities shape", "local/capabilities",
+                   case_local_capabilities_shape)
+        report.run("local/metrics shape", "local/metrics",
+                   case_local_metrics_shape)
+        report.run("local sink download round-trip + reveal guard", "sftp/download/start",
+                   case_local_sink_download_roundtrip)
+        report.run("local sink download binary frame shape", "sftp/download/next",
+                   case_local_sink_download_chunk_binary_frames)
+        report.run("ssh/processes list + kill round-trip", "ssh/processes/list",
+                   case_processes_list_and_kill)
+        report.run("ssh/metrics/history samples", "ssh/metrics/history", case_metrics_history)
+        report.run("ssh/recording start/stop/list/get/delete", "ssh/recording/start",
+                   case_recording_flow)
+        report.run("local/recording start/stop + shared recordings family",
+                   "local/recording/start", case_local_recording_flow)
+
+        # -- 压缩传输（M33，gzip 混合方案）group --------------------------------
+        # 阈值 0 + 开关开：可压缩文件走压缩通道（响应 compression=gzip、终态
+        # 内容一致、两侧无临时件残留）；黑名单类型决策层回退（compression=
+        # none）；随机数据触发比率守卫回退仍正确落盘；压缩下载/树下载的
+        # ready 握手与内容校验；压缩上传推送期取消的临时件清理。容器缺
+        # gzip/gunzip/tar 时整组 SKIP（能力探测用例抛 SkipSignal）。
+        compress_state: dict = {}
+
+        def compress_remote_ls(pattern: str) -> str:
+            listing = req("ssh/exec", {"sessionId": session_id,
+                                       "command": f"ls -A '{home}' | grep -F '{pattern}' || true"},
+                          timeout=30)
+            return (listing.get("output") or "").strip()
+
+        def compress_remote_digest(path: str) -> str:
+            verify = req("ssh/exec", {"sessionId": session_id,
+                                      "command": f"sha256sum '{path}'"}, timeout=60)
+            return (verify.get("output") or "").split()[0] if verify.get("output") else ""
+
+        def compress_wait_terminal(task_id: str, timeout: float = 300.0) -> dict:
+            """等任务的终态 progress 事件（ack/进度事件混流，按 taskId 过滤）。"""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                for event in list(client.events):
+                    params = event.get("params", {})
+                    if (event.get("method") == "sftp/transfer/progress"
+                            and params.get("taskId") == task_id
+                            and params.get("status") in ("completed", "failed", "cancelled")):
+                        client.events = [e for e in client.events if e is not event]
+                        return params
+                client.events = [e for e in client.events
+                                 if e.get("method") != "sftp/transfer/progress"
+                                 or e.get("params", {}).get("taskId") != task_id
+                                 or e.get("params", {}).get("status") in ("completed", "failed", "cancelled")]
+                client.timeout = min(2.0, max(0.5, deadline - time.monotonic()))
+                try:
+                    client._pump(None)
+                except SidecarError:
+                    continue
+                finally:
+                    client.timeout = 30.0
+            raise AssertionError(f"task {task_id} terminal progress event timeout")
+
+        def compress_spool_upload(remote_path: str, data: bytes) -> tuple[str, dict]:
+            """spool 分块上传（256KiB + ack 背压）→ finish；返回 (taskId, start 响应)。"""
+            info = req("sftp/upload/start", {"sessionId": session_id,
+                                             "remotePath": remote_path, "size": len(data)})
+            task_id = info["taskId"]
+            for offset in range(0, len(data), 256 * 1024):
+                chunk = data[offset:offset + 256 * 1024]
+                client.send_binary(f"sftp/upload/{task_id}", struct.pack(">Q", offset) + chunk)
+                while True:
+                    ack = next((event for event in reversed(client.events)
+                                if event.get("method") == "sftp/upload/ack"
+                                and event.get("params", {}).get("taskId") == task_id
+                                and event.get("params", {}).get("offset") == offset), None)
+                    if ack is not None:
+                        client.events = [event for event in client.events
+                                         if event.get("method") != "sftp/upload/ack"]
+                        break
+                    client.timeout = 2.0
+                    try:
+                        client._pump(None)
+                    except SidecarError:
+                        raise AssertionError(f"ack timeout at offset {offset}")
+                    finally:
+                        client.timeout = 30.0
+            req("sftp/upload/finish", {"taskId": task_id}, timeout=60)
+            return task_id, info
+
+        def compress_wait_ready(task_id: str, timeout: float = 120.0) -> dict:
+            """轮询 status 直到压缩 prep ready（与前端 waitForDownloadReady 同语义）。"""
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                status = req("sftp/transfer/status", {"taskId": task_id}, timeout=30)
+                if status.get("ready"):
+                    return status
+                if status.get("status") in ("failed", "cancelled"):
+                    raise AssertionError(f"task {task_id} died pre-ready: {json.dumps(status)[:160]}")
+                time.sleep(0.5)
+            raise AssertionError(f"compressed prep for {task_id} not ready in {timeout}s")
+
+        def case_compress_prefs_roundtrip():
+            """偏好键读写 + 阈值钳制；记录先前值供收尾恢复。"""
+            before = req("local/preferences/get", {})
+            compress_state["prev_mode"] = before.get("transfer_compress_mode")
+            compress_state["prev_threshold"] = before.get("transfer_compress_threshold_mib")
+            # on 策略：豁免弱 CPU 门槛（冒烟机核数不可假定），阈值 0 全量启用。
+            req("local/preferences/set", {"transfer_compress_mode": "on",
+                                          "transfer_compress_threshold_mib": 0})
+            current = req("local/preferences/get", {})
+            if current.get("transfer_compress_mode") != "on" or current.get("transfer_compress_threshold_mib") != 0:
+                raise AssertionError(f"compress prefs roundtrip failed: mode={current.get('transfer_compress_mode')} threshold={current.get('transfer_compress_threshold_mib')}")
+            # 超界钳制到 65536；再回到 0 供后续用例全量启用。
+            req("local/preferences/set", {"transfer_compress_threshold_mib": 999999})
+            clamped = req("local/preferences/get", {}).get("transfer_compress_threshold_mib")
+            if clamped != 65536:
+                raise AssertionError(f"threshold clamp {clamped} != 65536")
+            req("local/preferences/set", {"transfer_compress_threshold_mib": 0})
+            print("    prefs set (enabled, threshold=0), clamp 999999->65536 verified")
+
+        def case_compress_tool_probe():
+            probe = req("ssh/exec", {"sessionId": session_id,
+                                     "command": "command -v gzip >/dev/null 2>&1 && command -v gunzip >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && echo DBX_COMPRESS_OK"},
+                        timeout=30)
+            if probe.get("exitCode") != 0 or "DBX_COMPRESS_OK" not in (probe.get("output") or ""):
+                raise SkipSignal("remote container lacks gzip/gunzip/tar; compressed channel unavailable")
+            print("    remote gzip/gunzip/tar present")
+
+        def case_upload_compressed_roundtrip():
+            payload = (b"2026-09-29 compressed upload smoke line\n" * 60000)  # ~2MiB 高冗余
+            remote_path = f"{home}/.dbx-compress-src.log"
+            digest = hashlib.sha256(payload).hexdigest()
+            task_id, info = compress_spool_upload(remote_path, payload)
+            if info.get("compression") != "gzip":
+                raise AssertionError(f"start compression={info.get('compression')!r}, want gzip")
+            terminal = compress_wait_terminal(task_id)
+            if terminal.get("status") != "completed":
+                raise AssertionError(f"upload terminal {terminal.get('status')!r}: {terminal.get('error')!r}")
+            if compress_remote_digest(remote_path) != digest:
+                raise AssertionError("compressed upload digest mismatch")
+            residue = compress_remote_ls(".dbx-upload-")
+            if residue:
+                raise AssertionError(f"remote upload temp residue: {residue!r}")
+            compress_state["src_path"] = remote_path
+            print(f"    compressed upload verified ({len(payload)} bytes, gzip channel)")
+
+        def case_upload_blacklist_decision_fallback():
+            payload = b"blacklist-smoke-payload\n" * 1000
+            remote_path = f"{home}/.dbx-compress-photo.png"
+            digest = hashlib.sha256(payload).hexdigest()
+            task_id, info = compress_spool_upload(remote_path, payload)
+            if info.get("compression") != "none":
+                raise AssertionError(f"blacklist compression={info.get('compression')!r}, want none (.png)")
+            terminal = compress_wait_terminal(task_id)
+            if terminal.get("status") != "completed":
+                raise AssertionError(f"upload terminal {terminal.get('status')!r}: {terminal.get('error')!r}")
+            if compress_remote_digest(remote_path) != digest:
+                raise AssertionError("blacklist upload digest mismatch")
+            req("sftp/delete", {"sessionId": session_id, "path": remote_path})
+            print("    .png decision fallback verified (compression=none)")
+
+        def case_upload_incompressible_ratio_fallback():
+            payload = secrets.token_bytes(512 * 1024)
+            remote_path = f"{home}/.dbx-compress-rand.bin"
+            digest = hashlib.sha256(payload).hexdigest()
+            task_id, info = compress_spool_upload(remote_path, payload)
+            if info.get("compression") != "gzip":
+                raise AssertionError(f"random .bin compression={info.get('compression')!r}, want gzip (ratio guard is a mid-flight fallback)")
+            terminal = compress_wait_terminal(task_id)
+            if terminal.get("status") != "completed":
+                raise AssertionError(f"upload terminal {terminal.get('status')!r}: {terminal.get('error')!r}")
+            if compress_remote_digest(remote_path) != digest:
+                raise AssertionError("ratio-fallback upload digest mismatch")
+            residue = compress_remote_ls(".dbx-upload-")
+            if residue:
+                raise AssertionError(f"remote upload temp residue after fallback: {residue!r}")
+            req("sftp/delete", {"sessionId": session_id, "path": remote_path})
+            print("    random payload ratio fallback verified (content identical)")
+
+        def case_download_compressed_roundtrip():
+            remote_path = compress_state.get("src_path") or f"{home}/.dbx-compress-src.log"
+            expected_digest = compress_remote_digest(remote_path)
+            info = req("sftp/download/start", {"sessionId": session_id, "remotePath": remote_path,
+                                               "saveToLocal": True})
+            if info.get("compression") != "gzip":
+                raise AssertionError(f"download compression={info.get('compression')!r}, want gzip")
+            task_id = info["taskId"]
+            compress_wait_ready(task_id)
+            offset = 0
+            size = info["size"]
+            while True:
+                result = req("sftp/download/next", {"taskId": task_id, "offset": offset})
+                offset += result["length"]
+                if result["eof"] or offset >= size:
+                    break
+            finish = req("sftp/download/finish", {"taskId": task_id})
+            local_path = finish.get("localPath")
+            if not local_path:
+                raise AssertionError(f"finish returned no localPath: {json.dumps(finish)[:160]}")
+            saved = Path(local_path)
+            if not saved.is_file() or hashlib.sha256(saved.read_bytes()).hexdigest() != expected_digest:
+                raise AssertionError(f"compressed download content mismatch: {local_path}")
+            residue = compress_remote_ls(".dbx-download-")
+            if residue:
+                raise AssertionError(f"remote download temp residue: {residue!r}")
+            req("sftp/delete", {"sessionId": session_id, "path": remote_path})
+            compress_state.pop("src_path", None)
+            print(f"    compressed download verified -> {local_path}")
+
+        def case_download_tree_compressed():
+            tree_root = f"{home}/.dbx-compress-tree"
+            # 幂等前置清理：非空目录 sftp/delete 会 FAILURE，且上一次失败
+            # 运行的残留目录会让本轮 mkdir 直接 FAILURE——统一 rm -rf。
+            req("ssh/exec", {"sessionId": session_id, "command": f"rm -rf '{tree_root}'"}, timeout=30)
+            req("sftp/createDirectory", {"sessionId": session_id, "path": tree_root})
+            req("sftp/createDirectory", {"sessionId": session_id, "path": f"{tree_root}/sub"})
+            expected = {}
+            for name, body in (("a.log", b"tree smoke a\n" * 500),
+                               ("sub/b.log", b"tree smoke b\n" * 500),
+                               ("sub/c.txt", b"tree smoke c\n")):
+                req("sftp/write", {"sessionId": session_id, "remotePath": f"{tree_root}/{name}",
+                                   "dataBase64": base64.b64encode(body).decode()})
+                expected[name] = body
+            info = req("sftp/download/tree/start", {"sessionId": session_id, "remotePath": tree_root},
+                       timeout=120)
+            if info.get("compression") != "gzip":
+                raise AssertionError(f"tree compression={info.get('compression')!r}, want gzip")
+            task_id = info["taskId"]
+            compress_wait_ready(task_id, timeout=180)
+            offset = 0
+            while True:
+                result = req("sftp/download/next", {"taskId": task_id, "offset": offset})
+                offset += result["length"]
+                if result["eof"]:
+                    break
+            finish = req("sftp/download/finish", {"taskId": task_id}, timeout=120)
+            local_root = finish.get("localPath")
+            if not local_root:
+                raise AssertionError(f"tree finish returned no localPath: {json.dumps(finish)[:160]}")
+            for name, body in expected.items():
+                saved = Path(local_root, *name.split("/"))
+                if not saved.is_file() or saved.read_bytes() != body:
+                    raise AssertionError(f"tree file mismatch: {name}")
+            residue = compress_remote_ls(".dbx-tree-")
+            if residue:
+                raise AssertionError(f"remote tree temp residue: {residue!r}")
+            if any(part.endswith(".staging") for part in Path(local_root).parts):
+                raise AssertionError(f"local staging name leaked into final path: {local_root}")
+            shutil.rmtree(local_root, ignore_errors=True)
+            # 远端整树递归清理（sftp/delete 只能删空目录）。
+            req("ssh/exec", {"sessionId": session_id, "command": f"rm -rf '{tree_root}'"}, timeout=30)
+            print(f"    compressed tree download verified ({len(expected)} files) -> {local_root}")
+
+        def case_upload_compressed_cancel_cleanup():
+            # 96MiB 可压缩数据：完整 spool（finish 要求完整）→ finish 触发后台
+            # 压缩+推送（本机窗口约 2-4s）→ 立即 cancel，取消旗标在压缩/推送/
+            # gunzip 的逐块检查点命中，终态 cancelled 且两侧无临时件残留。
+            payload = (b"cancel smoke compressed payload line\n" * 1677722)[:96 * 1024 * 1024]
+            remote_path = f"{home}/.dbx-compress-cancel.log"
+            task_id = compress_spool_upload_cancel_friendly(remote_path, payload)
+            terminal = compress_wait_terminal(task_id, timeout=600)
+            if terminal.get("status") != "cancelled":
+                raise AssertionError(f"cancel terminal {terminal.get('status')!r}, want cancelled")
+            time.sleep(1.0)
+            exists = req("sftp/exists", {"sessionId": session_id, "path": remote_path})
+            if exists.get("exists") is True:
+                raise AssertionError("cancelled upload left the target file behind")
+            residue = compress_remote_ls(".dbx-upload-")
+            if residue:
+                raise AssertionError(f"remote temp residue after cancel: {residue!r}")
+            print("    cancelled compressed upload cleaned remote temps")
+
+        def compress_spool_upload_cancel_friendly(remote_path: str, data: bytes) -> str:
+            info = req("sftp/upload/start", {"sessionId": session_id,
+                                             "remotePath": remote_path, "size": len(data)})
+            task_id = info["taskId"]
+            for offset in range(0, len(data), 256 * 1024):
+                chunk = data[offset:offset + 256 * 1024]
+                client.send_binary(f"sftp/upload/{task_id}", struct.pack(">Q", offset) + chunk)
+                while True:
+                    ack = next((event for event in reversed(client.events)
+                                if event.get("method") == "sftp/upload/ack"
+                                and event.get("params", {}).get("taskId") == task_id
+                                and event.get("params", {}).get("offset") == offset), None)
+                    if ack is not None:
+                        client.events = [event for event in client.events
+                                         if event.get("method") != "sftp/upload/ack"]
+                        break
+                    client.timeout = 2.0
+                    try:
+                        client._pump(None)
+                    except SidecarError:
+                        raise AssertionError(f"ack timeout at offset {offset}")
+                    finally:
+                        client.timeout = 30.0
+            # finish 一返回就取消：后台压缩/推送窗口内命中取消旗标。
+            req("sftp/upload/finish", {"taskId": task_id}, timeout=60)
+            req("sftp/transfer/cancel", {"taskId": task_id, "reason": "user"})
+            return task_id
+
+        def case_compress_prefs_restore():
+            restore: dict = {}
+            if compress_state.get("prev_mode") is not None:
+                restore["transfer_compress_mode"] = compress_state["prev_mode"]
+            if compress_state.get("prev_threshold") is not None:
+                restore["transfer_compress_threshold_mib"] = int(compress_state["prev_threshold"])
+            req("local/preferences/set", restore or {"transfer_compress_mode": "auto",
+                                                     "transfer_compress_threshold_mib": 64})
+            print(f"    prefs restored: {json.dumps(restore)}")
+
+        report.run("compress prefs roundtrip + clamp", "local/preferences/set",
+                   case_compress_prefs_roundtrip)
+        report.run("compress remote tools probe", "ssh/exec", case_compress_tool_probe,
+                   needs="compress prefs roundtrip + clamp")
+        report.run("compressed upload round-trip", "sftp/upload/start",
+                   case_upload_compressed_roundtrip, needs="compress remote tools probe")
+        report.run("blacklist type decision fallback (.png)", "sftp/upload/start",
+                   case_upload_blacklist_decision_fallback, needs="compress remote tools probe")
+        report.run("incompressible ratio fallback keeps content", "sftp/upload/start",
+                   case_upload_incompressible_ratio_fallback, needs="compress remote tools probe")
+        report.run("compressed download round-trip + temp cleanup", "sftp/download/start",
+                   case_download_compressed_roundtrip, needs="compressed upload round-trip")
+        report.run("compressed tree download round-trip + cleanup", "sftp/download/tree/start",
+                   case_download_tree_compressed, needs="compress remote tools probe")
+        report.run("cancelled compressed upload cleans temps", "sftp/upload/finish",
+                   case_upload_compressed_cancel_cleanup, needs="compress remote tools probe")
+        report.run("compress prefs restore", "local/preferences/set",
+                   case_compress_prefs_restore, needs="compress prefs roundtrip + clamp")
+
+        # -- dock「+」launch-options 本地终端分组 group -------------------------
+        # 宿主侧 options_action 下发 locale；launch-options 首项为默认 Shell
+        # 启动项（描述带解析后的默认 Shell，localShell 偏好优先，否则自动探
+        # 测链；不带 group，宿主顶层首位平铺），其余为扫描到的 shell 子项
+        # （共享「本地终端」group）。不走 SSH 连接，任意环境可跑。
+        def case_launch_options_local_terminal_group():
+            """launch-options returns the default entry + a shell group."""
+            options = req("local/terminal/launch-options", {"locale": "zh-CN"})
+            entries = options.get("entries") or []
+            assert len(entries) >= 1, "expected at least the default entry"
+            first = entries[0]
+            assert first.get("label") == "本地终端", first.get("label")
+            description = first.get("description") or ""
+            assert description.startswith("默认 Shell："), description
+            assert len(description) > len("默认 Shell："), "default shell program missing"
+            assert first.get("context", {}).get("plugin", {}).get("mode") == "local-terminal"
+            # 默认项不带 group（宿主顶层首位）；shell 子项共享「本地SHELL」分组。
+            assert not first.get("group"), first.get("group")
+            for entry in entries[1:]:
+                assert entry.get("group") == "本地SHELL", entry.get("group")
+                assert (entry.get("context", {}).get("plugin", {}) or {}).get("shell"), entry
+            legacy = req("local/terminal/launch-options", {})
+            assert (legacy.get("entries") or [{}])[0].get("label") == "Local terminal"
+
+        report.run("local/terminal/launch-options local-terminal group", "local/terminal/launch-options",
+                   case_launch_options_local_terminal_group)
+
+        # -- M14-M17 编码 / 管线偏好 / MCP 工具面 group ---------------------------
+        # 补批次欠账：latin-1 编码族真容器链路（M14/M16/M17）、每连接编码覆盖
+        # （M16）、SFTP 管线偏好（M14-B）、MCP 工具面 SFTP 往返（M17-B）。
+        # local/preferences 是插件级持久档：进组前先快照原值，组内自建自清理、
+        # 末尾 cleanup 再兜底还原，保证整组幂等。latin-1 文件名一律以 \uXXXX /
+        # %XX 转义书写，避免源码编码歧义。
+        enc_dir = f"{home}/.dbx-enc-smoke"
+        # 显示文本（latin-1 域内：U+00E9 按 latin1_encode_display 映回 0xE9 字节）。
+        enc_name_display = "caf\u00e9.txt"
+        enc_name_renamed = "caf\u00e9-renamed.txt"
+        # M19 增量②：符号链接三命令的 0xE9 字节链接名（显示形式 + wire 形式）。
+        enc_link_display = "caf\u00e9-link"
+        enc_link_wire = "caf%E9-link"
+        # 列表回传的 wire 形式（escape_wire 的 %XX 转义）。
+        enc_name_wire = "caf%E9.txt"
+        enc_name_renamed_wire = "caf%E9-renamed.txt"
+        enc_payload = b"latin-1 smoke payload\n"
+        # M20：watcher 外部编辑链路（watch/start -> 外部保存 -> file-modified
+        # 事件 -> watch/upload 回写远端）。localPath 必须落在 sidecar 的下载
+        # 根内（validate_remote_edit_path），所以每个文件的本地副本来自
+        # saveToLocal 单文件下载（finish.localPath）。
+        watch_dir = f"{home}/.dbx-watch-smoke"
+        watch_state = {}
+        watch_lat_dir = f"{home}/.dbx-watch-latin1"
+        enc_tree_local = Path(tempfile.mkdtemp(prefix="dbx-ssh-smoke-enc-tree-"))
+        prefs_snapshot = req("local/preferences/get", {})
+        mcp_stamp = int(time.time())
+        mcp_dir = f"{home}/.dbx-mcp-smoke-{mcp_stamp}"
+        mcp_dir_renamed = f"{home}/.dbx-mcp-smoke-renamed-{mcp_stamp}"
+
+        def prefs_get(key):
+            return req("local/preferences/get", {}).get(key)
+
+        def case_prefs_pipeline_preferences():
+            # M14-B：transfer_max_active 越界钳制（1..=8）读回 + sftp_compat_mode
+            # 开关读回；非布尔值拒绝写入。只验证偏好读写链，不要求真机并发行为。
+            try:
+                for raw, want in ((99, 8), (0, 1), (5, 5)):
+                    req("local/preferences/set", {"transfer_max_active": raw})
+                    got = prefs_get("transfer_max_active")
+                    if got != want:
+                        raise AssertionError(f"transfer_max_active {raw} -> {got!r}, want {want}")
+                for enabled in (True, False):
+                    req("local/preferences/set", {"sftp_compat_mode": enabled})
+                    got = prefs_get("sftp_compat_mode")
+                    if got is not enabled:
+                        raise AssertionError(f"sftp_compat_mode={got!r}, want {enabled}")
+                try:
+                    req("local/preferences/set", {"sftp_compat_mode": "yes"})
+                except SidecarError as error:
+                    if "must be a boolean" not in str(error):
+                        raise AssertionError(f"unexpected compat error: {error}")
+                else:
+                    raise AssertionError("non-bool sftp_compat_mode accepted")
+            finally:
+                req("local/preferences/set", {
+                    "transfer_max_active": prefs_snapshot.get("transfer_max_active", 3),
+                    "sftp_compat_mode": bool(prefs_snapshot.get("sftp_compat_mode")),
+                })
+            print("    clamped 99->8 / 0->1 / 5->5; compat toggle read back")
+
+        def case_latin1_pref_set():
+            # M16 全局偏好：latin-1 写入并读回；原值由 cleanup 还原。
+            req("local/preferences/set", {"sftp_name_encoding": "latin-1"})
+            got = prefs_get("sftp_name_encoding")
+            if got != "latin-1":
+                raise AssertionError(f"sftp_name_encoding={got!r}, want 'latin-1'")
+
+        def case_latin1_create_and_list():
+            # M16 真容器链路①：touch（目录 wire 前缀 + 末段显示文本）落 0xE9
+            # 字节名，列表走裸包 READDIR latin-1 解码回忠实显示名 + %E9 wire uri。
+            req("sftp/createDirectory", {"sessionId": session_id, "path": enc_dir})
+            req("sftp/touch", {"sessionId": session_id, "path": f"{enc_dir}/{enc_name_display}"})
+            listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+            entry = next((e for e in listing.get("entries", []) if e.get("name") == enc_name_display), None)
+            if entry is None:
+                raise AssertionError(f"{enc_name_display!r} missing from latin-1 listing: "
+                                     f"{[e.get('name') for e in listing.get('entries', [])]}")
+            if "%E9" not in str(entry.get("uri", "")):
+                raise AssertionError(f"uri missing %E9 wire escape: {entry.get('uri')!r}")
+            if entry.get("lossy"):
+                raise AssertionError(f"latin-1 decode must be faithful (lossy=true): {entry!r}")
+            print(f"    listed {entry.get('name')!r} uri={entry.get('uri')!r}")
+
+        def case_latin1_write_read_exists():
+            # M16/M17 增量①：wire 路径写读往返；exists 双形态（form:"wire" 整条
+            # %XX 还原 / 缺省目录 wire + 末段显示文本）+ 交叉反例（显示文本按
+            # UTF-8 还原 0xC3A9 ≠ 0xE9，wire 形态必须探不到）。
+            wire_path = f"{enc_dir}/{enc_name_wire}"
+            req("sftp/write", {"sessionId": session_id, "remotePath": wire_path,
+                               "dataBase64": base64.b64encode(enc_payload).decode()})
+            read_back = req("sftp/read", {"sessionId": session_id, "path": wire_path, "maxBytes": 4096})
+            if base64.b64decode(read_back.get("dataBase64", "")) != enc_payload:
+                raise AssertionError(f"wire-path read-back mismatch: {read_back!r}")
+            present = req("sftp/exists", {"sessionId": session_id, "path": wire_path, "form": "wire"})
+            if present.get("exists") is not True:
+                raise AssertionError(f"exists(form=wire) -> {present!r}, want true")
+            present_default = req("sftp/exists",
+                                  {"sessionId": session_id, "path": f"{enc_dir}/{enc_name_display}"})
+            if present_default.get("exists") is not True:
+                raise AssertionError(f"exists(default form) -> {present_default!r}, want true")
+            crossed = req("sftp/exists",
+                          {"sessionId": session_id, "path": f"{enc_dir}/{enc_name_display}", "form": "wire"})
+            if crossed.get("exists") is not False:
+                raise AssertionError(f"exists(form=wire, display text) -> {crossed!r}, want false")
+            print("    wire write/read ok; exists wire/default/crossed = true/true/false")
+
+        def case_latin1_tree_download():
+            # M16/M17：latin-1 整树下载——远端裸包 READDIR 遍历字节保真，本地
+            # 根名/文件名按显示名落盘、内容逐字节一致，空子目录骨架保留。
+            req("sftp/createDirectory", {"sessionId": session_id, "path": f"{enc_dir}/sub"})
+            try:
+                info = req("sftp/download/tree/start",
+                           {"sessionId": session_id, "remotePath": enc_dir,
+                            "downloadDir": str(enc_tree_local)})
+                task_id = str(info.get("taskId") or "")
+                if not task_id:
+                    raise AssertionError(f"tree/start shape: {json.dumps(info)[:160]}")
+                drained = 0
+                while True:  # 与前端分块等待器同构：跑到 eof，而非字节总量
+                    chunk = req("sftp/download/next", {"taskId": task_id, "offset": drained})
+                    drained += int(chunk.get("length") or 0)
+                    if chunk.get("eof"):
+                        break
+                finish = req("sftp/download/finish", {"taskId": task_id})
+                local_root = finish.get("localPath")
+                if not local_root:
+                    raise AssertionError(f"tree finish returned no localPath: {json.dumps(finish)[:160]}")
+                local_file = Path(local_root) / enc_name_display
+                if not local_file.is_file():
+                    raise AssertionError(f"latin-1 named file missing under {local_root}: "
+                                         f"{sorted(p.name for p in Path(local_root).rglob('*'))}")
+                if local_file.read_bytes() != enc_payload:
+                    raise AssertionError(f"tree download content mismatch: {local_file.read_bytes()!r}")
+                if not (Path(local_root) / "sub").is_dir():
+                    raise AssertionError(f"empty subdir 'sub' not mirrored under {local_root}")
+                print(f"    tree downloaded to {local_root} ({drained} bytes)")
+            finally:
+                req("sftp/delete", {"sessionId": session_id, "path": f"{enc_dir}/sub", "recursive": True})
+
+        def case_latin1_rename_delete():
+            # M17 增量③：raw RENAME（源 wire / 目标末段显示文本）+ wire 删除 +
+            # exists 收口。删完目录清空，交给每连接覆盖组复用。
+            req("sftp/rename", {"sessionId": session_id, "sourcePath": f"{enc_dir}/{enc_name_wire}",
+                                "targetPath": f"{enc_dir}/{enc_name_renamed}"})
+            listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+            names = [e.get("name") for e in listing.get("entries", [])]
+            if enc_name_renamed not in names:
+                raise AssertionError(f"renamed file missing from latin-1 listing: {names}")
+            req("sftp/delete", {"sessionId": session_id,
+                                "path": f"{enc_dir}/{enc_name_renamed_wire}"})
+            gone = req("sftp/exists", {"sessionId": session_id,
+                                       "path": f"{enc_dir}/{enc_name_renamed_wire}", "form": "wire"})
+            if gone.get("exists") is not False:
+                raise AssertionError(f"deleted file still exists: {gone!r}")
+            print(f"    renamed to {enc_name_renamed!r}, deleted via wire path")
+
+        def case_latin1_symlink_roundtrip():
+            # M19 增量②：latin-1 组补符号链接三命令。symlink-create 的链接
+            # 名是 0xE9 字节名（wire 目录前缀 + 用户新输入显示末段的落盘分
+            # 工）；symlink-read 传整条 wire 路径，指向文本 latin-1 显示解
+            # 码；symlink-update 用显示形式的新指向再编码回字节——读↔写在
+            # latin-1 域内精确闭环。链接自清理，交还空目录给每连接覆盖组。
+            link_wire = f"{enc_dir}/{enc_link_wire}"
+            anchor = f"{enc_dir}/anchor.txt"
+            repointed = "caf\u00e9-target"
+            try:
+                req("sftp/touch", {"sessionId": session_id, "path": anchor})
+                req("sftp/symlink-create", {"sessionId": session_id, "target": "anchor.txt",
+                                            "linkPath": f"{enc_dir}/{enc_link_display}"})
+                listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+                entry = next((e for e in listing.get("entries", [])
+                              if e.get("name") == enc_link_display), None)
+                if entry is None or entry.get("kind") != "symlink":
+                    raise AssertionError(f"latin-1 named symlink missing from listing: "
+                                         f"{[e.get('name') for e in listing.get('entries', [])]}")
+                read_back = req("sftp/symlink-read", {"sessionId": session_id, "linkPath": link_wire})
+                if read_back.get("target") != "anchor.txt":
+                    raise AssertionError(f"symlink-read target mismatch: {read_back!r}")
+                req("sftp/symlink-update", {"sessionId": session_id, "linkPath": link_wire,
+                                            "target": repointed})
+                read_new = req("sftp/symlink-read", {"sessionId": session_id, "linkPath": link_wire})
+                if read_new.get("target") != repointed:
+                    raise AssertionError(f"symlink-update latin-1 round-trip mismatch: {read_new!r}")
+                print(f"    link {enc_link_display!r} create/read/update -> {repointed!r}")
+            finally:
+                for path in (link_wire, anchor):
+                    try:
+                        req("sftp/delete", {"sessionId": session_id, "path": path})
+                    except SidecarError:
+                        pass
+
+        def case_encoding_override_active():
+            # M16 连接级覆盖：全局 auto + {connectionId: latin-1} 时本连接列表
+            # 仍走原始字节路径（显示名忠实、无 lossy 标记）。
+            req("local/preferences/set", {"sftp_name_encoding": "auto",
+                                          "sftp_name_encoding_overrides": {connection_id: "latin-1"}})
+            req("sftp/touch", {"sessionId": session_id, "path": f"{enc_dir}/{enc_name_display}"})
+            listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+            entry = next((e for e in listing.get("entries", [])
+                          if str(e.get("name", "")).endswith(".txt")), None)
+            if entry is None:
+                raise AssertionError(f"no .txt entry under {enc_dir}: {listing.get('entries')}")
+            if entry.get("name") != enc_name_display or entry.get("lossy"):
+                raise AssertionError(f"connection override not applied: {entry!r}")
+            print(f"    override latin-1 active for {connection_id}: {entry.get('name')!r}")
+
+        def case_encoding_override_fallback():
+            # M16 回退语义：删除覆盖后回全局 auto，0xE9 字节名经高层客户端
+            # lossy 解码（U+FFFD + lossy 标记）。auto 下高层客户端按字面量发
+            # UTF-8 删不掉 0xE9 字节名——先临时恢复覆盖整目录递归删，再还原
+            # 全局 auto + 空覆盖桶（与进组前状态一致）。
+            req("local/preferences/set", {"sftp_name_encoding_overrides": {}})
+            listing = req("sftp/list", {"sessionId": session_id, "path": enc_dir})
+            entry = next((e for e in listing.get("entries", [])
+                          if str(e.get("name", "")).endswith(".txt")), None)
+            if entry is None:
+                raise AssertionError(f"no .txt entry under {enc_dir}: {listing.get('entries')}")
+            if "\ufffd" not in str(entry.get("name", "")) or entry.get("lossy") is not True:
+                raise AssertionError(f"expected lossy auto decode after override removal: {entry!r}")
+            print(f"    fallback to global auto: {entry.get('name')!r} (lossy=true)")
+            req("local/preferences/set", {"sftp_name_encoding_overrides": {connection_id: "latin-1"}})
+            req("sftp/delete", {"sessionId": session_id, "path": enc_dir, "recursive": True})
+            req("local/preferences/set", {"sftp_name_encoding": "auto",
+                                          "sftp_name_encoding_overrides": {}})
+
+        def watch_download_local(remote_path):
+            # saveToLocal 单文件下载。工作台 openInExternalEditor 把落点指定为
+            # <下载目录>/remote-edit/<stamp>/ —— watch/start 对 localPath 的
+            # 白名单域就是该 remote-edit 子目录，smoke 沿同一分工。
+            stamp = time.strftime("%Y%m%d%H%M%S")
+            edit_dir = str(Path(download_dir) / "remote-edit" / f"smoke-{stamp}-{len(watch_state)}")
+            info = req("sftp/download/start", {"sessionId": session_id,
+                                               "remotePath": remote_path,
+                                               "saveToLocal": True,
+                                               "downloadDir": edit_dir,
+                                               "conflict": "overwrite"})
+            task_id, size = str(info["taskId"]), int(info["size"])
+            offset = 0
+            while True:
+                chunk = req("sftp/download/next", {"taskId": task_id, "offset": offset})
+                offset += int(chunk.get("length") or 0)
+                if chunk.get("eof"):
+                    break
+            finish = req("sftp/download/finish", {"taskId": task_id})
+            local_path = finish.get("localPath")
+            if not local_path:
+                raise AssertionError(f"watch fixture download has no localPath: {json.dumps(finish)[:120]}")
+            return local_path, size
+
+        def wait_watch_event(watch_id, marker, timeout_s=8.0):
+            # 事件帧在 socket 里堆到下一次请求才被 sidecar_client 读出，所以
+            # 用无害请求泵事件循环，直到目标 watchId 的 file-modified 出现。
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                req("local/capabilities")
+                for event in client.events[marker:]:
+                    if (event.get("method") == "watch/file-modified"
+                            and (event.get("params") or {}).get("watchId") == watch_id):
+                        return event
+                time.sleep(0.3)
+            raise AssertionError(f"watch/file-modified for {watch_id} not seen in {timeout_s}s")
+
+        def watch_modified_events(marker):
+            return [event for event in client.events[marker:]
+                    if event.get("method") == "watch/file-modified"]
+
+        def case_watch_register_two():
+            # 两个文件并发注册：watchId 互不相同、各带自己的本地副本。
+            # 组自洽：显式归位 auto（wa/wb 是 clean 名，走高层写/读即可），
+            # 不依赖持久档里 sftp_name_encoding 的历史残留值。
+            req("local/preferences/set", {"sftp_name_encoding": "auto"})
+            req("sftp/createDirectory", {"sessionId": session_id, "path": watch_dir})
+            req("sftp/write", {"sessionId": session_id, "remotePath": f"{watch_dir}/wa.txt",
+                               "dataBase64": base64.b64encode(b"watch-a v1\n").decode()})
+            req("sftp/write", {"sessionId": session_id, "remotePath": f"{watch_dir}/wb.txt",
+                               "dataBase64": base64.b64encode(b"watch-b v1\n").decode()})
+            local_a, size_a = watch_download_local(f"{watch_dir}/wa.txt")
+            local_b, size_b = watch_download_local(f"{watch_dir}/wb.txt")
+            if (size_a, size_b) != (len(b"watch-a v1\n"), len(b"watch-b v1\n")):
+                raise AssertionError(f"watch fixture sizes: {size_a}/{size_b}")
+            watch_state["id_a"] = str(req("watch/start", {
+                "sessionId": session_id, "remotePath": f"{watch_dir}/wa.txt",
+                "localPath": local_a}).get("watchId") or "")
+            watch_state["id_b"] = str(req("watch/start", {
+                "sessionId": session_id, "remotePath": f"{watch_dir}/wb.txt",
+                "localPath": local_b}).get("watchId") or "")
+            if not watch_state["id_a"] or not watch_state["id_b"] \
+                    or watch_state["id_a"] == watch_state["id_b"]:
+                raise AssertionError(f"watch ids: {watch_state}")
+            watch_state["local_a"], watch_state["local_b"] = local_a, local_b
+            watch_state["marker"] = len(client.events)
+            print(f"    watchId a={watch_state['id_a'][:8]}… b={watch_state['id_b'][:8]}…")
+
+        def case_watch_edit_upload():
+            # 外部编辑 a：直接改本地副本（编辑器保存语义），事件须按 watchId
+            # 精确路由，upload-back 后远端字节与本地一致。（抑制窗已归零——
+            # 预热噪音由 SHA-256 基线把关——这里的 sleep 只是节奏留白。）
+            time.sleep(2.5)
+            Path(watch_state["local_a"]).write_text(f"external edit A {time.time()}\n")
+            event = wait_watch_event(watch_state["id_a"], watch_state["marker"])
+            params = event.get("params") or {}
+            if params.get("remotePath") != f"{watch_dir}/wa.txt" or params.get("sessionId") != session_id:
+                raise AssertionError(f"event a routing: {params}")
+            watch_state["marker"] = len(client.events)
+            back = req("watch/upload", {"watchId": watch_state["id_a"]})
+            local_bytes = Path(watch_state["local_a"]).read_bytes()
+            if int(back.get("size") or -1) != len(local_bytes):
+                raise AssertionError(f"upload-back size: {back}")
+            read_back = req("sftp/read", {"sessionId": session_id,
+                                          "path": f"{watch_dir}/wa.txt", "maxBytes": 4096})
+            if base64.b64decode(read_back.get("dataBase64", "")) != local_bytes:
+                raise AssertionError("upload-back content mismatch on wa.txt")
+            # 多文件互不串扰：编辑 b，事件路由到 b 自己的 watchId 并可独立回写。
+            Path(watch_state["local_b"]).write_text(f"external edit B {time.time()}\n")
+            event_b = wait_watch_event(watch_state["id_b"], watch_state["marker"])
+            if (event_b.get("params") or {}).get("remotePath") != f"{watch_dir}/wb.txt":
+                raise AssertionError(f"event b routing: {event_b.get('params')}")
+            watch_state["marker"] = len(client.events)
+            req("watch/upload", {"watchId": watch_state["id_b"]})
+            # 同内容重复保存（mtime 变、sha256 不变）不得再触发事件。
+            marker = len(client.events)
+            Path(watch_state["local_a"]).write_text(Path(watch_state["local_a"]).read_text())
+            time.sleep(2.0)
+            watch_drain = watch_modified_events(marker)
+            if watch_drain:
+                raise AssertionError(f"identical re-save re-fired: {watch_drain}")
+            print("    per-watch routing + upload-back round-trip + identical-save dedup ok")
+
+        def case_watch_immediate_and_atomic():
+            # 真机回归双锁：① watch/start 后立即保存（<2s）必须触发——旧 2s
+            # 启动抑制窗会把"编辑器已在运行、秒开秒存"的真实保存静默吞掉；
+            # ② 原子保存（临时件 + rename 覆盖，WPS/Office 的保存形态）必须
+            # 触发——文件级监听在 inode 交换后失聪，现在监听父目录，指纹把关。
+            local_c, size_c = watch_download_local(f"{watch_dir}/wa.txt")
+            if size_c <= 0:
+                raise AssertionError(f"immediate-case fixture size: {size_c}")
+            watch_c = str(req("watch/start", {
+                "sessionId": session_id, "remotePath": f"{watch_dir}/wa.txt",
+                "localPath": local_c}).get("watchId") or "")
+            if not watch_c:
+                raise AssertionError("immediate-case watch id missing")
+            # ① 不睡抑制窗，落盘即编辑。
+            marker = len(client.events)
+            Path(local_c).write_text(f"immediate edit {time.time()}\n")
+            wait_watch_event(watch_c, marker)
+            # ② 原子写：同目录临时件 + rename 覆盖（inode 交换）。
+            marker = len(client.events)
+            tmp = Path(local_c).with_name(Path(local_c).name + ".smoke-tmp")
+            tmp.write_text(f"atomic edit {time.time()}\n")
+            os.replace(tmp, local_c)
+            wait_watch_event(watch_c, marker)
+            # 回传校验：远端字节与本地原子写后的内容一致。
+            back = req("watch/upload", {"watchId": watch_c})
+            local_bytes = Path(local_c).read_bytes()
+            if int(back.get("size") or -1) != len(local_bytes):
+                raise AssertionError(f"atomic upload-back size: {back}")
+            read_back = req("sftp/read", {"sessionId": session_id,
+                                          "path": f"{watch_dir}/wa.txt", "maxBytes": 4096})
+            if base64.b64decode(read_back.get("dataBase64", "")) != local_bytes:
+                raise AssertionError("atomic upload-back content mismatch")
+            # ③ 同远端双副本：dedup 键是本地副本路径，两个副本的 watcher 都
+            # 存活、各自触发（前端注册表按 watchId 全保留，任一窗口保存都可回传）。
+            local_d, _ = watch_download_local(f"{watch_dir}/wa.txt")
+            watch_d = str(req("watch/start", {
+                "sessionId": session_id, "remotePath": f"{watch_dir}/wa.txt",
+                "localPath": local_d}).get("watchId") or "")
+            if not watch_d or watch_d == watch_c:
+                raise AssertionError(f"two-copy watch ids: {watch_c}/{watch_d}")
+            marker = len(client.events)
+            Path(local_c).write_text(f"copy-c edit {time.time()}\n")
+            wait_watch_event(watch_c, marker)
+            marker = len(client.events)
+            Path(local_d).write_text(f"copy-d edit {time.time()}\n")
+            wait_watch_event(watch_d, marker)
+            req("watch/stop", {"watchId": watch_c})
+            req("watch/stop", {"watchId": watch_d})
+            print("    immediate save + atomic save (temp+rename) + two-copy watchers all fire")
+
+        def case_watch_stop_semantics():
+            req("watch/stop", {"watchId": watch_state["id_a"]})
+            marker = len(client.events)
+            Path(watch_state["local_a"]).write_text(f"post-stop edit A {time.time()}\n")
+            time.sleep(2.0)
+            stopped_fired = [event for event in watch_modified_events(marker)
+                             if (event.get("params") or {}).get("watchId") == watch_state["id_a"]]
+            if stopped_fired:
+                raise AssertionError(f"stopped watch still fired: {stopped_fired}")
+            # b 未受影响：仍能触发。
+            Path(watch_state["local_b"]).write_text(f"post-stop edit B {time.time()}\n")
+            wait_watch_event(watch_state["id_b"], marker)
+            result = req("watch/stop-all", {"sessionId": session_id})
+            if int(result.get("stopped") or 0) < 1:
+                raise AssertionError(f"stop-all stopped={result}")
+            print("    stop removes exactly its watch; b survives; stop-all sweeps")
+
+        def case_watch_latin1_back():
+            # latin-1 连接口径的真机门收口：wire 路径的注册/外部编辑/回写全链
+            # （此前只有 write_bytes latin-1 分支的单测与 MCP 往返覆盖，真容器
+            # 没跑过）。组尾自愈：回写校验后删残留并把偏好归位 auto。
+            req("local/preferences/set", {"sftp_name_encoding": "latin-1"})
+            req("sftp/createDirectory", {"sessionId": session_id, "path": watch_lat_dir})
+            wire = f"{watch_lat_dir}/caf%E9.txt"
+            req("sftp/write", {"sessionId": session_id, "remotePath": wire,
+                               "dataBase64": base64.b64encode(b"latin1 watch v1\n").decode()})
+            local, size = watch_download_local(wire)
+            if size != len(b"latin1 watch v1\n"):
+                raise AssertionError(f"latin-1 watch fixture size: {size}")
+            watch_id = str(req("watch/start", {"sessionId": session_id, "remotePath": wire,
+                                               "localPath": local}).get("watchId") or "")
+            if not watch_id:
+                raise AssertionError("latin-1 watch id missing")
+            marker = len(client.events)
+            time.sleep(2.5)  # 越过 pump 启动抑制窗
+            Path(local).write_text(f"latin-1 external edit {time.time()}\n")
+            event = wait_watch_event(watch_id, marker)
+            if (event.get("params") or {}).get("remotePath") != wire:
+                raise AssertionError(f"latin-1 event remotePath: {event.get('params')}")
+            marker = len(client.events)
+            back = req("watch/upload", {"watchId": watch_id})
+            local_bytes = Path(local).read_bytes()
+            if int(back.get("size") or -1) != len(local_bytes):
+                raise AssertionError(f"latin-1 upload-back size: {back}")
+            read_back = req("sftp/read", {"sessionId": session_id, "path": wire,
+                                          "maxBytes": 4096})
+            if base64.b64decode(read_back.get("dataBase64", "")) != local_bytes:
+                raise AssertionError("latin-1 upload-back content mismatch")
+            # 自愈：watch 已停，趁偏好仍在 latin-1 删掉 0xE9 字节名残留，再归位 auto。
+            req("watch/stop", {"watchId": watch_id})
+            req("sftp/delete", {"sessionId": session_id, "path": watch_lat_dir,
+                                "recursive": True})
+            req("local/preferences/set", {"sftp_name_encoding": "auto"})
+            print("    latin-1 wire register/edit/upload-back round-trip ok")
+
+        def case_local_editors_list():
+            # 编辑器目录（编辑器映射增强）：条目形状齐备，平台基线编辑器必在
+            # （macos=textedit / windows=notepad，均为系统自带恒可用）。
+            payload = req("local/editors/list")
+            platform = str(payload.get("platform") or "")
+            if platform not in {"macos", "windows", "linux", "other"}:
+                raise AssertionError(f"local/editors/list platform: {payload}")
+            editors = payload.get("editors")
+            if not isinstance(editors, list) or not editors:
+                raise AssertionError(f"local/editors/list editors: {json.dumps(editors)[:200]}")
+            ids = set()
+            for editor in editors:
+                for key in ("id", "name", "available", "launch", "suggestedExtensions"):
+                    if key not in editor:
+                        raise AssertionError(f"editor entry missing {key}: {editor}")
+                if not isinstance(editor["available"], bool) or not isinstance(editor["launch"], dict):
+                    raise AssertionError(f"editor entry types: {editor}")
+                ids.add(str(editor["id"]))
+            baseline = {"macos": "textedit", "windows": "notepad"}.get(platform)
+            if baseline and baseline not in ids:
+                raise AssertionError(f"{platform} baseline editor {baseline} missing: {sorted(ids)}")
+            available = [str(e["id"]) for e in editors if e["available"]]
+            watch_state["available_editor"] = available[0] if available else ""
+            print(f"    platform={platform} editors={len(editors)} available={available or 'none'}")
+
+        def case_local_open_with_guardrails():
+            # 三条拒绝路径：unknown editorId 明确报错；可用编辑器打开未记录
+            # 路径被下载历史 allowlist 拦截；custom 通道空命令被拒。
+            try:
+                req("local/open-with", {"path": "/definitely-not-opened", "editorId": "no-such-editor"})
+            except SidecarError as error:
+                if missing_method(error) is not None:
+                    raise
+                if "Unknown editor id" not in str(error):
+                    raise AssertionError(f"unknown editorId error: {error}")
+            else:
+                raise AssertionError("unknown editorId accepted")
+            editor_id = watch_state.get("available_editor")
+            if not editor_id:
+                raise SkipSignal("no editor available on this host; allowlist branch untested")
+            try:
+                req("local/open-with", {"path": "/definitely-not-opened", "editorId": editor_id})
+            except SidecarError as error:
+                if missing_method(error) is not None:
+                    raise
+                if "not saved by a completed download" not in str(error):
+                    raise AssertionError(f"allowlist error: {error}")
+            else:
+                raise AssertionError("unrecorded path accepted by local/open-with")
+            try:
+                req("local/open-with", {"path": "/definitely-not-opened", "custom": {"command": "   "}})
+            except SidecarError as error:
+                if missing_method(error) is not None:
+                    raise
+                if "non-empty command" not in str(error):
+                    raise AssertionError(f"empty custom command error: {error}")
+            else:
+                raise AssertionError("empty custom command accepted")
+            print(f"    unknown-id / allowlist / empty-custom all rejected (available={editor_id})")
+
+        def case_mcp_sftp_toolface():
+            # M17-B MCP 工具面（#203 瘦身后 = 只读浏览面）：sftp_list_dir /
+            # sftp_stat / sftp_read_file 在 autonomous 模式经 mcp/call 基本往返；
+            # 变更族（mkdir/rename/remove 等）已移出 MCP 面，改由 ssh_exec 走
+            # shell——与 agent 实际路径一致，一并验证该组合可用。
+            # smoke_mcp.py 走独立 --mcp stdio 进程；这里沿既有 ssh_exec 先例走
+            # embedded 桥（mcp/call + lifecycle），同一工具实现、无需第二进程。
+            # 临时目录放 /tmp：mcp_safety 灾难门对家目录（≤2 层）下的递归
+            # rm 也拦（/tmp 下常规清理豁免），agent 实际使用同样会选 /tmp。
+            base = f"/tmp/.dbx-mcp-smoke-{int(time.time())}"
+            renamed = f"{base}-renamed"
+            call_tool_embedded("ssh_exec", {"command": f"mkdir -p '{base}'"},
+                               connection_id=connection_id)
+            listing = call_tool_embedded("sftp_list_dir", {"path": "/tmp"}, connection_id=connection_id)
+            names = [str(e.get("name")) for e in listing.get("entries", [])]
+            if base.rsplit("/", 1)[-1] not in names:
+                raise AssertionError(f"mcp sftp_list_dir missing {base}: {names[:10]}…")
+            stat = call_tool_embedded("sftp_stat", {"path": base}, connection_id=connection_id)
+            if "size" not in stat or "permissions" not in stat:
+                raise AssertionError(f"mcp sftp_stat shape: {stat}")
+            inner = call_tool_embedded("sftp_list_dir", {"path": base},
+                                       connection_id=connection_id)
+            if not isinstance(inner.get("entries"), list):
+                raise AssertionError(f"mcp sftp_list_dir on dir: {inner}")
+            call_tool_embedded("ssh_exec",
+                               {"command": f"mv '{base}' '{renamed}'"},
+                               connection_id=connection_id)
+            call_tool_embedded("ssh_exec",
+                               {"command": f"rm -r '{renamed}'"},
+                               connection_id=connection_id)
+            after = call_tool_embedded("sftp_list_dir", {"path": "/tmp"}, connection_id=connection_id)
+            remaining = [str(e.get("name")) for e in after.get("entries", [])]
+            if renamed.rsplit("/", 1)[-1] in remaining:
+                raise AssertionError(f"removed dir still listed per MCP tool: {remaining[:10]}…")
+            print("    mcp list/stat + shell-mutation round-trip ok")
+
+        print("\n--- alert triage + audit group ---")
+        report.run("ssh/alert/triage normalize+classify+playbook", "ssh/alert/triage",
+                   case_alert_triage)
+        report.run("ssh/audit/list returns approval trail", "ssh/audit/list",
+                   case_audit_list,
+                   needs="agent remembered list settings + destructive refused")
+        report.run("ssh/audit/clear truncates the ledger", "ssh/audit/clear",
+                   case_audit_clear,
+                   needs="ssh/audit/list returns approval trail")
+
+
+        print("\n--- encoding / pipeline preferences group (M14-M17) ---")
+        report.run("local/preferences pipeline clamps read back", "local/preferences/set",
+                   case_prefs_pipeline_preferences)
+        report.run("local/preferences latin-1 encoding set", "local/preferences/set",
+                   case_latin1_pref_set)
+        report.run("latin-1 container create + list decode", "sftp/touch",
+                   case_latin1_create_and_list, needs="local/preferences latin-1 encoding set")
+        report.run("latin-1 wire write/read + exists both forms", "sftp/write",
+                   case_latin1_write_read_exists, needs="latin-1 container create + list decode")
+        report.run("latin-1 tree download keeps byte-faithful names", "sftp/download/tree/start",
+                   case_latin1_tree_download,
+                   needs="latin-1 wire write/read + exists both forms")
+        report.run("latin-1 raw rename + wire delete", "sftp/rename",
+                   case_latin1_rename_delete,
+                   needs="latin-1 tree download keeps byte-faithful names")
+        report.run("latin-1 symlink create/read/update round-trip", "sftp/symlink-create",
+                   case_latin1_symlink_roundtrip,
+                   needs="latin-1 raw rename + wire delete")
+        report.run("per-connection encoding override applies", "local/preferences/set",
+                   case_encoding_override_active,
+                   needs="latin-1 symlink create/read/update round-trip")
+        report.run("per-connection override falls back to global auto", "local/preferences/set",
+                   case_encoding_override_fallback, needs="per-connection encoding override applies")
+        report.run("MCP tool-face sftp round-trip (autonomous)", "mcp/call",
+                   case_mcp_sftp_toolface)
+
+        print("\n--- watcher external-edit group (M20) ---")
+        report.run("watch/start registers two files with distinct ids", "watch/start",
+                   case_watch_register_two)
+        report.run("watcher external edit routes events per watch + upload-back",
+                   "watch/upload",
+                   case_watch_edit_upload,
+                   needs="watch/start registers two files with distinct ids")
+        report.run("watcher immediate save (<2s) and atomic save (temp+rename) both fire",
+                   "watch/upload",
+                   case_watch_immediate_and_atomic,
+                   needs="watcher external edit routes events per watch + upload-back")
+        report.run("watch/stop drops exactly its watch; stop-all sweeps", "watch/stop-all",
+                   case_watch_stop_semantics,
+                   needs="watcher immediate save (<2s) and atomic save (temp+rename) both fire")
+        report.run("watcher latin-1 wire path register/edit/upload-back", "watch/upload",
+                   case_watch_latin1_back,
+                   needs="watch/stop drops exactly its watch; stop-all sweeps")
+
+        print("--- local editor catalog group (editor mapping) ---")
+        report.run("local/editors/list returns shaped per-platform catalog", "local/editors/list",
+                   case_local_editors_list)
+        report.run("local/open-with rejects unknown id / unrecorded path / empty custom",
+                   "local/open-with",
+                   case_local_open_with_guardrails,
+                   needs="local/editors/list returns shaped per-platform catalog")
+
+        step("cleanup leftovers")
+        # Best-effort mode/secret restore even when a late case failed: the
+        # sidecar keeps these in memory only, but a clean teardown keeps the
+        # next smoke run's expectations honest.
+        try:
+            client.request("ssh/settings/set", {"sessionId": session_id,
+                                                "agentTerminalMode": "off",
+                                                "sudoPassword": ""})
+        except SidecarError:
+            pass
+        # M14-M17 组兜底清理：先借 latin-1 原始字节路径删掉编码组残留（auto
+        # 下高层客户端删不掉 0xE9 字节名），再还原进组前的偏好快照。
+        try:
+            client.request("local/preferences/set", {"sftp_name_encoding": "latin-1"})
+            client.request("sftp/delete", {"sessionId": session_id, "path": enc_dir, "recursive": True})
+            print(f"    deleted {enc_dir}")
+        except SidecarError:
+            pass  # already cleaned by its case / never created
+        try:
+            client.request("sftp/delete", {"sessionId": session_id, "path": watch_dir,
+                                           "recursive": True})
+            print(f"    deleted {watch_dir}")
+        except SidecarError:
+            pass  # watcher group never reached registration
+        try:
+            client.request("local/preferences/set", {
+                "sftp_name_encoding": prefs_snapshot.get("sftp_name_encoding") or "auto",
+                "sftp_name_encoding_overrides": prefs_snapshot.get("sftp_name_encoding_overrides") or {},
+                "transfer_max_active": prefs_snapshot.get("transfer_max_active", 3),
+                "sftp_compat_mode": bool(prefs_snapshot.get("sftp_compat_mode")),
+            })
+            print("    preferences restored to pre-group snapshot")
+        except SidecarError:
+            pass
+        shutil.rmtree(enc_tree_local, ignore_errors=True)
+        for path, recursive in ((touch_path, False), (write_path, False), (resume_src, False),
+                                (archive_path, False), (extract_dir, True), (sudo_dir, True),
+                                (f"{home}/.dbx-fs-smoke-sink", False),
+                                (f"{home}/.dbx-fs-smoke-sink2", False),
+                                (mcp_dir, True), (mcp_dir_renamed, True)):
+            try:
+                client.request("sftp/delete",
+                               {"sessionId": session_id, "path": path, "recursive": recursive})
+                print(f"    deleted {path}")
+            except SidecarError:
+                pass  # already cleaned by its case / not ours / needs sudo
+        try:
+            client.request("ssh/session/close", {"sessionId": session_id})
+            print("    session closed")
+        except SidecarError:
+            pass
+        same_connection_session_id = same_connection_session_state.get("sessionId")
+        if same_connection_session_id:
+            try:
+                client.request("ssh/session/close", {"sessionId": same_connection_session_id})
+                print("    second same-connection session closed")
+            except SidecarError:
+                pass
+        agent_session_id = agent_session_state.get("sessionId")
+        if agent_session_id:
+            try:
+                client.request("ssh/session/close", {"sessionId": agent_session_id})
+                print("    agent session closed")
+            except SidecarError:
+                pass
+
+        shutil.rmtree(download_dir, ignore_errors=True)
+        client.close()
+        step(f"summary ({time.monotonic() - started:.1f}s)")
+        print(f"PASS {len(report.passed)} / SKIP {len(report.skipped)} / FAIL {len(report.failed)}")
+        for name, reason in report.skipped:
+            print(f"  SKIP {name}: {reason}")
+        for name, error in report.failed:
+            print(f"  FAIL {name}: {error}", file=sys.stderr)
+        if report.failed:
+            sys.exit(1)
+        print("PASS: fs/keys smoke OK")
+    except SidecarError as error:
+        fail(str(error), client)
+    except KeyboardInterrupt:
+        client.close()
+
+
+if __name__ == "__main__":
+    main()

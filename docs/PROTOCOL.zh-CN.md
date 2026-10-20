@@ -1,0 +1,1434 @@
+# SSH/SFTP 插件协议
+
+## 生命周期与状态隔离
+
+Sidecar 是插件级共享进程，所有状态都必须以 `connectionId`、`sessionId` 或 `taskId` 为键。`connection/connect` 只接收并缓存宿主注入的连接配置；`connection/disconnect` 会关闭该连接下的终端、SFTP 子系统和传输任务。工作台不会接收密码字段。
+
+Telnet/VNC/Serial/RDP 的 saved connection 生命周期也走同一入口，但不会进入 SSH 连接池：`connection/connect` 对 `external_config.protocol: "telnet"|"vnc"|"serial"|"rdp"` 返回成功，`connection/test` 对宿主给出的 `runtime.host:runtime.port` 做 10 秒 TCP 可达性探测（Serial 无 TCP 语义，直接返回成功并提示可达性在真实打开连接时校验），`connection/disconnect` 按 `connection.id` 清理其 Telnet/VNC 会话。逻辑端点始终来自 `connection.host:connection.port`，用于界面显示和身份；实际 TCP 拨号只使用 `runtime.host:runtime.port`（缺省时回退逻辑端点）。serial/rdp 连接的会话启动由前端 `openSession` 路由（M32-B）：读取连接的 `serial_*`/`rdp_*` config 字段组装各自的连接参数，失败回落对应连接表单。
+
+**非 SSH 连接凭据暂存**（2026-10-03，配合连接表单 `password` 字段对 telnet/vnc/rdp 可见）：连接表单的密码（manifest `binding: "password"` → lifecycle `connection.password`）对这三个协议不再无处安放——`connection/connect` 非 SSH 分支把它连同 `connection.username` 按连接 id 暂存进 sidecar 内存注册表（仅进程内存活、`Zeroizing` 持有、容量 256 封顶、`connection/disconnect` 即清、Debug 只出连接 id 列表）；`telnet/start`（合成内置词表的 declarative 自动登录）、`vnc/start` / `rdp/start`（合并 NLA/VNC-Auth 密码，RDP 用户名仅请求留空时补）在**请求自身未携带凭据**时才取用。webview context 是无密钥白名单形状，前端永远接触不到该密码，只能透传 `connectionId`。没存密码则维持旧行为（回落各自连接弹窗）。
+
+工作台的“新建会话”保持独立 transport 语义，会重新完成 SSH 认证（堡垒机可再次要求 MFA）；“复制会话（免再次验证）”则向 `ssh/session/open` 传 `reuseAuthenticatedTransport: true` 和当前 `reuseAuthenticatedSessionId`，在用户所点窗口当前存活且已认证的 transport 上新开独立 PTY channel。复制会话拥有独立 `sessionId`、`workbenchId`、回放缓冲和终端任务，不复制或缓存 OTP。打开复制 channel 前会先预占共享 transport 引用，因此源会话在 channel/PTY/shell 建立期间关闭也不会提前释放跳板链；关闭任一复制会话只关闭自己的 channel，最后一个共享引用释放后才断开跳板链。每个复制会话都会额外占用一个 SSH channel，数量受服务端 `MaxSessions` 限制（OpenSSH 常见默认值为 10）；超过限制时 `open` 返回 channel 建立失败。
+
+显式传入 `reuseAuthenticatedSessionId` 时严格 fail closed：指定来源不存在、已关闭或连接不匹配都会返回 `No live authenticated SSH connection`。前端收到该错误后只降级一次，以普通“新建会话”语义重新登录，允许堡垒机再次要求 MFA；该错误同时属于永久重试错误，不进入对同一失效 sessionId 的退避重试。只传 `reuseAuthenticatedTransport: true` 的旧调用方保留兼容行为：后端会从同一连接中确定性选取最早创建的存活会话，因此 transport 来源不保证对应调用方当前显示的窗口。
+
+复制会话继承来源会话在连接时解析出的内存态 sudo 编排快照（`SudoAuth`），包括 `password_command` 当时的解析结果；复制时不会再次运行 `password_command`。会话建立后的设置同步仍按各会话现有更新机制独立生效。
+
+`ssh/session/open` 还可接收可选 `requestedSessionId`。前端可在调用长连接 RPC 前预分配该 id，使 `ssh/terminal/out/{sessionId}` 的首帧无需等待 RPC 返回即可进入终端；sidecar 会在注册表冲突或旧调用方缺失该字段时安全回退到新的 UUID，返回的 `sessionId` 始终是权威值。旧前端/sidecar 继续使用现有 replay 语义。交互 PTY 会先建立；交互 shell 会话打开时 sidecar 异步探测远端 shell 并武装提示符钩子（见下「提示符钩子与提示符换行」节），探测不阻塞首个 Prompt；命令会话（`spawnCommand`/`remote_command`）不武装。
+
+## 提示符钩子与提示符换行（t8y2/dbx#10750）
+
+每个**交互 shell 会话**打开时，sidecar 在读循环外异步探测远端 shell（`printf '%s' "$SHELL"`，5s 超时判 Other），bash/zsh 会话即向 channel 键入一次 hook 安装行（与启动命令共用命令 FIFO，`interactive_shell_session` 门控——`spawnCommand`/`remote_command` 替代了 shell，绝不向其 stdin 键入 shell 语法）：
+
+- bash 在 `PROMPT_COMMAND` 前置 `__dbx_emit_cwd`，zsh 向 `precmd_functions` 前插同名函数，二者均在**每次提示符绘制前**发一帧 `ESC]7;file://<host><pwd>BEL`（与 SFTP 目录跟随共用同一信号源）；安装行带 `__DBX_CWD_ACTIVE` 幂等守卫与会话本地回滚保护，重复武装为远端 no-op。
+- 武装对会话全生命周期生效：SFTP「跟随目录」开关关闭只停前端导航，**不再拆除钩子**（`ssh/terminal/directoryTracking {enabled:false}` 现为纯前端语义）；开关开启遇已武装则跳过重复安装。
+- **前端提示符换行**（FinalShell/WindTerm 行为）：`lib/terminalPromptNewline.ts` 字节级变换器把 OSC 7 帧当"提示符即将绘制"信号——可见输出不在行首就在帧前补一帧 CRLF，命令无结尾换行的输出不再与下一个提示符粘连。变换器除插入外逐字节透传（不解码 UTF-8，zmodem 显示流/trzsz 嗅探不受影响）；备用屏（vim/top）与 zmodem/trzsz 传输期间只跟踪不插入；无钩子流（fish/nushell、命令会话、安装失败）恒等直通。会话切换/断开时随命令标记一并复位。
+
+
+## 同 transport 命令会话（WezTerm `spawn` 对标，WT-4）
+
+WezTerm 的 ssh domain 支持 `spawn` 语义：在已认证 transport 上另开 channel 直接执行指定命令（独立 PTY/session），适配「一键开 htop 第二个 tab」类场景。本插件经 `ssh/session/open` 的可选参数 `spawnCommand`（string，camelCase）实现等价能力，无新增方法号——命令会话与复制会话共用同一条「复制会话链路」，只是 channel 的启动动作不同。
+
+- **方法与参数**：`ssh/session/open` 新增可选 `spawnCommand`。缺省、空串或纯空白 → 现行行为不变（shell，或连接级 `remote_command`）；trim 后非空 → 该 channel 在 `request_pty` + `set_env` 之后以 `exec` 执行 `sh -c '<命令>'` 替代 `request_shell`。`spawnCommand` 显式覆盖连接级 `remote_command`（每次打开的请求优先于连接配置）。命令字节数上限 4096（与启动命令单条上限同量级），超限报错；含 NUL 字节报错（exec 字符串不能携带 NUL，fail closed 不静默截断）。
+- **命令转义（安全约定）**：远端命令一律 shell 单引号转义（仓库硬性约定）。sidecar 用既有 `exec::shell_quote` 把整条命令包成 `sh -c '<单引号转义后的命令>'`：外层登录 shell 只收到一个安全单参，引号内元字符无法逃逸；内层 `sh -c` 保留完整 shell 语义（管道、重定向、多命令按用户输入原样生效）。
+- **返回值**：与现行 `ssh/session/open` 完全一致（`sessionId`/`connectionId`/`connected`/`sequence`/`chunkSize`/`directoryTrackingSupported`），无新增字段。
+- **与「复制会话」的差异**：仅 channel 启动动作不同（`exec` 指定命令 vs `request_shell`）。其余语义完全复用——独立 `sessionId`、`workbenchId`、回放缓冲与终端任务；`reuseAuthenticatedTransport` + `reuseAuthenticatedSessionId` 组合时的共享引用预占（retain 先于任何 await）、跳板链生命周期与 sudo 编排快照继承均与复制会话一致；关闭会话只关自己的 channel，最后一个共享引用释放才断开跳板链。差异点二：命令会话跳过 `startup_commands` 注入——exec 替代了交互 shell，向其键入预置命令是语义冲突（与连接级 `remote_command` 的既有豁免同款）。
+- **参数正交性**：`spawnCommand` 不强制与复用参数组合。与复用组合是主路径（WezTerm spawn 语义，免再次认证）；不带复用时按普通新建会话认证后在新 transport 上执行同一命令——前端「复制 transport 失效降级一次重登」路径依赖此正交性，降级后命令意图不丢。`spawnCommand` 是一次性打开参数：打开成功后该工作台的后续重连回到普通 shell 会话语义（对齐复制会话 reuse 意图的一次性消费），不把 exec 命令固化进连接配置。
+- **错误形态（沿用 sidecar String 错误上抛体系，无数字错误码）**：参数非法 → `spawnCommand must not contain NUL bytes` / `spawnCommand exceeds the 4096 byte limit`；复用来源失效 → 既有 `No live authenticated SSH connection`（前端单次降级为普通登录）；channel/PTY/exec 建立失败 → 既有 `Failed to open terminal channel` / `Failed to request SSH PTY` / `Failed to start remote command` 前缀并携带服务端原因原文。
+- **MaxSessions 语义**：命令会话与复制会话一样各占用一个 SSH channel，数量受服务端 `MaxSessions` 限制（OpenSSH 常见默认 10）。超限时 `exec`/`channel_open_session` 被服务端拒绝，`open` 以错误返回且错误文本携带服务端原因——失败对用户可见，不静默降级、不自动重连（与复制会话既有语义一致）。
+- **前端入口**：工作台工具栏「复制会话」按钮旁新增「命令会话」入口，弹窗输入命令后以 `openWorkbench` 打开新 tab，context 携带 `spawnCommand` + 复用参数（`spawnCommand` 非宿主保留字段，随 context 原样透传给工作台）。
+
+## RPC
+
+> **兼容基线口径**：manifest `engines.host_api` 固定 `">=1.0.0"` 作粗粒度声明；`permissions` 中的
+> `host.storage` / `host.ai` 实为宿主 1.2 能力，运行时全程 `?.` 存在性守卫并逐级降级
+> （`pluginStore.ts` 宿主桥 → guarded localStorage → 内存三级回退），缺失只降功能不致死。
+> **权威安装下限由 `engines.dbx` 承担**（当前 `>=0.6.31`）——宿主 `SUPPORTED_PLUGIN_HOST_API_VERSION`
+> 的演进先于部分能力面，`host_api` 无法用来门控细粒度能力（论证见 `private_key_path` picker 兼容性段）。
+
+| 方法 | 作用 |
+| --- | --- |
+| `connection/connect`、`connection/disconnect` | 宿主生命周期入口（语义见上文「生命周期与状态隔离」节）：`connect` 只接收并缓存宿主注入的连接配置进连接注册表，非 SSH 协议（`telnet`/`vnc`/`serial`/`rdp`）不进 SSH 连接池、直接 `{success: true}`；**同 connectionId 重复 connect 幂等**（#202，web 刷新后宿主重推凭据的恢复路径）：注册表整体替换为最新配置，并把该连接上一轮注册可能残留的辅助状态一并清扫——绑定已死会话的 sudo 保活循环（旧实现 `contains_key` 早退会让新会话的 Quick Sudo 保活静默失效）、孤儿会话的 metrics 快照/兼容提示/压缩工具探测缓存、无存活会话的连接级 remote-forward 表，重推后运行时状态与全新注册完全一致，后续 `ssh/session/open` 不会再被旧状态卡死；`disconnect` 按 `connection.id` 关闭该连接全部 SSH 会话与共享传输、独立端口映射、sudo 保活循环，并连带清理 Telnet/VNC 会话，缺 id 报错、幂等返回 `{success: true}` |
+| `connection/test` | 连接表单探针（TCP 语义见上文「生命周期与状态隔离」、弹窗重臂见「主机密钥确认通道」节）：SSH 走完整握手（拨号预算按宿主 RPC 截止对齐留 1s 余量，弹窗挂起期以「挑战等待+连接超时」重臂一次），成功即握手/主机密钥/认证三步全过；telnet/vnc/rdp 对 `runtimeHost:runtimePort` 做 10 秒 TCP 探测，不可达返回 `{success: false, message}`（非报错）；serial 无 TCP 语义直接 `{success: true}` 附「可达性在真实打开时校验」提示 |
+| `connection/challenge/resolve` | 主机密钥与 RDP 证书确认的固定应答方法（流程见上文「主机密钥确认通道」、RDP 侧见下文「RDP 远程桌面会话」节）：`{challengeId, operationId, accept?, remember?}`，`accept` 缺省 `false` fail-closed；按 `challengeId` 先查 RDP 证书注册表，未命中进 SSH host-key/agent 共享 resolve |
+| `connection/protocol` | webview 路由前的权威协议查询：`{connectionId}` → `{protocol, shell?}`。宿主推给 webview 的 connection 上下文缺 `external_config.protocol`（该字段只随 lifecycle `connection/connect` 走向 sidecar），前端据此把暂存的非 SSH 协议（`telnet`/`vnc`/`serial`/`rdp`）路由到各自会话；本地 Shell 目标（`io.dbx.ssh.local`，登记于 local_targets 注册表）优先命中，返回 `protocol: "local"` 与连接表单的 `shell`/`cwd`/`env`（shell/cwd 空、env 空数组 = 未配置，前端逐级回落默认解析链；`env` 为净化后的 name/value 行数组），前端据此路由到 `local/terminal/start`（cwd 优先级：重开继承上次跟踪目录 > 连接表单 > 偏好；env 偏好与连接表单合并、同名时连接表单覆盖）——宿主侧要求每个 connection provider 声明 workbench 或 filesystem provider 才可打开，本地连接打开的就是 Terminal 工作台，路由到本地终端而非 SSH 拨号；已登记的 SSH 连接（宿主先推 `connection/connect` 把连接写进 SSH 连接注册表，再创建 webview）返回 `protocol: "ssh"`，SSH 路由不再空耗重试窗口；只有宿主尚未推送该连接时才返回空串，调用方以短重试吸收 lifecycle 推送与 webview 创建的固有竞态（恢复态 4×250ms、常规 2×250ms，旧 sidecar 对 SSH 仍回空串时最多多等 0.75s，路由结果不变）。查询结果须写回前端响应式状态——只用于当次路由会让连接级 UI 门控退回 ssh 形态 |
+| `ssh/session/open`、`ssh/session/close` | 创建、关闭 PTY 会话（`open` 可选 `requestedSessionId`、`reuseAuthenticatedTransport` + `reuseAuthenticatedSessionId`、`spawnCommand`，`requestedSessionId` 供前端在长 RPC 返回前按预分配 id 接收终端首帧，sidecar 在注册表冲突或缺省时回退服务端 UUID；复用指定同连接存活会话的认证 transport 并新开独立 channel；显式 ID 不可用时 fail closed，只有布尔参数时兼容选择同连接最早存活会话；复用会继承来源会话已解析的 sudo 编排快照；连接 `remote_command` 非空时 exec 该命令替代 shell，`spawnCommand` 非空时以单引号转义的 `sh -c` exec 覆盖两者（WezTerm spawn 对标，见「同 transport 命令会话」节），`set_env` 随会话注入；连接配置 `triggers` 时挂载自动交互触发器引擎，命中发 `ssh/trigger` 事件，见「自动交互触发器（Expect）与外部密码管理器」节；`startup_commands` 偏好启用的连接在 shell 建立后按序自动键入预置命令并发 `ssh/startup` 事件，见「启动命令（Login scripts 对标）」节） |
+| `ssh/session/attach` | 按 `connectionId + workbenchId` 在**存活**会话中回附（工作台重建第二入口，与 `ssh/session/open` 的复用参数互补）：`{connectionId, workbenchId, afterSequence?}` → `{sessionId, connectionId, workbenchId, connected: true, sequence, replay, chunkSize}`，并按 `afterSequence` 在 `ssh/terminal/out` 补发缺口帧；无匹配存活会话报 `No live SSH session is attached to this workbench`（绝不按连接抢占另一标签页的会话，与 `*/list` 族同一红线） |
+| `ssh/terminal/resize` | 调整 PTY 行列 |
+| `ssh/terminal/directoryTracking` | 目录跟踪开关（保留兼容）：`{sessionId, enabled}`。钩子自「不再拆除」起对会话全生命周期生效，`enabled:false` 为纯前端语义（只停 SFTP 导航跟随），不改变远端状态 |
+| `ssh/terminal/replay` | 从指定序号补发终端输出 |
+| `ssh/host-key/resolve` | 处理工作台内的主机密钥确认 |
+| `ssh/exec` | 在会话连接上执行远程命令，可选 Quick Sudo 提权 |
+| `ssh/exec/cancel` | 中止进行中的远程命令（按 `execId`） |
+| `task/validate`、`task/execute`、`task/start`、`task/stop`、`task/status` | Scheduler Task Provider（`io.dbx.ssh.tasks`，冻结契约固定 RPC 面，调用方是宿主 Scheduler，详见「Scheduler Task Provider（task/\* 固定 RPC）」节） |
+| `completion/execute` | FIG 补全引擎的 generator 命令执行（local / ssh 双 target、超时竞速、输出上限、只读拒绝，见「completion/execute（补全 generator 执行）」节） |
+| `ssh/forward/interfaces` | 本机网卡地址探测（供端口映射面板的监听地址选择器）：无参 → `{interfaces: [{name, addr, isLoopback}]}`，回环优先、v4 先于 v6、按 IP 去重；探测失败返回空数组（选择器隐藏，手输不受影响）。`if-addrs`（getifaddrs）实现，无会话依赖 |
+| `ssh/forward/list`、`ssh/forward/start`、`ssh/forward/stop` | 用户级端口映射（ssh(1) -L/-R/-D，见「端口映射」节）：`list` 按 `{connectionId?}`/`{sessionId?}` 过滤返回 `{forwards: [row]}`；`start` `{sessionId?\|connectionId?, kind: "local"\|"remote"\|"dynamic", listenHost?, listenPort, targetHost?, targetPort?}`（至少一个归属 id；`dynamic` 无固定目标，省略 target 字段；`listenHost` 缺省 127.0.0.1；`listenPort: 0` 自动挑选，`boundPort` 回报实际端口）→ `{forward: row}`；`stop` `{id}` → `{success, forward}`，未知 id 报错。独立映射的 `sessionId` 为 `""`。row 字段 camelCase：`id/sessionId/connectionId/kind/listenHost/listenPort/boundPort/targetHost/targetPort/state("starting"\|"active"\|"stopped"\|"error")/error?/connectionsTotal/connectionsActive/bytesUp/bytesDown`。状态迁移发 `ssh/forward/state`（notify）`{id, sessionId, connectionId, state, error?}`。管理界面的端口映射预设按连接保存在宿主 `host.storage` 键 `ssh-tunnel-profiles`，不改变运行态 RPC 及其清理语义。 |
+| `contextMenu/resolve/manage-tunnels`、`contextMenu/manage-tunnels` | DBX 动态连接右键菜单（需宿主 ≥0.6.30 的 `dynamic` 贡献点）。resolve 接收 `{connection:{id,dbType,name,database},locale?,ownerPluginId?}`；仅当 `ownerPluginId` 为 `io.dbx.ssh` 时，从本插件数据目录的 `ui-storage.json` 只读现有 `ssh-tunnel-profiles`，结合 `ssh/forward/list` 返回一层 `{items:[{label:"Port forwards",children:[...]}]}`，其他数据源返回空菜单。无预设时仅有“管理端口映射”，有未运行预设时显示“启用已保存端口映射”，有运行映射时显示“停止所有端口映射”，每条预设按当前状态显示启动/停止和勾选。宿主每级菜单限制 40 项，右键最多列出前 36 条预设，其余仍可在管理页操作。点击 invoke 子项时宿主发送原连接上下文加 `itemId`（`start-all`、`stop-all` 或 `toggle/<profileId>`）；后端按连接范围操作，返回 `{message}` 供宿主提示。启动动作声明 `reopenConnectionOnMissing:true`，若 sidecar 尚无连接配置，宿主按用户点击触发的连接恢复后重试一次。管理项使用 `open-workbench` 加 `presentation:"dialog"`，由宿主弹框打开，无需终端或新标签页。 |
+| `ssh/agent/resolve` | 处理 AI 终端同步执行的命令审批（按 `challengeId`，一次性；approve 可携 `command` 编辑后原文与 `remember: true` 记住标记，见「审批记忆」节） |
+| `ssh/alert/triage` | 告警分诊：异构告警 JSON/纯文本 → 结构化 + 分类 + 只读诊断命令清单（无需连接，从不执行；见「告警分诊」节） |
+| `ssh/audit/list` | 执行审计台账只读回放：`{limit?, beforeTs?}` → `{entries, truncated}`（见「执行审计」节） |
+| `ssh/audit/clear` | 清空执行审计台账（工作台设置「审计日志」按钮）：无参 → `{success: true}`。截断活动 `audit-log.jsonl` 并删除轮转 `.1` 代——**保留文件本体**（并发 O_APPEND 写入端不见文件消失），清空后新审计自然开启新代 |
+| `ssh/agent/mode/get` | 连接级 AI 终端模式探针（供宿主 MCP 桥转发前判定路由）：`{connectionId}` → `{agentTerminalMode: "off"\|"auto"\|"strict", hasTerminalSession: bool}`；未知连接降级为 `off` + `false` 而非报错，宿主侧任何失败同样回落静默路径 |
+| `ssh/metrics` | 采集服务器指标（CPU/内存/负载/磁盘（含 inode 使用率）+ 网络接口速率 + Top CPU/内存进程，只读命令；`cached: true` 返回上次快照；每次新鲜采集顺带落一行趋势历史） |
+| `ssh/metrics/history` | 趋势历史查询（`metrics-history.jsonl` 环形 720 行，按连接维度过滤，见下文） |
+| `ssh/processes/list`、`ssh/processes/kill` | 全量进程表（CPU 序，上限 500 行）与进程信号（pid/signal 校验，pid 0/1 拒绝），见下文 |
+| `ssh/recording/start`、`stop`、`list`、`get`、`delete` | 会话录制（asciicast v2 `.cast` 落盘、回放分页读取、列表/删除，见下文） |
+| `ssh/recording/clear`、`ssh/recording/reveal` | 录制管理补齐（家族语义见下文「会话录制」节）：`clear` 无参 → `{success, deleted}`——只删 recordings 目录内 `.cast`，单个删除失败（如 Windows 上进行中录制）跳过计数不整批失败；`reveal {recordingId}` → `{success: true}`——id 走路径穿越校验（`/`/`\`/`..` 拒绝）、文件已不存在报错后在文件管理器定位，非任意路径打开原语 |
+| `ssh/recording/search` | 录制搜索：`{query}` → `{recordings: [行]}`，无持久索引对现存 `.cast` 即时扫描（名称命中或内容命中），见下文「会话录制」节 |
+| `ssh/host-key/check` | 连接维度主机密钥预检（探针三态：已知 / 变更 / 未知，不发认证） |
+| `ssh/settings/get`、`ssh/settings/set` | 读取/运行时更新 Quick Sudo 编排设置 |
+| `mcp/tools`、`mcp/call` | MCP 工具发现与执行（供 DBX MCP 桥 `dbx_call_plugin_tool` 调用；连接凭据以标准 lifecycle payload 转发，按 `connectionId` 池化，payload 新增 `name` 字段携带连接名）。连接类工具新增可选 `connectionName`（与 `connectionId` 二选一，注册表按名匹配，重名报错并列出候选）；stdio 独立模式对未注册 `connectionId` 的调用自动经宿主桥 `POST /list-plugin-connections` 转发到运行中的 DBX 应用执行——请求 `{"plugin_id":"io.dbx.ssh"}`、响应 `{"connections":[{id,name,host,port,username,authentication,readOnly}]}`（仅元数据，密钥只出布尔标志位），桥不可用回落内联凭据；新增 `ssh_list_connections` 工具即消费该路由，降级时仅回本会话注册表并附 `note`。`mcp/tools` 与 stdio `tools/list` 返回的每个工具附 `annotations`（`title` + `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`，与内部门禁分类同源，见 docs/MCP.zh-CN.md「工具 annotations」与下文「MCP 工具面」节） |
+| `mcp/settings/get`、`mcp/settings/set` | MCP SFTP 尺寸限制策略（maxRead/maxUpload/maxDownload，持久化，`--mcp` 同源生效）；`localTransferRoot` 配置 `sftp_upload`/`sftp_download` 本地传输根（绝对路径或空串回落默认根=临时目录+插件数据目录；敏感路径黑名单任何模式叠加生效）。**消费模式注**（存储迁移批 1）：`set` 为部分更新（未指定字段含 `localTransferRoot` 保留）；工作台把可同步子集（maxRead/maxUpload/maxDownload + persisted 权限档）镜像进宿主 `host.storage` 作云同步载荷，sidecar 文件仍是 serve 时即时权威（见 `IMPL_PLAN_STORAGE_SYNC.zh-CN.md`） |
+| `sftp/chmod` | 修改远端路径权限位（八进制）；`sftp_name_encoding` 为 `latin-1` 时路径整条按 wire 还原走裸包 SETSTAT（M17） |
+| `sftp/diskUsage` | 路径所在挂载的磁盘用量 |
+| `sftp/home`、`sftp/list`、`sftp/read` | 浏览、预览远端文件（`sftp/list` 支持可选 `includeOwner` 附加属主/属组；`sftp/read` 支持可选 `offset` 分片续读，见下文）。`sftp/home` 走高层客户端 `canonicalize(".")`（`ssh.rs:3505`）——**编码边界（登记，M28-A）**：家目录名非 UTF-8 时返回串已含 U+FFFD（高层 lossy 解码，原始字节不可恢复），以其为基准拼接的后续路径无法命中，与 `sftp/list` 节 M17 段登记的 shell cwd 回读同类不可恢复边界 |
+| `sftp/createDirectory`、`sftp/rename`、`sftp/delete`、`sftp/exists`、`sftp/rename-unique`、`sftp/touch`、`sftp/write`、`sftp/upload/start/finish`、`sftp/upload-local`、`watch/upload` | SFTP 写操作/预检（`sftp_name_encoding` 为 `latin-1` 时走裸包客户端字节保真，路径来源分工见 `sftp/list` 节 M15-B/M16 段；symlink 三命令见独立行） |
+| `sftp/upload/start`、`finish` | 上传事务生命周期（`resumeTaskId` 断点续传；`finish` 校验后交后台任务推送并立即返回，见「上传两阶段计数与收尾语义」）。start/finish 响应附 `compression: "gzip"\|"none"`（M33 压缩通道决策结果，见「压缩传输（gzip 混合方案）」节；旧客户端可忽略） |
+| `watch/start`、`watch/stop`、`watch/stop-all`、`watch/upload` | 外部编辑器回写 watcher（仅桌面端，见「外部编辑器 watcher（watch/*）」节）：`start` 对 `remote-edit/` 下载目录内的本机文件登记监听并返回 `{watchId}`，内容确认变化后发 `watch/file-modified` 事件；`upload` 把监听文件当前字节按 `sftp/write` 同款原子提交推回远端（latin-1 按所属连接编码走裸包字节保真，M21） |
+| `local/editors/list`、`local/open-with` | 外部编辑器目录与按名打开（编辑器映射增强，仅桌面端消费，见「外部编辑器目录与打开方式（local/editors/*、local/open-with）」节）：`list` 返回平台知名编辑器目录（文件系统/PATH 探测，不 spawn 进程，unavailable 条目仍返回）；`open-with` 在与 `local/open` 同源的下载历史 allowlist 下用目录编辑器或用户自定义命令行打开已下载文件（argv 直接 spawn，不过 shell） |
+| `sftp/download/start`、`next`、`finish` | 下载事务生命周期（`offset` 断点续传，见下文；桌面端可选 `downloadDir` 指定本机绝对保存目录）。**路径形态契约（M27-A）**：latin-1 生效时 `remotePath` 必须是 `sftp/list` 回传的 wire 形式（`pathFromUri(entry.uri)`）——wire 域内字面 `%` 已被 `escape_wire` 自转义为 `%25`，因此 wire 字符串中的 `%XX`（X∈hex）唯一解读就是转义还原（`has_wire_escapes` 判分支）；该入口不接受用户字面输入的显示文本，含字面 `%XX` 的真实文件名经列表回传时其 wire 形式为 `%25XX`，往返无损。**车道判定按生效编码区分（M28-B 修 D-7）**：latin-1 维持上述 raw 车道；auto 生效时一律走高层客户端——auto 列表 uri 由高层产出、字面 `%` 未经 `%25` 自转义，wire 串里的 `%XX` 是文件名字面量而非转义，不还原（auto 以字面量语义与列表一致）。响应附 `compression: "gzip"\|"none"`（M33 压缩通道决策结果，见「压缩传输（gzip 混合方案）」节；`offset > 0` 续传恒为 `none`） |
+| `sftp/download/tree/start` | 递归目录下载启动：远端 `read_dir` 走树扫描（有界），本地镜像目录布局后复用 `sftp/download/next`/`finish`/`sftp/transfer/cancel` 分块管线（见「递归目录下载」节）。`remotePath` 路径形态契约同 `sftp/download/start`（M27-A：列表回传的 wire 形式）。响应附 `compression`（M33：满足压缩条件时改走「远端 tar.gz 单流 → 本地解包 staging 树」通道，见「压缩传输（gzip 混合方案）」节） |
+| `sftp/stat`、`sftp/exists`、`sftp/touch`、`sftp/write` | 扩展文件操作：元信息单查、存在性检查、空文件创建、小文件直写；latin-1 下 `sftp/stat` 整条 wire 还原走裸包 LSTAT，`sftp/exists` 按 `form` 参数分工还原（缺省「wire 前缀 + 显示末段」、`form: "wire"` 整条），均走裸包 LSTAT（M17，见 `sftp/exists` 节） |
+| `sftp/symlink-create`、`sftp/symlink-read`、`sftp/symlink-update` | 符号链接三命令（路径来源分工详见 `sftp/list` 节 M16 段）：`create {target, linkPath}` 与 `update {linkPath, target}` 过 `ensure_writable` 只读门禁，`target` 允许相对路径（symlink 语义，仅清洗不归一）；SFTPv3 无 re-link 原语，update 为「读现指向比对——一致即 no-op，否则先删旧链再重建」；`read {linkPath}` → `{linkPath, target}`。latin-1 车道：linkPath 整条 wire 还原、target/指向文本按显示编码回字节，读↔写闭环（裸包建立失败回退高层，读侧任何失败即回退） |
+| `sftp/archive`、`sftp/extract` | 远端 tar.gz 打包与解压；extract 可选 `sudo: true`（文件夹整包上传车道：列档/解包经 sudo 编排、跳过撞名预检恒覆盖），见「文件夹整包上传（folderArchive）」节 |
+| `sftp/copy`、`sftp/move` | 服务器内复制 / 剪切（逐项执行，目标存在需 `overwrite`）；latin-1 下覆盖预检与同目录 move rename 快路径走裸包字节保真（M17，shell 执行层边界见 `sftp/list` 节） |
+| `filesystem/list`、`filesystem/read`、`filesystem/write`、`filesystem/delete`、`filesystem/rename`、`filesystem/createDirectory` | 宿主 filesystem-provider 面（manifest 贡献点）：会话归属 `sessionId` 可省、改传 `connectionId` 自动解析到该连接的存活会话；路径参数统一为 `uri`（`sftp:` scheme，归一化剥 `.`/`..`，**无 `..` 逃逸**）。`list {uri}` → `{entries}`（同 `sftp/list` 形状，固定 auto 编码、不支持 `includeOwner`）；`read {uri, offset?, maxBytes?（缺省 256KiB，钳 1–1MiB）}` → `{dataBase64, contentType, truncated}`；`write {uri, dataBase64, create?=false, overwrite?=false}` 过 `ensure_writable` 只读门禁、≤1 MiB（超限提示改走传输槽）、`.dbx-part` 暂存原子落位；`delete {uri, recursive?=false}`；`rename {sourceUri, targetUri}`。宿主面固定 auto：latin-1 裸包车道不适用（编码容错只面向 SFTP 面板） |
+| `sftp/bookmarks/list`、`sftp/bookmarks/save`、`sftp/bookmarks/delete` | SFTP 路径书签管理（**legacy**：权威已迁宿主 `host.storage`，仅 `list` 作一次性搬迁种子，见下文） |
+| `sftp/transfer/cancel` | 取消并清理临时状态（可选 `reason` slug 落入账本，见「上传两阶段计数与收尾语义」） |
+| `sftp/transfer/list`、`sftp/transfer/status` | 查询会话传输任务列表 / 单任务状态（含历史，会话维度过滤）。status 对压缩任务附 `compression`/`ready`（下载）与 prep 进行中的 `phase`（M33，ready 等待的兜底轮询面） |
+| `sftp/transfer/history` | 跨重启传输历史查询（持久化 + 内存 live 合并，见下文） |
+| `sftp/transfer/history/clear` | 清空已持久化及当前进程中的传输历史 |
+| `sftp/transfer/resumable` | 可续传上传扫描（中断任务的 spool 前缀仍在磁盘上的清单，见下文） |
+| `import/preview/start`、`finish`、`cancel` | 第三方 SSH 客户端会话导入的临时流式预览与脱敏规范化导出（不落盘，见下文） |
+| `sudo/stat`、`sudo/exists`、`sudo/touch` | sudo 元信息查询与空文件创建 |
+| `sudo/listDir`、`sudo/readFile`、`sudo/writeFile` | sudo 目录浏览与文件读写 |
+| `sudo/mkdir`、`sudo/remove`、`sudo/removeAll`、`sudo/chmod`、`sudo/rename` | sudo 写操作 |
+| `sudo/download/start`、`sudo/download/cancel` | sudo 下载（root 大文件二进制下载，M14-C DownloadSudo）：start 把源文件暂存进同目录 0600 临时件后复用 `sftp/download/next`/`finish` 分块管线与进度事件，见「sudo 下载（DownloadSudo）」节 |
+| `sudo/upload/start`、`sudo/upload/finish` | sudo 上传（sudo 模式下向 root 目录上传，UploadSudo）：start 参数族与 `sftp/upload/start` 一致（`remotePath`），分块二进制帧/进度事件/取消全复用；finish 把 spool 推到登录用户 home 暂存件后经 exec `sudo mv` 提交，见「sudo 上传（UploadSudo）」节 |
+| `sudo/profiles/list`、`sudo/profiles/save`、`sudo/profiles/delete` | 全局 Quick Sudo 配置管理（多套命名凭据/策略档，插件数据目录持久化，密钥永不回显） |
+| `sudo/profiles/options` | 连接表单动态下拉选项（`sudo_profile` 字段的 `options_action`）：返回 `{options: [{value: id, label: name}]}`，按名称排序，永不携带密钥 |
+| `otp/list`、`otp/save`、`otp/delete` | OTP 动态令牌库（持久化 `<plugin_data_dir>/otp-entries.json`：0600 原子写、损坏按空库；条目密钥经 vault 字段级 AEAD 加密落盘，AAD 绑定 `totpSecret|<entryId>`，明文永不落盘/出库）。`list` 无参 → `{entries, bindings}`，条目视图仅 `hasSecret` 布尔位（id/otpType/issuer/username/algorithm/digits/period/counter）；`save {id?, otpType("totp"\|"hotp"), issuer?, username?(各≤120 字符), algorithm?(SHA1/256/512，缺省 SHA1), digits?(6–8，缺省 6), period?(1–3600s，缺省 30), counter?(hotp 新建必填), secret(base32，≤64 字节解码)} → {entry, created}`——新建必须带 secret，更新缺省/空串保留旧密文，上限 100 条；`delete {id}` → `{deleted}`，级联清除该条目的连接绑定，无删除不落盘 |
+| `otp/bind`、`otp/unbind`、`otp/generate`、`otp/import-qr` | 连接绑定与取码：`bind {connectionId, entryId}` → `{bound: true}`（条目须存在、重复绑定即改绑），绑定条目作为登录期/sudo 自动应答的 TOTP 回落来源（与 `connection_secrets.totp_secret` 并存的库形态）；`unbind {connectionId}` → `{removed}`；`generate {entryId}`：totp → `{code, remainingSeconds}`，**同窗口码已被 generate 或自动应答任一路径发出时返回 `{code: null, reused: true, remainingSeconds}`**（进程级共享防重放缓存），hotp → `{code, hotp: true}` 且 counter+1 持久化（消费型），未知 id/密钥不可用报错；`import-qr {imageBase64}` → `{otpType, issuer, label, secretBase32, algorithm, digits, period, counter}`——仅解码 `otpauth://` 供表单预填不入库，容忍 data URL 前缀，图片 ≤8 MiB、解码头寸 ≤8192px/64MiB 防解压炸弹 |
+| `connection/action` | 连接表单动作（manifest `connection-provider.actions` 声明）。宿主校验：整体可为 `null` / 字符串 / 对象，对象里 `message` 必须是字符串、`fieldValues` 一旦出现必须是 object（缺省=不回填；显式 `null` 会被宿主以 "fieldValues must be an object" 拒掉，键须为 manifest 已声明字段）。`fieldValues` 键 = manifest 字段 key，由宿主回填当前表单：`action=import-private-key` 桌面端弹系统文件框读私钥回填 `private_key`（web/docker 报桌面限定，取消选文件整体返回 `null` 安静无操作）；`action=import-sessions`（`when: create`，表单标签「导入连接」）两段式：先弹原生**来源类型选择**（MobaXterm/Xshell/WindTerm/SecureCRT/FinalShell/Electerm/Termius/OpenSSH config，与向导同 8 类；任一步取消整体返回 `null` 安静无操作），再按所选类型弹带扩展名过滤的文件框（macOS 自定义扩展名无 UTI 不过滤，默认目录 OpenSSH config 定位 `~/.ssh`），文件按扩展名/JSON 顶层形态嗅探向导同款 8 来源（`.json` 按 hosts/bookmarks 分流 Electerm/Termius）并**复用 `import/preview` 同一解析器**，把首条会话回填 `display_name/host/port/username/authentication/private_key_path`（密码永不回填、私钥只回路径，与预览同红线）；多会话时 `message` 报「1 of N」并指引工作台向导批量，WindTerm 加密导出指回向导要主密码，无会话文件报错。可选 `source`（来源 kind）/`path` 参数逐段跳过系统对话框，供冒烟/自测注入（宿主从不携带；载荷仍只有脱敏字段，与预览同边界） |
+| `keys/discover` | 本地 SSH 私钥发现（不返回私钥内容） |
+| `keys/discover/options` | 连接表单 `private_key_path` 的 `options_action` 数据源（设计取舍见「连接表单的私钥录入」节）：无参 → `{options: [{value, label}]}`，`value` 与 `label` 均为密钥绝对路径（label 即路径本身，避免下拉被算法/指纹撑长）；算法/指纹只进 `keys/discover`；仅元数据，绝不含私钥内容 |
+| `ssh/knownHosts/list`、`ssh/knownHosts/remove` | known_hosts 条目管理（含 `@cert-authority` / `@revoked` 标记条目） |
+| `ssh/sessions/list` | 只读会话清单：sidecar 当前跟踪的活跃会话 |
+| `ssh/status` | 健康自描述探针（无参）：`{ok: true, plugin: "io.dbx.ssh", maxTransferSize}`——`maxTransferSize` 即传输上限常量（16 GiB），无任何会话/连接副作用 |
+| `ssh/quickCommands/list`、`ssh/quickCommands/save`、`ssh/quickCommands/delete` | 全局快速命令管理（**legacy**：权威已迁宿主 `host.storage`，仅 `list` 作一次性搬迁种子，见下文） |
+| `ssh/terminal/batchInput` | 批量发送：把同一条命令写入多个已打开会话的交互终端（PTY 键盘语义），返回逐会话发送结果 |
+| `ssh/batchBar/state`（notify） | 批量发送命令条的跨工作台状态同步：工作台把 `{ source, draft, quickPickId, open }` 以通知送达 sidecar，sidecar 原样以同名事件广播给所有插件 webview，各端按 `source` 过滤自己的回声；纯转发不落存储，旧版 sidecar 未注册时调用方静默降级 |
+| `local/terminal/start`、`local/terminal/resize`、`local/terminal/replay` | 本地终端：sidecar 所在机器的交互式登录 shell（工作台显式入口触发，见「本地终端」节；`start` 支持显式 `shell`、继承/指定的 `cwd` 与追加的 `env` 环境变量） |
+| `local/shells/list` | 本机可启动 shell 清单（用户登录 shell 置顶，含 `isDefault`/`isUserShell`/`injectable` 标记——最后一项表示该 shell 是否支持 integration 注入，不支持的在选择器中灰掉开关；Unix 读 `/etc/shells`+`dscl`，Windows 枚举 PATH 下的 pwsh/PowerShell/cmd/wsl），工作台 shell 选择器数据源 |
+| `local/terminal/launch-options` | 宿主 dock「+」启动选项（PR-A4 通用契约）：`{entries: [{label, description, context, group?}]}`——首项为默认 Shell 启动项，**不带 `group`**（宿主顶层首位平铺，最快常用动作；`description` 为解析后的默认 Shell，`localShell` 偏好优先，否则 DS/`$SHELL`/平台默认链；`context` 携带 `mode`），其余为本机扫描到的 shell 子项（`context` 额外携带 `shell` 固定程序），`group` 同为本地化「本地SHELL」标签，宿主渲染为紧随其后的单个可折叠分组（默认折叠）。可选参数 `locale`（宿主 UI 语言，如 `zh-CN`/`zh-TW`/`ja`/`es`/`it`/`pt-BR`/`en`；宿主侧 `options_action` 调用统一下发）：本地化 label/group/description 前缀，未识别语言回落英文；旧宿主不传参数行为不变（`group` 字段被忽略，平铺渲染）。默认 Shell 在设置·终端配置（`localShell` 偏好，与工作台 shell 选择器同一存储键）。**已显式配置 `localShell` 时折叠发现分组**：菜单只留「本地终端」单个入口（描述即配置的 shell），不再列本机各 shell；未配置时维持默认入口 + 发现分组 |
+| `local/session/list`、`local/session/close` | 本地终端会话清单（webview 重载后接回）与关闭 |
+| `local/recording/start`、`local/recording/stop` | 本地终端录制（dock 本地终端录制按钮的数据面）：与 `ssh/recording` 同形——`start`（参数 `{ sessionId }`）给本地 PTY 会话挂同一 asciicast 录制器（PTY 输出发布前观察、State 帧不录），`stop` 返回同一形状摘要；`.cast` 落同一 recordings 目录（`meta.host` 为 `"local"`），`ssh/recording/list|get|search|delete` 全家族照常可用。shell 退出随会话槽位释放录制器（缓冲即落盘）；重复 start / 无录制 stop 报错文案与 SSH 家族一致 |
+| `local/metrics` | 本机系统快照（dock 面板左上角系统信息带，本地终端场景）：与 `ssh/metrics` 同一采集脚本走 sidecar 宿主机自身 shell（POSIX sh；macOS 走 sysctl/vm_stat/netstat 兜底分支），返回同形状文档（hostname/kernel/cpu/memory/disks/network/processes…），GPU/NPU 两段保持 SSH-only、本地文档缺省。无会话参数；Windows 无捆绑 sh 时返回结构化错误（`local metrics unavailable`），前端整条隐藏不占位 |
+| `local/capabilities` | 本机落盘能力探测（无参）：`{canSaveLocal, downloadsDir, platform}`——`canSaveLocal` 由环境变量强制，缺省 macOS/Windows 恒 true、Linux 需 `DISPLAY`/`WAYLAND_DISPLAY`；前端据此决定 sidecar 下载目录落盘还是浏览器 `<a download>` 兜底，递归目录下载可用性同判（见「递归目录下载」节） |
+| `local/fs/browse`、`local/fs/drives`、`local/fs/exists` | 应用内目录选择器/冲突预检（信任边界与 `local/*` 同级：只列目录、永不返回文件内容）：`browse {path?}` 缺省下载目录、必须绝对路径 → `{path, parent, entries: [{name, path, is_dir}]}`，仅子目录（symlink 到目录跟随）、大小写不敏感排序、封顶 500 条（先排序后截断）；`drives` 无参 → `{drives: [盘符]}`，仅 Windows C:..Z: 探测，其他平台空数组；`exists {dir, name}` → `{exists, path}`——「询问我」冲突策略预检，`name` 经文件名消毒、`path` 为精确候选路径 |
+| `local/reveal`、`local/open` | 已完成下载的定位/打开：`{path}` → `{success}`。路径白名单 = 持久化传输历史中 `direction=download` 且 `status=completed` 的 `localPath`（跨重启保留），其余一律拒绝——不构成任意路径打开/执行原语；`reveal` 目标被移走/改名时回落父目录再退插件下载目录（issue #18），绝不落系统文档目录 |
+| `local/preferences/get`、`local/preferences/set` | 工作台级 UI 偏好（`<plugin_data_dir>/preferences.json`，固定键白名单、原子写入，非法类型报错、非白名单键丢弃）：`downloadDir`（string，≤512 字符）、`downloadUseDefaultDir`（bool，默认 true）、`downloadConflictPolicy`（`rename`/`ask`/`overwrite`，默认 `rename`）、`startup_commands`（连接级启动命令存储，对象按 connectionId 分桶 `{ enabled: bool（默认 false）, commands: [{command, delayMs, enabled}] }`；整体非对象报错，桶/行级非法形状清洗丢弃；上限每连接 20 条、单条 4KiB、延迟 0..=30000ms 缺省 300，见「启动命令（Login scripts 对标）」节）。`transfer_concurrency`（u64，1..=10，默认 3）、`transfer_duplicate_policy`（`rename`/`ask`/`overwrite`，默认 `rename`）、`transfer_max_active`（M14-B 会话级并发传输深度，u64，1..=8，默认 3；sidecar 每次任务启动现读现用——改动即时生效，新任务按新深度启动，进行中任务按旧深度自然完成）、`transfer_download_limit_kib`（M31-B 下载限速，issue #66：SFTP 下载速度上限，u64，0..=1048576 KiB/s，0=不限速（缺省）；超界钳制、非法回落 0。sidecar 在下载任务启动（`sftp/download/start`、`sftp/download/tree/start`）时对现值快照一次并整个任务沿用——改动对下一个下载任务生效，进行中任务按原节奏完成）、`transfer_compress_mode`（M33 压缩传输策略，`auto`/`on`/`off` 白名单，默认 `auto`，非法值报错。`auto`=智能综合判断：大小/类型/远端工具/只读/latin-1 之外再计本机 CPU——并行度 ≤2 核直接跳过，上传压缩预压另有运行时吞吐守卫（实测速率 <20 MiB/s 中止回退，对所有策略生效）；`on`=始终尝试（豁免 CPU 门槛，其余回退条件与吞吐守卫不变）；`off`=关闭。语义见「压缩传输（gzip 混合方案）」节——任务 start 时现读现决，改动对下一个任务生效）、`transfer_compress_threshold_mib`（M33 压缩生效阈值，u64，0..=65536 MiB，默认 64，0=不限下限；超界钳制、非法回落默认）、`sftp_compat_mode`（M14-B 老旧服务器兼容模式，bool，默认 false；开启后 SFTP 会话不做流水线并发（读写各 1 路）并把并发深度强制 1，对新建 SFTP 会话生效（重连后应用）；SFTP 探测失败时 sidecar 对该会话一次性在错误信息中附带建议开启的提示）、`sftp_name_encoding`（M14-B 文件名显示编码，`auto`/`latin-1`，默认 `auto`，语义见 `sftp/list` 节）、`sftp_name_encoding_overrides`（M16 连接级文件名编码覆盖，对象按 connectionId 分桶 `{ <connectionId>: "auto"|"latin-1" }`；整体非对象报错，桶内非法值/空 connectionId 清洗丢弃，桶数上限 512；缺省语义为「跟随全局」——桶内无本连接条目即回退全局 `sftp_name_encoding`，再缺省 `auto`；判定优先级 连接覆盖 > 全局偏好 > 缺省 auto，覆盖值非法（白名单外）同样按未覆盖回退；判定点现读现用（`sftp/list`、`sftp/rename`、`sftp/delete`、`sftp/createDirectory`、`sftp/download/tree/start`），改动对下一次调用即时生效；sessionId 无法映射到连接（已断开）时按未覆盖处理）。兼容：set 为部分合并，缺省键不变；旧 sidecar 缺少的键前端按缺省处理。**消费模式注**（存储迁移批 2/3）：`startup_commands` / `sftp_name_encoding_overrides`（批 2）与 `downloadDir`、`downloadUseDefaultDir`、`downloadConflictPolicy`、`transfer_*`、`sftp_compat_mode`、`sftp_name_encoding`、`history_suggestions_enabled`、`history_suggestion_min_chars`、`history_suggestion_max_chars` 共 14 个全局偏好键（批 3，合并单镜像 `ssh-preferences-mirror`，wire 键名同形）已镜像进宿主 `host.storage` 作云同步载荷，sidecar 仍即时权威，见 `IMPL_PLAN_STORAGE_SYNC.zh-CN.md` |
+| `serial/upload/start`、`serial/upload/data`、`serial/upload/cancel` | 串口文件上传（XMODEM/YMODEM/ZMODEM，NyaTerm 对齐）：协议状态机在 sidecar（`backend/src/serial_xmodem.rs` 纯状态机，由串口读线程喂数据/取输出），文件字节由前端 File API 分块（≤64KiB）经 `data` 送入，sidecar 不落盘；单次上传总量上限 256 MiB；进度事件 `serial/upload/progress`（`sent`/`total`，不含文件内容）；同一会话同一时刻至多一个上传（并发第二次 `start` 报错），见「串口文件上传（X/Y/ZMODEM）」节 |
+| `serial/ports/list` | 本机串口清单（连接弹窗端口下拉数据源）：`{ports: [path], portDetails: [{path, description}]}`，按路径排序；枚举失败回落空清单，USB/PCI/Bluetooth 描述尽力标注 |
+| `serial/start`、`serial/write`、`serial/close` | 串口会话生命周期（回放见「串口终端回放」、写回压见「写序列化与回压」节）：`start {workbenchId, portName, baudRate(50–4000000，越界报错不静默钳制), dataBits?, parity?, stopBits?, flowControl?(缺省 none), backspaceMode?}` → `{sessionId, port, baudRate, binaryInput: true}`（binaryInput 为旧前端 JSON 兼容探测位），线路参数校验失败即 start 报错（绝不静默降级），开端口为阻塞 syscall 走 spawn_blocking；`write {sessionId, dataBase64(≤64KiB)}` → `{success: true}`——JSON 兜底车道（主路径 `serial/terminal/in` 二进制通道），Backspace 改写后进专用写线程队列，超限/队满整包丢弃并发 `serial/input/dropped`（不报错）、会话死亡报错；`close {sessionId}` → `{success: true}`，摘除会话并唤醒写线程退出 |
+| `local/wallpaper/get`、`local/wallpaper/set`、`local/wallpaper/clear` | 工作台背景图（桌面形态）：`get` 返回 `{dataUrl: "data:image/<png|jpeg|webp>;base64,…"}`，无背景时返回 `{}`；`set` 接受 `{imageBase64}`，≤8 MiB 且仅 png/jpeg/webp 魔数，原子落盘 `<plugin_data_dir>/wallpaper`，返回与 `get` 相同的 data URL 载荷；`clear` 幂等删除，返回 `{}` |
+| `docker/list`、`docker/logs`、`docker/action` | Docker 管理面板（参数 `target`/`cli`/`socket`/`host` 与全部语义见「Docker 管理面板」节）：list 探针+七列容器清单，`needsSudo` 且配置 Quick Sudo 时自动提权重采（只读连接/白名单拒绝一律退回原 payload 不报错）；logs `tail` 钳 10–2000（缺省 200）、容器消失降级 `container: null`；action 动词白名单 `start/stop/restart/kill/rm`、`containerId` 限 12–64 位小写十六进制、执行前写审计、kill/rm 走确认门、只读连接直接拒绝 |
+| `telnet/list`、`vnc/list`、`rdp/list`、`serial/list` | 活跃非 SSH 会话清单（均含 `sessionId`、`workbenchId`、逻辑端点和创建时间；Telnet/VNC saved connection 会额外带 `connectionId`、`runtimeHost`、`runtimePort`）。工作台重建只按相同 `workbenchId` 回附，绝不按连接抢占另一标签页会话。 |
+| `telnet/replay`、`serial/replay`、`vnc/replay`、`rdp/replay` | Webview 重建回附的输出恢复：Telnet/Serial 重发序号制终端帧；VNC 重发当前完整 framebuffer；RDP 重发一张有明确内存预算的完整合成 framebuffer，绝不重放不能独立恢复画面的增量 patch 序列。 |
+| `telnet/start`、`telnet/write`、`telnet/resize`、`telnet/close` | Telnet 会话生命周期（明文协议，逻辑/拨号端点分工见「生命周期与状态隔离」节，二进制通道见「二进制通道」节）：`start {workbenchId, host, port?(23), connectionId?, runtimeHost?, runtimePort?, enterMode?("crlf"\|"cr"\|"lf"), backspaceMode?("del"\|"ctrl_h"), cols?(120), rows?(32), autoLogin?}` → `{sessionId, host, port}`——实际拨号只用 runtime 端点（缺省回落逻辑端点），`autoLogin` 为 expect `rules`（tssh/JSON 文法，同 `triggers/validate`）或 NyaTerm 式 `declarative`（提示词正则+凭据+成功/失败判定+重试预算）二选一，配置非法即 start 报错、凭据 Debug 全程脱敏。请求未带 `autoLogin` 且 `connectionId` 命中连接表单暂存密码（`connection/connect` 生命周期投递的 `connection.password`，见「非 SSH 连接凭据暂存」）时，sidecar 以内置默认提示词正则合成 `declarative` 自动登录——表单存了密码即自动登录的用户意图；弹窗路径显式携带 `autoLogin` 时以请求为准；`write {sessionId, dataBase64(≤64KiB)}` → `{success: true}`——JSON 兜底（主路径 `telnet/terminal/in`），死会话报 `Telnet session was not found or expired`；`resize {sessionId, cols, rows}` 钳 1..=65535 后经泵发 NAWS；`close {sessionId}` → `{success: true}` |
+| `vnc/start`、`vnc/input`（`vnc/write` 同义别名）、`vnc/resize`、`vnc/set-clipboard`、`vnc/reconnect`、`vnc/close` | VNC 远程桌面会话（RFB；帧补丁与端点分工见「VNC 帧补丁」节）：`start {workbenchId, host, port?(5900), connectionId?, runtimeHost?, runtimePort?, password?, scaleMode?("fit"\|"stretch"\|"actual"), reconnectAttempts?(缺省 3，上限 10)}` → `{sessionId, host, port, scaleMode, reconnectAttempts}`——密码走 classic VNC-Auth 限 8 字节、`Zeroizing` 持有不落日志，缺省/空为 None 认证（明文协议，仅建议可信网络）；请求未带密码且 `connectionId` 命中连接表单暂存密码时由 sidecar 合并（见 telnet/start 行与「非 SSH 连接凭据暂存」）；`input {sessionId, kind: "key"{keysym,pressed}\|"pointer"{x,y,buttonMask}\|"release-all"}` → `{success: true}`（keysym 由前端映射）；`resize {sessionId}` → `{success: true}`——仅确认会话存活的前端缩放提示，不改远端分辨率；`set-clipboard {sessionId, text}` → `{success: true}`——仅 Latin-1 文本、≤1 MiB 越界整包拒绝；`reconnect {sessionId}` → `{sessionId, success: true}`——generation 计数防串话、保留帧缓冲整幅重绘；`close {sessionId}` → `{success: true}` |
+| `rdp/start`、`rdp/write`（=`rdp/input` 别名）、`rdp/resize`、`rdp/set-clipboard`、`rdp/reconnect`、`rdp/close`、`rdp/certificate/resolve` | RDP 远程桌面会话（参数表、返回形状、重连门控与安全红线见「RDP 远程桌面会话」节）：`start` 前有独立实验门（`rdp_experimental_enabled` 偏好关闭时 RPC 直接拒绝，绕不过 UI）；`write` 键鼠/unicode 注入（unicode ≤4096 字符整包拒绝）；`resize` 尺寸门限同 start；`set-clipboard` 仅文本、16 MiB 上限；`reconnect`/`close` 递增 generation 防串话、close 连带丢弃凭据/拒绝待定证书/清空剪贴板暂存；`certificate/resolve` accept 缺省 false fail-closed、`remember` 记入 rdp-known-certs.json（上限 1024 条），确认窗 120s 超时即拒 |
+| `workbench/close` | 工作台标签关闭的统一回收入口：`{workbenchId}` → `{success: true}`——级联关闭该工作台全部 SSH 会话（含复制会话）与本地终端、Telnet、VNC、RDP、串口会话（各家族 `close_workbench` 幂等清理）；webview 重载**不会**触发本方法，存活会话因此保持可回附（`*/list` + `*/replay`），见「本地终端」节 |
+
+## MCP 工具面（尺寸预算，#203）
+
+`tools/list`（stdio）与 `mcp/tools`（embedded 桥共用 `tool_definitions()`）返回同一份工具目录，当前 **16 个工具**（#203 两轮瘦身：33→16，移除冗余/可推导/命令可实现的工具面，前端工作台 RPC 全部保留，仅收缩 agent 面）。
+
+**尺寸实测与预算口径**（单测 `mcp::tests::tool_definitions_stay_under_budget` 固定）：
+
+- **raw 口径**：单测量的是 sidecar `tools/list` 的 raw JSON 序列化（serde `Value::to_string`）。#203 描述瘦身二轮后实测 **43,842 字符**（43,866 字节）。
+- **桥文本口径**：桥模式下宿主 `dbx_plugin_tools` 把工具目录重新拼装成自己的文本返回，与 raw 不是同一序列化结果，经验比 ≈0.9（#203 前单轮实测 99,909 raw → 90,114 桥文本，比率 0.902）。按此换算当前桥文本 ≈39.5k。
+- **客户端落盘线**：Claude Code 在 >≈50,000 字符落盘（persistenceThresholdCeiling，实测客户端中最严），Qoder CLI ≈75,000。预算断言 **raw ≤50_000** 对应桥文本 ≤≈45k，即断言内保证 Claude Code 不落盘；#172 时代的 100k 预算只是防回归，不是客户端无落盘判据（当时 90k 桥文本在两个实测客户端都落盘）。
+- **预算纪律**：新增工具前先看预算——能并进既有工具或用 `ssh_exec` 实现的不再单列；超预算先砍最长 description（自明参数可整条去 description），不删属性名、不删行为语义与安全警告。
+
+## 会话导入：流式预览与脱敏规范化导出
+
+`import/preview/start` 参数为 `{ kind, mainSize, userConfigSize?, masterPassword? }`：`kind` 为 `moba`、`xshell`、`windterm`、`securecrt`、`finalshell`、`electerm`、`termius` 或 `sshconfig`；主文件与仅 WindTerm 可用的 `userConfigSize` 共用 **64 MiB** 总预算。返回 `{ taskId, chunkSize }`，当前 `chunkSize` 为 256 KiB，刻意保持在 SDK 8 MiB JSON 上限以下。`sshconfig` 为第 8 种来源（OpenSSH config，WT-3）：支持 Host 通配、Hostname/User/Port、IdentityFile（仅映射路径、不读密钥材料，原因码 `key-path-only`）、UserKnownHostsFile、`Match host/user` 受限支持；Include 按「未跟随」标注降级（管线只收上传字节，sidecar 不做磁盘递归读取）；ProxyCommand/ProxyJump 仅在描述中标注「需手动映射」，绝不执行外部命令（与 tssh Expect 同款「密文/外部命令不自动执行」信任模型）。
+
+文件内容不经 JSON/base64 RPC 传输。前端按 SFTP 上传同款发送二进制通道 `import/preview/<taskId>/main`；WindTerm 可选文件使用 `import/preview/<taskId>/user-config`。每帧是 `[u64 BE offset][raw bytes]`，必须连续、从 offset 0 开始，单块至多 `chunkSize`。sidecar 成功接收后发 `import/preview/ack { taskId, part, nextOffset }`；前端等待 ACK 再发下一块。协议错误会发 `import/preview/error { taskId, part, error }`，并立即清理该任务。
+
+`import/preview/finish { taskId }` 只接受所有声明字节已到齐的任务；它在返回前移除原始文件字节和 WindTerm 主密码，返回 `{ sourceKind, sessions, totalSessions, truncated, export }`。这是一次性**临时 preview/export**：不创建连接、没有 `import/commit` 成功语义、也不持久化导入结果。所有格式（含 ZIP）使用解析前受限 accumulator，在每个 session `push` 前强制 `MAX_PREVIEW_SESSIONS=1000`，超限 fail-closed 而不是先构造巨大 `Vec` 后截断；ZIP 另受条目、单项与总解压预算限制。`sessions` 是最多 1000 行的脱敏预览（仅名称、主机、端口、用户、分组、描述、认证类别、`hasSecret` 与 `secretNote`）；`export` 是可供前端保存的规范化 JSON：`{ schemaVersion, sourceKind, sessions }`。每一行认证信息只有 `kind`、`hasSecret`、`keyPath`（路径元数据）和 `secretNote`；普通密码、私钥内容和私钥口令都不进入 `ImportedAuth` 预览模型，解密/检查仅用 `Zeroizing` 临时缓冲后立即释放；因此它们在任何响应、导出或插件私有文件中均不存在。该插件不再创建或读取 `imported-connections.json`。
+
+`import/preview/cancel { taskId }` 幂等地丢弃未完成的内存上传；组件卸载、读取失败、ACK 超时和用户返回均应调用它。sidecar 进程退出同样释放进程内状态。导出优先使用宿主 `saveFile`，其次 `fileTransfer`；Host API 1.0 同时缺失两项时，顶层、非 sandbox 页面使用浏览器 Blob 下载。因 issue #93，sandbox iframe **不得**尝试 `<a download>`：它必须失败并提示用户升级到带 `saveFile`/`fileTransfer` 的宿主或在顶层浏览器上下文打开，不能静默返回无导出结果。
+
+同一解析管线另有单会话形态：连接表单动作 `connection/action import-sessions`（「导入连接」，见 RPC 总表）在桌面端由 sidecar 先弹来源类型选择、再按类型过滤弹文件框（`source`/`path` 参数可逐段注入跳过），读盘后按扩展名/JSON 形态嗅探 kind 走 `parse_uploaded` 同一入口，只取首条会话回填表单——批量选择、WindTerm 主密码问询与预览表仍归工作台向导；两条路径的解析器、容量上限与脱敏语义必然一致（同一代码）。
+
+## 运行时设置
+
+`ssh/settings/get` 返回当前编排配置（密钥仅以布尔标记呈现，绝不下发明文；传 `revealSecrets: true` 时额外回显本连接配置的 `sudoPassword` / `totpSecret` 原始串（多密钥原文），供工作台设置弹窗预填已存原值——该参数仅工作台使用，MCP 通道不暴露，缺省响应与此前完全一致；另附 `quickSudoProfileId` / `quickSudoProfileName` 报告生效的全局配置绑定（`sudo_source=global` 时含连接表单引用解析结果），未绑定为空串，`sudoSource`（`custom` / `global` / `off`，生效来源），以及 `agentTerminalMode`（`off` / `auto` / `strict`，AI 终端同步模式，见下节））；`ssh/settings/set` 另接受可选 `rememberedCommands`（字符串数组全量替换连接级免审批清单，校验规则见「审批记忆」节，破坏性行拒绝且错误信息带行号，缺省不改变）；`ssh/settings/get` 响应含 `rememberedCommands`。`ssh/settings/set` 接受 `quickSudo`、`sudoUsePty`、`sudoPassword`（空串=清除回退登录密码）、`totpSecret`、`authFlowMode`、`passwordPromptHint`、`totpPromptHint`、可选 `agentTerminalMode`（非法值报错，缺省不改变），以及可选 `quickSudoProfileId`（非空须引用存在的全局配置并持久化绑定，空串解除绑定，缺省不改变；挑选配置会将连接的 `sudo_source` 切到 `global`，解除时 `global` 回落 `custom`）。更新通过共享编排锁立即作用于该连接的**所有存活会话**——终端自动应答与命令弹窗在下一次提示时即用新值（对齐每次输出动态 resolve 的语义）；终端侧监视器随每次设置/配置更新按当前连接状态**重新挂载**：连接时未配置凭据（如密钥认证连接）或 Quick Sudo 处于关闭的会话，在运行时配置密码/TOTP 或重新打开开关后立即开始自动应答，无需重连。`sudoPassword` 等字段级覆盖是 sidecar 本地值，sidecar 重启或重开连接后恢复宿主下发的配置，而 `quickSudoProfileId` 绑定与 `agentTerminalMode` 持久化在插件数据目录、重启保留（0.4.49 起，见「AI 终端同步执行」）。工作台工具栏提供设置弹窗；`agentTerminalMode` 与 `rememberedCommands` 已镜像进宿主 `host.storage` 作云同步载荷（存储迁移批 2，sidecar 仍即时权威，见 `IMPL_PLAN_STORAGE_SYNC.zh-CN.md`）。宿主连接表单通过 manifest 字段提供持久化配置入口：`sudo_source`（三选一 `custom` 本连接 / `global` 全局配置 / `off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射）、`sudo_profile`（仅 `global` 时显示，声明 `options_action: sudo/profiles/options` 由宿主渲染为动态下拉，无该扩展能力的宿主保留文本回退）、`sudo_password`、`sudo_use_pty`（仅 `custom` 时显示）、2FA 编排四件套 `totp_secret`、`auth_flow_mode`、`password_prompt_hint`、`totp_prompt_hint`（`global` 时隐藏——凭据来源整体由全局配置接管；`custom`/`off` 时 `auth_flow_mode` 常显以服务登录期 keyboard-interactive，`totp_secret`/`totp_prompt_hint` 仅在自动回码的两种 OTP 模式（`password_then_otp`/`password_plus_otp`）下出现，`password_prompt_hint` 与 TOTP 字段同集并紧随其后——2FA 关闭时整组折叠，不再残留孤立的密码提示词行）、超时与 keepalive、`set_env`（会话环境变量）、`remote_command`（会话命令，两者详见「会话环境与会话命令（SetEnv / RemoteCommand）」）、`triggers`（自动交互触发器）与 `password_command` / `passphrase_command`（外部密码管理器，三者详见「自动交互触发器（Expect）与外部密码管理器」）。注意：跳板链 `jump_hosts` **没有 manifest 表单字段**——它仅经会话导入写入连接的 `external_config.jump_hosts`（见「会话导入：流式预览与脱敏规范化导出」节），隧道/代理/跳板转发一律走 DBX 宿主传输层（不重复宿主能力），表单层无跳板配置入口。
+
+## AI 终端同步执行（agent terminal mode）
+
+DBX 内嵌 AI 通道（`mcp/call` 携 lifecycle `connectionId`）的 `ssh_exec` / `ssh_exec_sudo`
+可路由到**用户当前交互 shell**（PTY）执行：命令按键盘写入原文注入（与快速命令栏同
+信任域，无 shell 拼接面；C0 控制字符先剥离），输出经终端录制（提示符回归 + 300ms
+静默判定收尾；1 MiB 有界缓冲，ANSI 剥离后返回）。模式矩阵：
+
+| `agentTerminalMode` | low 风险 | elevated（sudo / 灾难模式命中） |
+| --- | --- | --- |
+| `off`（默认） | 既有隐藏 exec 通道 | 既有隐藏 exec 通道 |
+| `off` + 显式 `runInTerminal: true` | 直接注入（发 `ssh/agent/notice`） | 审批后注入（0.4.49 起；此前为拒绝） |
+| `auto` | 直接注入（发 `ssh/agent/notice`） | 审批后注入 |
+| `strict` | 审批后注入 | 审批后注入 |
+
+- 调用级覆盖：工具可选参数 `runInTerminal`（`true` 强制终端路径、`false` 强制隐藏
+  通道、缺省按连接模式）。stdio `--mcp` 模式的连接类调用自动经宿主桥转发到运行中的
+  DBX 应用执行（embedded sidecar 按同一矩阵决策），因此连接级模式开关在 stdio 场景
+  同样生效；宿主桥仅在显式 `runInTerminal: true` 或探针确认模式非 `off` 时才打开
+  工作台标签，静默调用不再开标签也不再抢窗口焦点。`runInTerminal` 是 agent 可自主
+  决定的参数（schema 引导：任务需要可见性/人工监督/交互性时主动置 `true`）。
+- 持久化：连接级 `agentTerminalMode` 落盘 `<plugin_data_dir>/agent-modes.json`
+  （版本化 JSON：`{version, modes: {connectionId: "auto"|"strict"}}`，原子写，
+  `off` 移除条目；损坏按空表处理），sidecar/app 重启后保持，不再回落 `off`。
+- 终端工具栏快速开关：工作台按钮行新增「终端 MCP 模式」弹出层（`Bot` 图标，非 `off`
+  时高亮），就地读写连接级 `agentTerminalMode`（与设置弹窗共用 `ssh/settings/get` /
+  `ssh/settings/set`）；开启后 MCP 命令在本终端可见执行（审计/学习），关闭走静默
+  隐藏通道。
+- 无终端会话：报错 `No open terminal session for this connection; open the SSH
+  workbench terminal first`（可见才执行的承诺）。
+- 审批：发 `ssh/agent/prompt` 事件并阻塞等待；`ssh/agent/resolve {challengeId,
+  decision: "approve"|"deny", command?, remember?}`（approve 可携带弹窗编辑后的
+  命令原文；`remember: true` 仅 approve 时有效，把该命令写入连接级免审批清单，见
+  「审批记忆」节）；默认 120s（钳 10–300）超时即拒绝；挑战一次性。
+- 收尾：发 `ssh/agent/finish {sessionId, status: "done"|"timeout"|"denied"}`。
+- 响应：终端路径返回 `{output, exitCode: null, mode: "terminal", incomplete,
+  interrupted}`；超时返回已捕获输出且 `incomplete: true`，命令留在终端继续跑、
+  人工可接管（Ctrl+C 复用既有终端通道）。
+- 已知限制：多行命令按行执行；全屏 TUI（vim/top 等）无提示符回归、走超时路径；
+  回显/尾提示符剥离为尽力而为。
+- 既有只读白名单与灾难 `confirmDestructive` 门禁先于路由判定生效，模式不放宽任何门。
+
+## 审批记忆（remembered approvals）
+
+AI 终端审批弹窗勾选「记住此命令」后，批准的命令（用户编辑后的最终文本）写入该
+连接的免审批清单（`<plugin_data_dir>/agent-approved-commands.json`，版本化 JSON
+`{version, connections: {connectionId: {commands: [原始行…]}}}`，tmp+rename 原子写，
+普通 JSON 无凭据不做 0600；损坏按空库处理）。后续同连接的终端路由命中清单即直接
+执行、不再弹审批：
+
+- 匹配完整复用 sudo 白名单的 token 语义（`backend/src/sudo_allowlist.rs`）：token
+  精确、`*` 匹配一个参数、尾 `*` 匹配剩余且须至少一个参数；记住时存精确形态，可在
+  设置面板手工泛化为通配。
+- 双重灾难锁（D2）：破坏性命令（`mcp_safety::assess_command == Destructive`）拒绝
+  入库（`remember`/`ssh/settings/set rememberedCommands` 均拒绝，后者错误信息带
+  行号），且命中清单前的重检对破坏性文本一律无效——灾难确认门永不绕过。
+- 生效范围：`decide_with_memory` 只把 `Prompt` 降为 `Run`，`Deny`（off 模式未显式
+  opt-in）不覆盖；off/auto/strict 三档下的已记住命令均可免审执行（用户显式动作
+  优先于模式默认）。
+- 管理：`ssh/settings/get` 返回 `rememberedCommands`（原始行数组）；`ssh/settings/set`
+  接受 `rememberedCommands` 全量替换（每行 ≤500 字符、每连接 ≤50 行、去重）。
+- 设置弹窗「AI 终端」区块提供清单展示与删除（保存随设置链全量提交）。
+
+## 执行审计（audit log）
+
+MCP/AI 执行面全量落本地 JSONL 审计账（`<plugin_data_dir>/audit-log.jsonl`，
+append-only；5 MiB 轮转保留一代 `.1`；open-append 单行写保证 embedded sidecar 与
+stdio `--mcp` 双进程共享数据目录时的行完整性；进程内 Mutex 串行）。审计面 =
+`call_tool` 每次工具调用一条（gate + outcome + exitCode + 耗时）+ 终端路由审批
+生命周期一条（`approval` 字段；工作台人工操作不记）。行结构（camelCase）：
+`{tsMs, tool, connectionId, gate, approval, outcome, exitCode, durationMs, mode, command, output, error}`，
+其中 `gate ∈ pass|write-denied|whitelist-denied|sensitive-path|destructive-unconfirmed|
+sudo-allowlist-denied|read-only-server`，`approval ∈ none|prompt|approved|denied|
+timeout|remembered`，`outcome ∈ ok|error`，`mode ∈ stdio|embedded|terminal`；
+`command` / `output`（0.4.77 起）记录被审命令文本与其输出尾部——exec 族工具从
+入参 `command` 与结果 `output` 提取，审批行只带命令文本；`command` 钳制 512 字符、
+`output` 钳制 1024 字符，旧版行无此两字段按 null 回放。`error` 钳制 1 KiB，
+凭据从不进入命令文本。宿主桥转发的调用由实际执行方（app 侧
+sidecar）记账，不双计。
+
+- `ssh/audit/list`：`{limit?: 1–500 缺省 100, beforeTs?: ms}` → `{entries: [行…],
+  truncated}`，文件序（旧→新）取末尾 limit 条，只读。
+
+## 告警分诊（alert triage）
+
+`ssh/alert/triage {payload: string}`：把异构告警体（JSON 文本任意 schema，或纯文本）
+标准化为固定结构并给出**只读诊断命令清单**。兼容语义对齐 openocta `/hooks/alert`：
+JSON 解析失败或 `message` 为空时整包文本作为 message；`data` 字段（object）原样
+序列化进 `dataJson`。分类为双语关键词计分（`cpu|memory|disk|inode|network|oom|
+service|generic`，同分按固定序、全零落 generic）。响应：
+`{normalized: {alertId, title, message, severity, source, dataJson}, category,
+suggestions: [{command, purposeKey}]}`（字段钳制：title/message ≤2 KiB、dataJson
+≤16 KiB）。硬约束：playbook 每条命令必须过 `mcp_safety` 只读白名单（单测钉死），
+无重定向/`$()`/`sudo`——建议命令在只读连接上可直接经既有 exec 门执行。该方法是
+纯分诊、无需连接、从不执行命令；执行由调用方经 `ssh_exec` 等门禁完成。工作台
+工具栏「告警排查」（Siren 图标）弹窗提供粘贴→分析→逐条发送到终端/全部复制。
+MCP 工具面同名工具 `ssh_alert_triage` 已随 #203 工具瘦身移出（分类逻辑仍经本
+sidecar 方法提供）。
+
+## Quick Sudo 全局配置
+
+`sudo/profiles/*` 管理跨连接复用的多套 Quick Sudo 配置（全局配置 + 连接级覆盖语义），持久化于 `<plugin_data_dir>/quick-sudo-profiles.json`（版本化 JSON：`profiles` + `bindings`，Unix 权限 0600，原子写；损坏按空库处理；0.4.52 起 `version: 2` 并静态加密，见下）。每套配置含：`name`（唯一，trim 后 1–64 字符）、`sudoPassword`、`totpSecret`、`authFlowMode`（`password_only` / `password_plus_otp` / `password_then_otp`）、`passwordPromptHint`、`totpPromptHint`、`sudoUsePty`。上限 20 套。
+
+**凭据静态加密（vault，0.4.52 起）**：文件内 `sudoPassword` / `totpSecret` 不再明文落盘，改为字段级 AES-256-GCM 信封（`sudoPasswordEnc` / `totpSecretEnc`，密文 `base64(nonce‖ct)`，AAD 绑定 `字段|档案id` 防密文挪用；空值不加密），name/提示词/模式等元数据保持明文。顶层 `crypto: {scheme:"aead-v1", storage:"keyfile"|"keychain"}` 声明 DEK 托管档位。**默认档为同目录 `vault.key`（0600）**：OS keychain 在 sidecar 二进制每次更新（macOS）或每进程首次访问时都会弹授权对话框，违背无人值守体验，故仅显式选入（环境变量 `DBX_SSH_VAULT_STORAGE=keychain`）时新建才走 keychain（服务 `io.dbx.ssh`、账户 `vault-dek-v1`；keyring，解析结果进程级缓存、至多弹一次）。遗留 keychain 档文件在首次成功解密时自动迁移为 keyfile 档并删除 keychain 条目；keychain 被拒绝时该进程内不再重试、文件保持原档位不被空密文覆盖。v1 明文文件加载后自动 best-effort 重写为 v2；解密失败按空处理、元数据保留。内存结构与全部方法视图不变（视图仍只出布尔位，`reveal` 仅工作台可用）。
+
+- `sudo/profiles/list`：返回 `{ profiles: [视图…] }`，按名称排序；视图含 `id`、`name`、`sudoPasswordSet`、`totpConfigured`、`authFlowMode`、提示词、`sudoUsePty`、`createdAt`、`updatedAt`，**永不携带密钥明文**。
+- `sudo/profiles/reveal`：参数 `id`；返回 `{ profile: 完整视图 }`（含 `sudoPassword` / `totpSecret` 原值），供工作台配置编辑器预填已存原值；未知 id 报错。**仅工作台方法，不进 MCP 工具面**——MCP 通道（list/save/工具 schema）只见布尔标记，密钥不进 agent 上下文。
+- `sudo/profiles/save`：参数 `id?`（有=更新须存在，无=新建）、`name`、`sudoPassword?` / `totpSecret?`（空串/缺省=保持原值）、`clearSudoPassword?` / `clearTotpSecret?`（true=清除）、其余策略字段可选；返回 `{ profile: 视图, created }`。错误：名称为空/超长/重复（大小写不敏感）、id 不存在、超出上限。
+- `sudo/profiles/delete`：参数 `id`；返回 `{ success, removed }`；级联清理绑定，并对受影响连接的存活会话即时回退到本连接配置。
+- 连接绑定：`ssh/settings/set { sessionId, quickSudoProfileId }` 选择来源（见「运行时设置」）。绑定生效期间该配置**整体覆盖**本连接的 sudo 密码 / TOTP / 提示词 / 认证流 / `sudo_use_pty`（配置密码为空时回退登录密码，而非本连接 sudo 密码）；终端 auto sudo 与 `ssh/exec{sudo:true}` 走同一编排，自动使用所选来源。配置保存/删除即时热更新所有绑定它的存活会话（字段级覆盖，保留 OTP 防重放记账）。
+- MCP 通道：list/save/delete 的 MCP 工具面（`ssh_quick_sudo_profiles_*`）已随 #203 工具瘦身移出——profile 管理走工作台 UI 与本 sidecar 方法族，agent 面保留只读引用能力：`ssh_exec_sudo` 支持可选 `quickSudoProfile`（id 或精确名称）引用全局配置作为默认凭据，调用内联 `sudoPassword` / `totpSecret` 显式给出时优先；引用在发起任何连接 I/O 前解析，未知名称快速报错。
+- MCP 安全门（`mcp_safety.rs`）：`ssh_exec` / `ssh_exec_sudo` 在执行前做命令风险分级——只读连接上仅放行白名单巡检命令（`ssh_exec_sudo` 一律拒绝）；命中灾难模式的命令（`rm -rf` 系统根、mkfs/dd 裸设备、shutdown、`/etc/passwd|sudoers` 覆盖、SQL DROP 等）任何连接都要求 `confirmDestructive: true`，只读连接直接拒绝；`DBX_SSH_MCP_READ_ONLY=1` 可把整个 MCP 进程强制只读。详见 `MCP.zh-CN.md` 生产误操作防范节。
+- 入口桩：宿主贡献点仅有 `connection-provider` / `workbench` / `filesystem-provider` 三种，**没有插件级独立设置页**。因此完整管理 UI 挂在工作台（工具栏钥匙按钮直达管理弹窗；来源绑定在设置弹窗「sudo 凭据来源」，连接表单 `sudo_source` 三选一含 `global`）。连接表单原经 `quick-sudo-profiles` 动作按钮返回配置摘要文本，2026-10-03 按用户反馈移除（点击无响应的发现桩价值有限），`sudo/profiles/*` 方法族与工作台管理 UI 保留。
+
+## 跳板机（ProxyJump）与连接存活
+
+- `external_config.jump_hosts`（最多 3 跳）定义跳板链：每跳包含 `host`、`port`（缺省 22）、`username`、`authentication`（`password` / `private-key` / `private-key-password` / `agent`）及对应凭据字段，可选 `totp_secret` / 提示词 / `auth_flow_mode`。配置跳板后整条链替换 runtime 隧道，末跳直连目标 `host:port`；每跳主机密钥独立校验，登录期 keyboard-interactive 2FA 同样生效。会话关闭时按序断开整条链。
+- 协议层 keepalive：russh 按 `keepalive_interval_secs`（连接表单字段，缺省 30 秒，0 关闭）周期发送带应答的 keepalive 全局请求（等效 OpenSSH `ServerAliveInterval`），连续 3 次无应答即判定连接死亡，终端转入断开态、由工作台重连；跳板链每跳同参。
+- 终端活动保活（`terminal_keepalive_secs`，连接表单字段，默认 0 关闭）：按配置间隔向交互终端 PTY 注入"空格+退格"（净零输入——空命令行不入 shell history，全屏程序内仅光标往返），用于对抗按键盘活动判空闲的服务器侧策略（`TMOUT`、堡垒机审计），协议层探测对此无效。解析侧钳制 5–3600 秒（`model.rs` `clamp_terminal_keepalive`）；仅作用于终端会话（MCP exec 通道不注入），会话关闭即随读写循环退出。`ssh/sessions/list` 以 `terminalKeepaliveSecs` 上报生效值。
+
+## 端口映射（-L / -R）
+
+用户级端口映射对标 ssh(1) `-L`/`-R`/`-D`。终端右上角和连接右键的「管理端口映射」打开同一管理界面；右键由宿主以 `open-workbench` 的 `presentation: "dialog"` 承载插件工作台，不创建标签页或 PTY。两个入口新增的映射均以 `connectionId` 持有独立 SSH 传输，关闭终端不影响映射。最后一条独立映射停止或连接断开时释放传输。旧版按 `sessionId` 创建的映射仍遵循会话结束即清理的语义。映射均为运行时状态，不落盘、不跨 DBX 重启恢复。
+
+- **local（-L）**：sidecar 在客户端机器 `listen_host:listen_port` 起 TCP 监听；每条入站连接开一条 `direct-tcpip` 通道，由服务端拨 `target_host:target_port`。双向转发走 `copy_bidirectional`，按连接累计 `bytesUp/bytesDown`。
+- **remote（-R）**：sidecar 先向服务端发 `tcpip-forward` 全局请求（拒绝即 start 报错，`AllowTcpForwarding no` 的服务器在此处失败）；`listenPort: 0` 时由服务端挑选端口并以 `boundPort` 回报。服务端侧入站连接以 `forwarded-tcpip` 通道送达，sidecar 的客户端 handler 按连接维度的转发表（`(listen_host, bound_port) → target`，含归一化与通配端口回退匹配）在**客户端机器**拨目标地址并双向转发。停止时发 `cancel-tcpip-forward` 并摘除表项。
+- **dynamic（-D）**：sidecar 在客户端本地监听 SOCKS5，接受无认证 `CONNECT`，目标可为 IPv4、IPv6 或域名；域名原样交给 SSH 服务端通过 `direct-tcpip` 解析和拨号。`BIND`、`UDP ASSOCIATE`、不含无认证方法的握手均按 SOCKS5 返回拒绝；握手 10 秒超时。默认监听回环地址，其他地址须用户显式填写。浏览器/DBX 代理可手动使用列表中的 `SOCKS5 host:boundPort`。
+- **输入校验与冲突预检**：listen/target 主机接受 IPv4、IPv6（`[...]` 括号剥除）与主机名标签；嵌入式端口/scheme（`host:8080`、`http://…`）、`999.1.1.1` 这类伪 IP、本地映射的 `*` 通配均拒绝（空 listenHost 缺省回环）。`start` 在 bind/`tcpip-forward` 之前做监听端点冲突预检：同显式端口（0 = 自动挑选永不冲突）、主机相同或任一侧通配（`*`/`0.0.0.0`/`::`/空）即报 `Listen endpoint … is already forwarded by mapping …`；local 与 dynamic 共享本机监听端口，跨连接互相冲突；remote 仅与同一连接的 remote 冲突。工作台面板同规则预检并在表单内联提示。
+- `stop` 语义：后台任务全部 abort（含已建立的转发连接），registry 立即摘除；对同一 id 重复 stop 报 `not found` 错误。会话映射随终端会话结束；独立映射持续到用户停止、连接断开或 SSH 传输失效，并在最后一条映射结束时关闭专用传输。
+- 事件 `ssh/forward/state` 为状态广播（starting/active/error/stopped），工作台面板（`PortForwardDialog.vue`，自订阅该事件）据此就地刷新；list 为准、事件为加速。
+
+## 会话环境与会话命令（SetEnv / RemoteCommand）
+
+对标 ssh(1) `SetEnv` / `RemoteCommand` 的两个连接级会话特性（manifest 字段 `set_env` / `remote_command`，binding `config`；0.4.35 前存量为 `setEnv` / `remoteCommand` camelCase，sidecar 兼容读取两种命名；跳板链不继承，仅作用于最终会话）：
+
+- `set_env`（textarea，默认空串）：每行一条 `KEY=VALUE`（分号亦可作分隔符，空白条目忽略，键值两侧空白去除），在交互终端通道（`ssh/session/open`，PTY 申请后、shell/exec 请求前）与 exec / sudo 命令通道上以 CHANNEL_REQUEST `env` 注入。重复键以最后一条为准——本地合并去重后每个变量恰好请求一次；sudo 通道内部 `SUDO_ASKPASS` 清空默认值让位于用户同名条目（用户值优先，不靠服务器端覆盖顺序）。**默认值**：空串（不发任何 env 请求）。**校验失败行为**：任一条目非法（缺 `=`、键为空或含空白或 NUL、值含 NUL）时连接解析直接失败，并聚合报出全部非法条目——宁可连不上也不错配。语义为客户端显式指定的环境，**不透传本地进程环境变量**；env 请求的注入失败（通道/传输级错误）即报错并命名该变量，不静默吞掉。注意与 ssh(1) 一致的协议现实：env 请求为 fire-and-forget，服务器未 `AcceptEnv` 对应变量时静默丢弃（不发失败应答可观测），此时该变量不生效但连接不失败——需要在远端生效请在服务器 sshd_config 配置 `AcceptEnv`。插件内部管道命令（metrics 采集、磁盘用量、服务器内复制）不注入 setEnv，保证输出解析与连接的语言覆盖解耦。
+- `remote_command`（单行文本，默认空串）：非空时 `ssh/session/open` 在申请 PTY 并注入 setEnv 后 exec 该命令**替代 shell request**（PTY 照常申请，对标 `ssh RemoteCommand`）。空串 = 普通交互 shell（默认）。重连或工作台重开会话会**重放同一条命令**，属预期行为（与 ssh(1) 一致：每次新会话都重新执行）。MCP 隐藏 exec 通道、`ssh/exec`、sudo 执行与终端回放（replay）/重连语义不变——remoteCommand 只影响交互会话的启动方式。
+
+## 启动命令（Login scripts 对标）
+
+连接级启动命令（Tabby「Login scripts」对标，M7 P0-4）：连接建立、`request_shell` 成功进入交互 shell 后，sidecar 按配置顺序把预置命令逐条经终端输入通道（与终端 keepalive 相同的 PTY 键盘语义）写入并回车。这是 shell 起来之后的自动键入序列，**不是** `RemoteCommand` 的替代：`remote_command` 非空的 exec 会话没有可键入的 shell 提示符，语义冲突，**自动跳过启动命令**（见上节）。
+
+- 存储：复用 `local/preferences/*` 白名单键 `startup_commands`（`<plugin_data_dir>/preferences.json`），按 connectionId 分桶：`{ <connectionId>: { enabled: bool（默认 false）, commands: [{ command: string（≤4KiB，结尾 CR/LF 剥离）, delayMs: u64（0..=30000，缺省 300）, enabled: bool（默认 true） }] } }`；每连接最多 20 条、最多 512 个连接桶，桶/行级非法形状丢弃不报错（整体非对象由 set 报错）。前端「设置 → 终端 → 启动命令」列表编辑（增删/排序/启停/延迟毫秒，开关默认关），改动对之后新开的会话生效（`open_session` 时读取）。
+- 执行：shell 起来后 spawn 一次性顺序注入器；每条命令先等 `delayMs`（首条等待同时覆盖 shell 提示符就绪），再写入 `command + "\r"`；会话关闭（输入通道断开）注入即停。命令可能含敏感串——**永不进日志、审计或事件**。
+- 事件 `ssh/startup`：注入结束发一次 `{ sessionId, count, completed }`（`count` 为计划条数；`completed: false` 表示会话中途关闭、序列未走完），**不带任何命令内容**。
+
+## Quick Sudo 远程执行
+
+`ssh/exec` 参数为 `sessionId`、`command`、`sudo`（可选，默认 false）、`timeoutSecs`（可选，5–300 秒）、`execId`（可选，用于取消），返回 `output` 与 `exitCode`；`ssh/exec/cancel` 携带 `execId` 中止执行中的命令并返回取消错误。命令通道（sudo 与非 sudo）会先注入连接的 `set_env` 条目（见「会话环境与会话命令」），注入失败即报错。
+
+Quick Sudo（`sudo: true`）提供 sudo 远程执行服务：
+
+- 命令以 `sudo -S -p '' sh -c '…'` 执行，密码写入 stdin（优先 `connection_secrets.sudo_password`，缺省回退登录密码）；未配置密码时回退 `sudo -n`（NOPASSWD 或已缓存时间戳）。
+- 执行期间持续监控提示流，识别密码 / TOTP / 组合提示（内置中英文模式，可用 `external_config.password_prompt_hint`、`totp_prompt_hint` 自定义），并依据 `external_config.auth_flow_mode`（`off` / `password_only` / `password_plus_otp` / `password_then_otp`）自动应答。`off`（0.4.77 起连接表单默认）永不自动回 OTP 验证码（登录 keyboard-interactive、sudo watcher、组合提示三条路径一致，密码类提示照常应答，纯 OTP 凭据不再武装监视器）；存量连接字段缺省时仍按 `password_then_otp` 生效，不受新默认值影响。
+- TOTP 密钥来自 `connection_secrets.totp_secret`，支持 `otpauth://totp/…` URI、base32 密钥或 4–10 位静态码；按 RFC 6238（SHA1/SHA256/SHA512，6–8 位）现场计算验证码。多个密钥按行/分号分隔，轮换选择规则：未用过的验证码优先、剩余有效时长最长者优先，配置顺序兜底。**同一验证码在提交后的重放窗口（自身有效窗 + ±1 步长）内不会被再次注入**——服务器普遍接受相邻窗口验证码，重复提交必然失败；命中窗口时自动应答直接跳过（不再等待用户输入），并在编排日志标注 `otp auto-answer skipped`。使用/防重放两本台账驻留 **sidecar 进程全局**（按 **目标作用域** `user@host:port` + 密钥 SHA-256 指纹 + 窗口 + 验证码键控，只存指纹不存密钥），跨 exec 调用、跨终端会话共享——MCP `ssh_exec_sudo` 每次调用独立解析编排实例，轮换状态依然连续；作用域隔离使共用同一密钥的多个连接互不吞码（A 机烧掉的码在 B 机仍可提交）；静态码的 usage 记账不随 `now+窗口` 漂移（键控不含时间戳）。sidecar 重启即清零。
+- `external_config.sudo_source` 选择凭据来源：`custom` 本连接凭据（默认）、`global` 全局 Quick Sudo 配置（`sudo_profile` 按名称或 id 引用，未解析到时回落工作台绑定，再退化为本连接凭据，连接不失败）、`off` 停用；旧连接缺省时按 `quick_sudo` 布尔映射（true→`custom`、false→`off`）。`sudo_use_pty` 可为需要 TTY 的 PAM 栈请求 PTY（默认关闭，此时提示走 stderr；`global` 模式下配置自带的 PTY 偏好优先）。
+- 检测到 `sorry, try again` 等认证失败标记立即报错；认证应答最多三轮。sudo 执行成功后按连接启动 `sudo -nv` 保活循环：每 4 分钟（`SUDO_KEEPALIVE_INTERVAL`）校验/续期时间戳，连续 2 次（`SUDO_KEEPALIVE_MAX_FAILURES`）校验失败自动停止（时间戳已失效，下次 sudo 执行会重新注册）；同一连接只保留一个循环，连接断开或会话清理时确定性中止。
+- 只读连接拒绝 sudo 执行；密码与 TOTP 密钥仅停留在 sidecar 内存中，不下发工作台。
+
+## 登录期 2FA（keyboard-interactive）
+
+密码认证被拒绝或服务器未开放 `password` 方法时，自动降级 keyboard-interactive（PAM）认证：每一轮提示先按 Quick Sudo 的同一套编排配置自动应答（密码 / TOTP / 组合提示，遵循 `auth_flow_mode`）；仍未回答的提示在宿主支持 Host API 1.1 `host.requestUserInput` 时打开一次性密文弹窗，展示净化后的服务器 `name` / `instructions` / 提问文本，由用户输入当前动态令牌。弹窗答案只用于本次认证，不写配置、不进日志；取消、超时或空值均 fail closed。旧宿主不支持该接口时保持兼容：未知提示留空交由服务器处理并在失败信息中给出配置指引。最多 4 轮，复用连接超时。覆盖 `PasswordAuthentication no` + PAM 2FA 的主机，以及 JumpServer/koko 的"密码或私钥 + 动态口令"登录；密钥+密码（`private-key-password`）回退路径同样适用。
+
+**首因子判定（2026-09-16，issue #17 / #30）**：`password_then_otp` 只在"首因子已经过掉"时才自动回 OTP 验证码。除同一次 KI 交换里答过密码提问外，以下两种情形同样算首因子已满足——① 密码方法已尝试、服务器要求继续认证（koko/JumpServer 用 partial success 表示"密码通过、还差 MFA"；即使服务器未置该位，密码已提交这一事实同样成立）；② 公钥 / SSH Agent 身份被服务器接受但要求后续认证（partial success 且剩余方法只有 keyboard-interactive，私钥/agent 路径据此续答 KI，不再直接报"认证被拒"）。既没有 password 方法、也没提交过密码的纯 KI 主机保持原保护：裸 OTP 提问不自动应答。
+
+**提问识别**：除提问文本本身，挑战的 `name` / `instructions` 也参与匹配——堡垒机（koko）把可读文案放在 instructions（`Please Enter MFA Code.`）、提问是 `[OTP Code]: `，二者都能命中内置模式（新增 `otp code` / `mfa code` / `mfa:` / 动态密码 / 验证码 / 一次性密码）。OTP 信号优先于用户自定义的"密码提示词"：命中 OTP 模式的提问不会被密码提示词改判成密码提问（避免把登录密码当验证码回给服务器）。
+
+**凭据来源与密码半边（2026-09-16）**：登录期 KI 用的流程模式 / TOTP 密钥 / 提示词与 Quick Sudo 同源——`global` 模式下连接表单隐藏 2FA 四件套（凭据整体由全局配置接管），登录提问因此也读该配置的 `authFlowMode` / `totpSecret` / hints；`custom` 模式下连接自身配置优先，绑定（0.4.x 遗留）只补齐连接留空的项；`off` 不提升全局配置。**密码半边始终是登录口令**（含 `password_command` 解析结果）：登录提问若回一个单独的 sudo 口令只会认证失败，还会把特权口令平白送给对端。
+
+**选型指引**：有稳定的 `otpauth://` URI / base32 密钥时可配置自动回码；手机、硬件令牌或短信里不断变化的六位码不要保存到 `TOTP 密钥`，把该字段留空，连接时在密文弹窗输入当前码。主机先问 MFA、再问密码且需要自动应答时用「密码 + OTP 合并」模式——该模式不设"先密码"门槛，裸 MFA 提问也会被应答；「先密码，再 OTP」对裸 MFA 提问保持留空（保护），随后由宿主弹窗询问。**合并提问**（一条提问里同时要密码与验证码，如 `Password: OTP Code: `）两种 OTP 模式都拼接应答（只回密码半边必然失败）；`password_only` / `off` 仍只自动回密码半边，未回答部分可由连接期弹窗补充。终端内的合并提问同样处理，但需命中密码类内置模式（`[sudo] password for` / `password:`）或配置了自定义提示词，避免误答其他交互程序。
+
+**诊断**：认证失败时错误信息带上服务器实际提问（`name` / `instructions` / 提问文本，去控制字符并截断，绝不包含凭据）。支持 Host API 1.1 的 DBX 会先弹出密文输入框；旧宿主则指路配置 TOTP 密钥或 OTP 提示词。`auth_flow_mode=off` 只关闭自动回码，不关闭连接期人工输入。端到端回归见 `scripts/smoke_login_mfa_test.py`（本机 mock 堡垒机 + 真 sidecar，paramiko 缺失时 SKIP）。
+
+## 终端内 Quick Sudo
+
+工作台终端输出流经统一的 sudo 检测与自动应答状态机：
+
+- 出现 sudo 密码提示（`[sudo] password for …` / `Password:`）时自动注入密码并回车；sudo 需要的 2FA 验证码在配置了 `totp_prompt_hint`（或处于 `password_plus_otp` 模式）时自动应答，每个认证序列只应答一次。
+- 通用提示仅在配置自定义提示词时应答，避免误答其他交互程序（保守策略）。
+- **并发同靶排队**：批量发送把 sudo 命令写入同一 host:port 的多个会话时，各会话的 OTP 提示几乎同时出现，而当前窗口唯一的码已被先到的会话提交、重放保护拒绝重复注入——后到的提示不再永远搁置，而是推迟到下一个 TOTP 窗口边界（+1s）由终端读循环（250ms tick）自动补答新窗口的码（静态恢复码不变，不推迟）；期间检测到 shell 提示符即照常复位。
+- 检测到 shell 提示符（行尾 `$` / `#`）即重置状态机。`sudo_source=off`（旧 `quick_sudo=false` 同义）或只读连接时整体停用；每次自动应答（含推迟补答）发出 `ssh/auto-sudo` 事件（`kind` 为 `password` / `otp`）供宿主审计。
+
+## 自动交互触发器（Expect）与外部密码管理器
+
+对标 tssh「自动交互（Expect 系列）」与「外部密码管理器（PasswordCommand / PassphraseCommand）」的两组连接级特性（manifest 字段 `triggers_enabled`、`triggers`、`trigger_answer_1`、`trigger_answer_2`、`password_command`、`passphrase_command`；仅作用于交互终端会话的 PTY 输出，exec/命令通道不接入）。tssh 官方项目与配置参考见 <https://github.com/trzsz/trzsz-ssh>；本插件保留一个整段文本输入框，不把 Expect 阶段拆成多组表单字段：
+
+- `triggers_enabled`（boolean，binding config，默认 `false`）：连接表单独立总开关。关闭时即使 `triggers` 仍有旧文本也不会解析、校验或挂载引擎；统一默认关闭，必须手动打开。
+- `triggers`（textarea，binding config，仅在 `triggers_enabled=true` 时显示；默认空）：expect 式有序阶段规则，接受 JSON 对象（宿主 lifecycle payload）与 JSON 字符串（表单 textarea）两种形态，JSON 顶层可选 `"enabled": false`（0.4.77 起）——保留规则的同时显式关闭引擎，缺省或 `true` 行为不变。字符串形态另兼容 tssh（trzsz-ssh）文本规则（0.4.77 起）：文本非法 JSON 但含 `Expect*` 指令即按 tssh 规则解析，`#!!` / `#!` / `#` 前缀可选——全局指令 `ExpectCount`（**0 即显式关闭**；缺省时按已列阶段数生效，不让粘贴的规则静默失效；正值截断超出序号的阶段）、`ExpectTimeout`、`ExpectSleepMS`、`ExpectPassSleep`（no|none|each|enter），阶段指令 `ExpectPatternN`、`ExpectSendTextN`、`ExpectSendOtpN` / `ExpectSendEncOtpN`（本地命令取 stdout，即 `sendCommand`；Enc 形态为 tssh `--enc-secret` 密文解密后取命令）、`ExpectSendPassN` / `ExpectCaseSendPassN <pattern> <enc>`（tssh `--enc-secret` 密文，**按 tssh 同款算法解密**——hex(nonce12 ‖ AES-256-GCM(ct‖tag))，固定内嵌密钥与 tssh 源码逐字节一致）、`ExpectSendTotpN` / `ExpectSendEncTotpN`（RFC 6238 TOTP：HMAC-SHA1、6 位、30 秒步长，命中时按当前时间生成验证码，与 pquerna/otp 默认参数逐字节兼容）及 `ExpectCaseSendTextN <pattern> <text>`；非合法正则的 pattern 按字面量匹配兜底（tssh README 示例 `*assword` 即非合法正则）。JSON schema：`{ "timeoutSecs": 30, "sleepMs": 100, "passSleep": "none", "enabled": true, "stages": [ { "pattern": "(?i)verification code", "sendText": "654321\\r", "sendSecretKey": "trigger_answer_1", "sendSecret": "字面密文", "sendTotp": "base32 TOTP 密钥", "sendCommand": "oathtool --totp -b %h", "casePattern": "\\(yes/no\\)", "caseSendText": "y", "caseSendSecretKey": "trigger_answer_2", "caseSendSecret": "字面密文" } ] }`（`sendSecret` / `sendTotp` / `caseSendSecret` 为 0.4.77 新增，承接 tssh 密文/TOTP 解密产物；连接配置持久化的是原始输入文本，解密值只在会话内存存活）。每阶段 `pattern` 必填（Rust `regex` crate 语法，支持 `(?i)`，≤512 字符）；应答 `sendText` / `sendSecretKey` / `sendSecret` / `sendTotp` / `sendCommand` **五选一**；case 组可选，`caseSendText` / `caseSendSecretKey` / `caseSendSecret` **三选一**。取值范围：`timeoutSecs` 1–600（默认 30）、`sleepMs` 0–5000（默认 100）、`passSleep` ∈ none|each|enter（默认 none）、阶段数 1–16、`sendText`/`sendSecret` ≤4096 字符、`sendTotp` 解码后 ≤64 字节、`sendCommand` ≤1024 字符。`sendText` 转义：`\r` `\n` `\t` 解释为控制字符、`\|` 为分段停顿符（段间停 `sleepMs`），其余反斜杠原样；密文/TOTP/命令应答自动补 `\r`。**校验失败行为**：非法 JSON / 非法 hex 或解密失败的 `--enc-secret` blob / 非法 base32 TOTP 密钥 / 不可编译正则 / 字段组合错误 / 超限 → 连接解析直接失败并报明确错误，不静默降级（tssh 文本形态仅 pattern 字面量兜底一处放宽）。
+- 引擎语义（sidecar 终端读循环内）：PTY 输出经 ANSI 剥离归一化后进入 ≤8 KiB 滚动缓冲，跨 chunk 匹配；阶段命中即消费已匹配文本并推进游标（末阶段后回卷，序列可重复）；`casePattern` 命中即应答但**不推进**游标，答完继续等本阶段 pattern；行尾 `$` / `#` shell 提示（与终端内 Quick Sudo 同一判据）将游标归零（一轮结束后可再次触发）。**超时只在序列中途生效**（已命中前序阶段、在等第 2..N 阶段）——空闲等待第一阶段是事件驱动的无限期等待，不设超时、不产生 timeout 事件（否则闲置会话每 `timeoutSecs` 刷一次事件）；超时将游标归零，会话继续不断连。`passSleep` 仅作用于密文/命令应答：none 整段+回车一次写入、each 逐字符按 `sleepMs` 停顿、enter 先应答、停 `sleepMs` 再回车。
+- 密文槽位（对齐 tssh `ExpectSendPass`）：`sendSecretKey` 引用 `connection_secrets.trigger_answer_1` / `trigger_answer_2`（manifest 各一个 password 字段，走宿主 secret binding）。槽位名固定两个；引用未知或未填充的槽位时连接失败。tssh `ExpectSendPassN` 的 `--enc-secret` 密文则按 tssh 同款固定密钥在 sidecar 内解密（同为混淆而非加密），无需密文槽。
+- 事件 `ssh/trigger`：每次自动应答 / 超时发出 `{ sessionId, stage(1-based), kind: "text"|"secret"|"command"|"timeout" }`，**永不携带应答内容**（密文不出 sidecar）。`sendCommand` 本地执行失败时什么都不发送、不发事件（stderr 只记失败原因如退出码/超时）。
+- 防双答互斥：触发器引擎在终端读循环中**先于**终端内 Quick Sudo 观察输出；同一 chunk 至多被其中之一自动应答（触发器命中则该 chunk 跳过 auto-sudo，反之亦然）。
+- `password_command` / `passphrase_command`（text，binding config，默认空；对齐 tssh 同名配置）：登录密码 / 私钥口令缺失时本地执行命令取回（gopass、1Password CLI、`oathtool` 等）。占位符 `%h` host、`%u` username、`%p` port、`%n` 连接名（缺省回退连接 id）、`%%` 字面 `%`（其余 `%x` 原样保留）；unix `sh -c` / windows `cmd /C` 执行，10 秒超时，stdout 去掉**单个**结尾换行后为凭据（输出上限 4096 字节，超出按失败处理）。优先级：既有显式凭据（宿主 secret binding / 表单密码）> 命令；配置了 `password_command` 时密码类认证允许不存储密码；`passphrase_command` 仅在密钥确实无法无口令解码时执行。解析点：拨号认证的 orchestration 构建前一次性解析，结果回填后供密码链（password / keyboard-interactive）与 sudo 编排共用，单次连接只执行一次命令。
+- MCP：连接类工具新增可选参数 `triggers`（JSON 字符串，同上 schema）、`passwordCommand`、`passphraseCommand`（字符串），与存储路径同一套解析校验，非法即拨号报错；内联拨号没有 secret binding，`sendSecretKey` 引用槽位即报错。MCP 的 `triggers` 是显式参数，不受连接表单 `triggers_enabled` 影响。
+- `triggers/validate`（sidecar RPC）：复用同一 parser 做 JSON/tssh 语法检测，返回 `valid`、`enabled`、`format`（`empty`/`json`/`tssh`）和阶段数；失败只返回定位错误，不回显 secret、解密结果或 TOTP key。连接表单若不能调用该 RPC，`connection/test` 仍在启用时执行同一最终校验。
+- **安全声明**：①恶意服务器可伪造匹配提示骗取回发内容（含密文槽位的值）——`pattern` 只应指向明确可信的提示序列，密文仅用于该连接上明确配置的场景；②`sendCommand` / `password_command` / `passphrase_command` 以当前用户权限在本地执行，命令完全来自用户自己的连接配置（插件不提供任何默认命令，MCP 工具描述不推广命令执行面）；③密文 / 凭据内容绝不进日志、事件或错误信息，命令输出用后 zeroize。
+
+## ZMODEM 触发检测（`ssh/zmodem`，#90）
+
+远端 `sz` 通过在 PTY 上发送 ZRQINIT 头开启 ZMODEM 下载会话。**ZMODEM 下载（接收）是插件功能**：前端 sentry（zmodem.js）常驻消费 `ssh/terminal/out` 帧，检测边沿即自动确认会话并接管收流（见下「ZMODEM 下载接收」）。SSH PTY 会话（仅 stdout 流）在输出泵上另挂一个纯状态机检测器（`backend/src/zmodem_detect.rs`）——它**不改写任何字节**，只在识别到 ZRQINIT 时产出一次事件边沿，供观测与 UX 兜底：
+
+- **识别序列**：ZMODEM 帧起始哨兵 `2A 2A 18` + 帧类型字节（`'B'`=ZHEX/`'A'`=ZBIN/`'C'`=ZBIN32，lrzsz 命名与 spec 相反处见模块注释），帧类型为 ZRQINIT（0x00；hex 帧为 ASCII `"00"`）即命中——lrzsz `sz` 的上线与重试都是 `zshhdr` hex 帧 `**\x18B00…\r\x8a\x11`。
+- **命中行为**：字节一律原样透传（协议帧由前端 sentry 消费）；40s 事件窗口内重试不再重复发事件，窗口过后自动复位（后续 `sz` 会再次上报）。跨 binary 帧切割安全：哨兵与类型位可分帧携带（部分候选跨帧 carry，≤5 字节）。
+- **不受影响**：ZRINIT（0x01，远端 `rz` 上传）与其它帧类型不触发事件；普通文本（含字面 `**`）照常透传。
+- **边界**：本地终端 / 串口 / telnet 通路未接检测器（远端 sz 场景仅 SSH PTY）；会话录制文件会包含 sz 协议帧（与 trzsz 帧现状一致）。
+
+## ZMODEM 下载接收（远端 sz 自动接收）
+
+远端 `sz` 发起的下载由前端 zmodem.js sentry 自动接管（`useZmodem` 接收状态机 + `lib/terminalZmodem.ts` 接收辅助），无需用户在终端手敲任何命令：
+
+- **接管条件**：sentry `on_detect` 且会话角色为 `receive` 时自动 `confirm()` 并立即 `session.start()`——ZRINIT 邀请帧由 `start()` 发出（confirm 只建会话不说话，漏调 start 的 sz 会等 ZRINIT 超时静默退出，真机 E2E 冒烟抓到过该缺陷）；仅当本地有待上传文件（rz 上传占流）或 trzsz 正在传输时 deny（deny 即发送 ZMODEM abort 序列，远端 `sz` 干净退出）。
+- **文件名安全**：offer 文件名是远端可控字符串，落盘前经 `sanitizeZmodemFileName` 净化——剥离路径段（POSIX/Windows 分隔符，`../../` 逃逸不生效）、去控制字符与 Windows 非法字符、保留名（CON/NUL/COM1…）加前缀、去尾部点空格、限长并保证非空。
+- **落盘三段式**（与 trzsz tsz 下载同一优先级，`useTrzsz.saveTrzszDownloadedFiles` 对齐）：①宿主 `fileTransfer`（optional 1.1 特性）：`beginSave` 打开目标后随 `on_input` 逐块流式写（`write(handleId, offset, chunk)`），不在内存攒整文件；②sidecar `local/saveFile`：本机落盘，支持下载目录设置/「每次询问」（按批次只问一次）与撞名冲突策略（rename/overwrite，取消只跳过该文件），完成后可「在文件夹中显示」；③浏览器 `saveFile` 兜底（web/docker 模式，sidecar 不在本机）：单次整包，上限 512 MiB。
+- **进度与取消**：overlay（`.zmodem-status`）显示文件名/百分比/文件计数/速度（1s 窗口 EWMA，与 trzsz 同款 `sampleTransferSpeed`）；取消按钮 `session.abort()`（CAN×5+BS×5）。取消语义按 lrzsz 实测校准：sz 流式 ZCRCG 块不读 stdin，CAN 序列在当前文件发完后才被看到——本地侧 abort 即死（字节丢弃、overlay 复位），远端滞后退出；会话关闭/切换时静默 teardown。
+- **完成语义与收尾容错**：会话正常结束（ZFIN/OO）后按实际保存文件数发完成通知；保存失败中止会话并报错（`zmodemReceiveFailed`）。lrzsz sz 的 `saybibi` 只等 10s 接收方 ZFIN，慢了就直接退出不发 "OO"，随后的 shell 提示符字节会让 zmodem.js 在 post-ZFIN 解析上抛 PROTOCOL 异常——文件已全数落盘时该异常按成功收尾（成功通知），不惊吓用户。
+- **端到端验收**：`scripts/smoke_zmodem_receive.py` + `scripts/zmodem_receive_bridge.mjs`（真实协议对：容器内 lrzsz sz ↔ 生产同款 zmodem.js，过真 sidecar PTY 泵；三用例——单文件 md5 对照、多文件中文名/空格 md5 对照、中途取消；需 node + frontend/node_modules + DBX_PLUGIN_SIDECAR，缺件 SKIP）。
+
+## Sudo 文件操作
+
+`sudo/*` 方法族在不以 root 登录的前提下管理远端 root 文件，覆盖完整的 Sudo 文件操作族（`StatSudo` / `ListDirSudo` / `ReadFileSudo` / `WriteFileSudo` / `MkdirSudo` / `RemoveSudo` / `RemoveAllSudo` / `ChmodSudo` / `RenameSudo`）。全部方法复用 `ssh/exec` 的 Quick Sudo 编排（密码 / TOTP 自动应答、`auth_flow_mode`、提示词、`sudo -nv` 保活），在远端以 sudo 权限执行命令并解析输出：stat 走 `stat -c`，list 走 `ls -la --time-style=+%s`，read 走 `dd` / `base64`，write 走 `dd of=`。
+
+公共参数：每个方法都必填 `sessionId`（string，会话 id），下文参数表不再重复列出。共同错误情形：
+
+- 只读连接拒绝全部写操作（`touch` / `write` / `mkdir` / `remove` / `removeAll` / `chmod` / `rename`），错误信息与 SFTP 写操作一致；
+- sudo 不可用（未配置密码且 `sudo -n` 失败、密码 / TOTP 认证失败、超过应答轮次）立即报错；
+- 路径不存在按各方法说明处理（`exists` 返回 `false`，其余报错）。
+
+### sudo/stat
+
+查询单个远端路径的元信息。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 远端绝对路径 |
+
+返回 `{ path, kind, size, modifiedAt, mode, owner, group }`：`kind` 取 `file` / `directory` / `symlink` / `other`；`size` 为文件字节数（目录可省略）；`modifiedAt` 为 Unix 秒级时间戳；`mode` 为八进制权限位字符串（如 `0644`）；`owner` / `group` 为属主 / 属组名。错误：路径不存在；sudo 不可用。
+
+### sudo/exists
+
+检查路径是否存在，参数同 `sudo/stat`（`sessionId`、`path`）。返回 `{ exists: bool }`，路径不存在不算错误。
+
+### sudo/touch
+
+创建空文件，或刷新已有文件的访问 / 修改时间戳。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 目标远端路径 |
+
+无附加返回字段。错误：父目录不存在或无权限；只读连接；sudo 不可用。
+
+### sudo/listDir
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 远端目录路径 |
+
+返回 `{ path, entries }`，`entries` 为 `SftpEntry` 数组，结构与 `sftp/list` 完全一致（含 `lossy` 标记）（`name`、`uri`、`kind`、`size`、`modifiedAt`、`permissions`、`contentType`，可选字段缺省时省略），并恒定附带 `owner`/`group` 属主与属组名字（来自 `ls -la` 解析，无额外往返；解析不到时省略）。错误：路径不存在或不是目录；sudo 不可用。
+
+### sudo/readFile
+
+按偏移分片读取文件内容。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 远端文件路径 |
+| `offset` | number | 是 | 起始字节偏移 |
+| `length` | number | 是 | 请求读取的字节数 |
+
+返回 `{ dataBase64, truncated }`：内容以 base64 编码返回；实际返回少于 `length` 字节（如已到文件末尾）时 `truncated` 为 `true`，调用方据此推进 `offset` 续读。错误：路径不存在或不是普通文件；`offset` 超出文件大小；sudo 不可用。
+
+### sudo/writeFile
+
+整体覆写小文件。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 目标远端路径 |
+| `dataBase64` | string | 是 | 完整文件内容（base64） |
+
+解码后不得超过 4 MiB，超限直接报错——大文件必须改走 `sftp/upload/*` 上传槽。错误：载荷超限；父目录不存在或无权限；只读连接；sudo 不可用。
+
+### sudo/mkdir
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 待创建目录路径 |
+
+错误：路径已存在；父目录不存在或无权限；只读连接；sudo 不可用。
+
+### sudo/remove
+
+删除单个文件或空目录，不递归。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 待删除路径 |
+
+错误：路径不存在；目标是非空目录（改用 `sudo/removeAll`）；只读连接；sudo 不可用。
+
+### sudo/removeAll
+
+递归删除目录树。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 待删除路径 |
+
+递归删除，不跟随符号链接——只删除链接本身，不触碰其指向的目标（防误删语义）。错误：路径不存在；只读连接；sudo 不可用。
+
+### sudo/chmod
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 远端路径 |
+| `mode` | string / number | 是 | 八进制权限位，最大 `7777`（与 `sftp/chmod` 约定一致） |
+
+错误：路径不存在；只读连接；sudo 不可用。
+
+### sudo/rename
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `sourcePath` | string | 是 | 原路径 |
+| `targetPath` | string | 是 | 新路径 |
+
+重命名 / 移动，语义等价 `mv`。错误：`sourcePath` 不存在；`targetPath` 父目录不存在或无权限；只读连接；sudo 不可用。
+
+## 扩展文件操作
+
+`sftp/*` 扩展方法基于 russh-sftp 原生协议与远端 `tar` 命令，提供 `Stat` / `Exists` / `Touch` / `WriteFile` / `Archive` / `Extract` 能力，走常规 SFTP 通道（无 sudo）。公共参数：均必填 `sessionId`（string，会话 id），下文参数表不再重复列出；写操作（`touch` / `write` / `archive` / `extract`）被只读连接拒绝。
+
+### sftp/list
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 远端目录路径 |
+| `includeOwner` | boolean | 否 | 是否附加属主/属组信息，默认 `false` |
+
+返回 `{ entries: SftpEntry[] }`。`SftpEntry` 基础字段：`name`、`uri`、`kind`（`file`/`directory`/`symlink`/`other`）、`size`、`modifiedAt`、`permissions`、`contentType`（可选字段缺省时省略）、`lossy`（布尔，文件名含 U+FFFD 替换字符时为 `true`，false 时字段省略——上游 lossy 解码后原始字节已不可恢复，UI 据此显示警示标记；语义详见下方 M14-B 文件名编码段）。
+
+**文件名编码（M14-B / M15-B）**：偏好 `sftp_name_encoding`（`auto`/`latin-1`，默认 `auto`）控制列表文件名的显示解码。`auto` 走高层客户端（合法 UTF-8 服务器字节往返无损），wire 名含 U+FFFD（上游 lossy 解码已替换非法字节）时条目附带 `lossy: true`（false 时字段省略）。`latin-1` 改走独立裸包客户端（SFTPv3，严格串行）拿原始文件名字节：`name` 为 latin-1 解码的显示文本，`uri` 中的文件名为 `%XX` 转义的 wire 形式——**传输路径始终用服务器原始字节/转义形式，显示层解码绝不回灌**；下载这类条目时 sidecar 自动把转义还原为原始字节走 raw OPEN/READ（每 chunk 独立 open/close；`start` 的 size 探测同样整条还原后走裸包 STAT——M21 收口）。**下载路径形态契约（M27-A 明示）**：latin-1 生效时下载族入口（`sftp/download/start`/`next`、`sftp/download/tree/start`）的 `remotePath` 必须是**本节列表回传的 wire 形式**（前端 `pathFromUri(entry.uri)`）——`escape_wire` 把字面 `%` 自转义为 `%25`，因此 wire 字符串中出现的 `%XX`（X∈hex）唯一解读就是转义还原；该入口从不接受用户字面输入的显示文本，真实文件名含字面 `%XX` 序列（如 `caf%E9.txt`）时列表回传的 wire 形式为 `caf%25E9.txt`，回传后往返无损。M15-B 段「输入中的字面 `%XX` 序列保持字面量，不再转义」限定于**写操作的末段用户新输入显示编码**（`latin1_encode_display` 分工，见下段 M16 两条分工），与下载车道的 wire 整条还原是不同分工，不构成矛盾。**回退口径按车道区分（2026-09-26 审计修正）**：列表 raw 路径失败（服务器版本协商/异常包）自动回退高层客户端（只读安全）；下载车道（size 探测与分块读取）不做回退，raw 失败原样上抛——转义名在高层客户端本就打不开，回退只会重演同一错误。**车道判定按生效编码区分（M28-B 修 D-7）**：下载 raw 车道仅在 latin-1 生效且 wire 含 `%XX` 转义时进入（`has_wire_lane` 收口判定）；auto 生效时一律走高层客户端——auto 列表 uri 字面 `%` 未经 `%25` 自转义，wire 串里的 `%XX` 是文件名字面量而非转义，不还原（auto 以字面量语义与列表一致）。**M16 连接级覆盖**：编码判定来源升级为「连接覆盖 > 全局偏好 > 缺省 auto」——覆盖存储在偏好键 `sftp_name_encoding_overrides`（语义见 `local/preferences` 行），全局偏好缺省时的行为完全不变；本节所述 raw/auto 两条路径的语义只取决于**最终生效的编码值**，与它来自连接覆盖还是全局无关。
+
+**M15-B 起 latin-1 模式下路径写操作同样走裸包客户端字节保真**：`sftp/rename`、`sftp/delete`（含 `recursive: true` 的递归树删）、`sftp/createDirectory` 对路径参数先还原为服务器原始字节再发送 raw RENAME/REMOVE/RMDIR/MKDIR（判型用 raw LSTAT，symlink 绝不跟随，与 auto 语义一致）。路径处理规则：目录前缀（列表回传的 wire 形式）按 `%XX` 转义还原；rename 目标 / mkdir 名这类**用户新输入的最后一段**按 latin-1 显示编码回字节（>U+00FF 的字符按 UTF-8 兜底；输入中的字面 `%XX` 序列保持字面量，不再转义）。裸包客户端**建立**失败时自动回退高层客户端（此时尚未发出任何请求，回退安全）；操作已发出后的失败原样报错，不回退（避免重复执行写操作）。`auto` 模式下所有操作行为完全不变（继续走高层客户端）。
+
+**M16 起 latin-1 裸包字节保真覆盖全部前端 SFTP 写路径**。裸包客户端补齐写侧操作（OPEN(creat|write|trunc)/WRITE/SETSTAT/READLINK/SYMLINK，SYMLINK 按 OpenSSH wire 次序装包，与高层 `symlink(target, linkPath)` 的生产行为一致）。路径来源分两类，还原分工固定：
+
+- **「wire 目录前缀 + 用户新输入的显示末段」**——`sftp/touch`（新建文件）、`sftp/symlink-create`（新链接名）、`sftp/exists`（rename 覆盖/上传撞名预检的目标路径）、`sftp/rename-unique`（上传撞名探测，候选名连 `(n)` 增量一起按显示编码；返回的 `name` 保持显示形式，回传给上传后按同一分工编码出同一组字节）、`sftp/upload/start|finish`（远端落盘名 = 前端 `joinRemote(当前目录, 本地文件名)`）：目录前缀按 `%XX` 还原、末段按 latin-1 显示编码回字节（即 M15 的 `write_path_bytes` 分工）。
+- **「整条 wire 路径」**——`sftp/write`（前端回传 `pathFromUri(entry.uri)` 与 watcher 的 remote-edit 目标）、`sftp/upload-local`（watcher 登记的 wire 路径）、`sftp/symlink-update`（链接路径）、`sftp/rename` 源路径、`sftp/delete`：整条按 `%XX` 还原为服务器字节（wire 的 `%` 自转义保证字面 `%XX` 名往返不吞）。`symlink-read` 的指向文本按 latin-1 显示解码返回，`symlink-update` 再按显示编码回字节，读↔写在 latin-1 域内闭环。
+
+上传/直写均保持「暂存 ASCII 临时文件 → 权限位保留（SETSTAT `0o7777`）→ 原子 rename 落位 → 失败清理/回滚」的提交语义（权限保留对齐高层 issue #37 行为），上传分块按 ≤32 KiB 切分（SFTPv3 兼容上限）。回退策略同 M15：仅裸包客户端**建立**失败回退高层客户端。
+
+**M17 起 latin-1 字节保真补齐读侧与粘贴/拖入链**（M16 遗留 ①② 收尾）：
+
+- **粘贴预检与底层 copy/move**：`sftp/exists` 新增可选参数 `form: "wire"`——粘贴预检（`pasteClipboard`）传来的整条路径是列表回传的 wire 形式，latin-1 下整条按 `%XX` 还原后 raw LSTAT（此前末段被按「新输入显示文本」编码，非 UTF-8 名探不到）；缺省（rename 覆盖预检、上传撞名预检）仍按「wire 前缀 + 显示末段」分工。`sftp/copy`/`sftp/move` 的 `from`/`toDir` 同为 wire 形式：`overwrite: false` 的覆盖预检在 latin-1 下改为逐个裸包 LSTAT（目标整条还原字节），同目录 move 的 SFTP rename 快路径改走裸包 RENAME（SFTPv3 不覆盖已存在目标，撞名/跨设备失败与原先一致回落 shell `mv`）；裸包客户端**建立**失败回退既有字面量路径。**设计边界（登记）**：底层执行仍是远端服务器侧 `cp -a --` / `mv -f --`，SSH exec 的命令串是 UTF-8 String，服务器原始字节经 shell 参数不可控——copy 与跨目录 move 的执行层不做字节保真迁移：clean 名（无转义）行为不变，转义名由服务器侧报错。
+- **终端拖入上传的目标目录**：拖入落点询问弹窗的「当前目录」选项（shell cwd OSC 7/633 回读 → sftp home 探测 → 面板当前目录兜底）与「指定目录」手输路径都是显示文本，前端在 latin-1 下经 `displayPathToWire`（与 sidecar `latin1_encode_display` + `escape_wire` 组合逐字符等价：ASCII 字面量透传、`%` 自转义为 `%25`、U+0080..=U+00FF 按码位转义 `%XX`、>U+00FF 的字符按 UTF-8 兜底）转成 wire 形式后与本地文件名 join，整条符合 `write_path_bytes` 的「wire 目录前缀 + 显示末段」分工；面板当前目录兜底本就走列表链的 wire 形式，原样透传。**已知边界（登记）**：shell cwd 回读中非 UTF-8 的服务器字节在终端解码层已丢失（U+FFFD），无法还原为 latin-1 字节，该场景不做恢复。
+- **查漏补缺**：`sftp/stat`（属性对话框）与 `sftp/chmod`（权限编辑）在 latin-1 下整条 wire 还原后走裸包 LSTAT/SETSTAT（此前字面量发送，转义名探不到）；裸包 v3 attrs 不携带 uid/gid，`sftp/stat` 的属主/属组仍经 `stat -c` shell 查询尽力而为（转义名下该查询受上述 shell 字节边界限制，失败显示 `-`），元数据主体（kind/size/mtime/mode）不受影响。
+- **shell 拼装入口的分层现状（登记；M26-A 文档审计修正，取代此前「仍按字面量发送」的过时表述）**：`sftp/diskUsage`（工作台与 MCP 两面路径均先 `normalize_remote_path` 再拼 `df -kP`）、`sftp/archive`/`sftp/extract`（`sourcePaths` 经 `clean_source_paths` 逐个归一，`archivePath`/`destinationPath` 归一，远端 `tar`/`mkdir -p` 命令逐参数 `shell_quote`）、sudo 模式全族（`sudo/stat`/`exists`/`touch`/`listDir`/`readFile`/`writeFile`/`mkdir`/`remove`/`removeAll`/`chmod`/`rename` 与 `sudo/download/*` 的路径参数全部归一 + `shell_quote`，`ls -la`/`stat`/`cat`/`head`/`tail`/`touch`/`mkdir -p`/`rm`/`chmod`/`mv`/`mktemp`/`chown` 均无裸拼路径）。这些入口的现状是「**路径参数已 normalize + shell_quote**」（穿越/注入安全），而非字面量裸拼；但 **shell 参数字节保真不可达**——SSH exec 的命令串是 UTF-8 String，latin-1 字节名（0x80–0xFF 单字节）经该边界按 UTF-8 重编码发出，远端按其 locale 解释，与服务器文件名的原始字节不一致：含转义/非 UTF-8 字节的名字经这些入口仍可能由远端报错（`df: no such file`、`tar: cannot stat` 类）或落到错误路径，clean 名（纯 ASCII）行为不变。sudo 族另维持一点原状：路径本就来自用户输入的显示文本，没有 wire 形式的名字来源，latin-1 裸包车道对其不适用。核实结论：该登记段原列入口经后续迭代（MCP diskUsage 见 M25）均已具备归一 + 引用，**没有完全字面量裸拼的残留入口**；真正不可变的是 exec 命令串的 UTF-8 字节边界本身，与同段 M17-A 登记的 copy/move 执行层、`stat -c` 属主查询边界同源。
+
+
+**M17 起 MCP 工具面复用同一编码判定并迁移列表/写工具（字节保真闭环）**：MCP 连接类工具在连接上下文内执行，编码判定直接复用连接级优先链——工具 `arguments` 的 `connectionId`（dispatch 层已把 `connectionName`/端点选择器归一化为该字段，stdio 与 `mcp/call` 同构）命中 `sftp_name_encoding_overrides` 时优先，否则跟随全局 `sftp_name_encoding`，缺省 auto；内联拨号（无 registry 身份）按未覆盖处理。latin-1 生效时：`sftp_list_dir` 改走裸包 READDIR（与工作台列表同源），**名字口径为显示形式**——`name`/`path` 均为 latin-1 解码文本（与工作台看到的显示名一致，不向 AI 消费者暴露 `%XX` wire 噪声），`.`/`..` 跳过，kind 按 v3 类型位归类（缺 permissions 退回 `file`）；MCP 面写/变更工具已随 #203 瘦身移出（`sftp_write_file`/`sftp_upload`/`sftp_download` 保留裸包字节保真，见下），变更族改走 `ssh_exec` shell 命令。**往返闭环**：latin-1 解码输出恒在 U+0000..=U+00FF 域内，显示 → 字节的 `latin1_encode_display` 是其精确逆变换——AI 把列表返回的 `path` 原样回传给保留的读写工具即落回原始字节（单测覆盖）。回退策略与工作台一致：列表 raw 路径任何失败回退高层（读操作安全），写操作仅裸包客户端**建立**失败回退；`auto` 模式下四个工具行为完全不变。
+
+**遗留（登记）**：① ~~粘贴预检与 `sftp/copy`/`sftp/move` 未迁移 raw~~（M17 已收尾，见上——shell 执行层的字节边界仍登记在案）。② ~~终端拖入上传的自定义目标目录按 wire 前缀处理~~（M17 已收尾，见上；shell cwd 回读的非 UTF-8 字节丢失为不可恢复边界）。③ ~~MCP 工具面其余工具按字面量发送~~（M18 已收尾，见下）。
+
+**M18 起 MCP 工具面剩余 SFTP 工具完成 latin-1 字节保真迁移（M17 遗留 ③ 收尾）**：沿用 M17-B 同一模式（显示路径整条 `latin1_encode_display` 还原字节 + 连接级裸包客户端），latin-1 生效时：
+
+- **读侧**：`sftp_stat` 走裸包 LSTAT（不跟随符号链接，与工作台 `sftp/stat` M17 同口径）；裸包 v3 attrs 不携带 uid/gid，属主数字经 `stat -c '%u %g'` shell 查询尽力而为补齐（非 ASCII 显示名的 shell 字节参数不可控——M17-A 登记边界，失败回 `null`，主元数据不受影响）；工作台 `sftp/exists` 走裸包 LSTAT，**只把 SSH_FX_NO_SUCH_FILE 映射为「不存在」**，其余错误如实上抛（auto 分支「权限错误绝不误报 exists:false」契约保持）；`sftp_read_file` 走裸包 OPEN(READ)+READ 分块循环（32 KiB 粒度，v3 规范建议口径），大文件策略沿既有 MCP 边界——单次至多 `maxBytes`（上限 maxDownloadBytes），超出标记 `truncated`，`offset` 分页起点显式携带。
+- **写侧**：`sftp_write_file` 走裸包 OPEN(CREAT|WRITE|TRUNC) 截断直写 + WRITE 32 KiB 分块（**选型**：MCP 面沿既有直写语义，无工作台上传族的 `.dbx-part` 暂存需求；`overwrite=false` 的覆盖预检走裸包 LSTAT，与写入同一字节口径）。
+- **copy/move**：工作台 RPC 面（`sftp/copy` / `sftp/move`）沿 M17-A 同模式接入裸包车道（路径口径为 wire 转义形式）：`overwrite=false` 的覆盖预检逐个裸包 LSTAT，同目录 move 的 RENAME 快路径走裸包 RENAME（SFTPv3 不覆盖已存在目标，失败回落 shell `mv`）。**执行层边界（登记，同工作台）**：远端 `cp -a --`/`mv -f --` 的 exec 命令串是 UTF-8 String，服务器原始字节经 shell 参数不可控——copy 与跨目录 move 的执行层保持字面量发送：clean 名（纯 ASCII）行为不变，非 ASCII 名由服务器侧报错。MCP 面同名工具已随 #203 瘦身移出。
+- **回退策略与 auto 不变性**：读操作（read_file/list_dir）裸包路径任何失败回退高层（读安全）；写操作（stat/exists/write_file/chmod/copy/move 的操作阶段）仅裸包客户端**建立**失败回退，操作错误原样上抛不重试；`auto` 模式下全部工具行为不变。每工具均有 latin-1 往返闭环单测（内存双工桩，字节级断言）。
+
+**M19 起 MCP 传输工具 `sftp_upload`/`sftp_download` 完成 latin-1 字节保真迁移（编码保真家族收尾）**：沿用 M17-B/M18 同一模式（显示路径整条 `latin1_encode_display` 还原字节 + 连接级裸包客户端），latin-1 生效时——`sftp_upload` 走裸包 OPEN(CREAT|WRITE|TRUNC) 截断直写 + WRITE 32 KiB 分块（**选型**：沿既有 MCP 传输直写语义，无工作台上传族的 `.dbx-part` 暂存需求；`overwrite=false` 的覆盖预检走裸包 LSTAT，与写入同一字节口径，复用 M18 `sftp_write_file` 直写核心）；`sftp_download` 走裸包 OPEN(READ)+READ 分块（读取量以 `maxDownloadBytes+1` 探测封顶，超限沿既有 post-read 口径报错；目录的 OPEN 被服务器拒绝后落回高层，由高层给出与 auto 分支一致的「is a directory」错误）。**往返闭环**：upload 响应的 `remotePath` 为显示形式，原样回传给 `sftp_download` 即命中同一组服务器字节（单测以内存双工桩断言两侧 OPEN 帧路径字节一致 + 载荷逐字节回收）。回退策略沿先例：download 读侧裸包路径任何失败回退高层重读（读安全），upload 写侧仅裸包客户端**建立**失败回退，操作错误原样上抛；`auto` 模式下两个工具行为完全不变（本地路径校验、传输根约束、敏感路径拒绝、大小上限均先于拨号，不受影响）。
+
+
+`includeOwner: true` 时，每个条目可携带可选 `owner`、`group` 字符串字段（属主用户、属组）：优先服务器直接提供的名字（SFTPv4+ 属主属性），数字 uid/gid 次之，SFTPv3 服务器（如 OpenSSH）再经一次只读 `ls -l` 往返升级为名字——该次往返失败（无 shell、无 `ls`、超时）时静默保留数字或省略字段，不影响列表本身。字段缺失即"未知"，由 UI 显示 `-`。省略 `includeOwner`（或为 `false`）时不输出这两个字段，与历史响应完全一致。`sudo/listDir` 恒定返回 `owner`/`group`（`ls -la` 解析附带，无额外往返）。
+
+### sftp/stat
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 远端绝对路径 |
+
+返回结构与 `sudo/stat` 完全一致（`{ path, kind, size, modifiedAt, mode, owner, group }`）。错误：路径不存在。`sftp_name_encoding` 为 `latin-1` 时路径整条按 wire 还原走裸包 LSTAT（M17）；裸包 v3 attrs 不携带 uid/gid，属主/属组仍经 `stat -c` shell 查询尽力而为（转义名下受 shell 字节边界限制，失败显示 `-`）。
+
+### sftp/exists
+
+参数同 `sftp/stat`（`sessionId`、`path`），另有可选 `form: "wire"`（M17）：粘贴预检传来的是整条 wire 路径，带该参数时 latin-1 模式整条按 `%XX` 还原字节探测；缺省按「wire 前缀 + 显示末段」分工（见 `sftp/list` 节 M17 段）。返回 `{ exists: bool }`，路径不存在不算错误。
+
+错误语义（M23/R1，两面对齐后口径统一）：只有 SSH_FX_NO_SUCH_FILE 判「不存在」，其余 LSTAT 失败（权限拒绝、通道异常等）如实报错——权限错误绝不误报 `exists: false`（`sftp/exists` 的 M18 契约，工作台 RPC 面同一口径）。工作台预检调用方（rename 覆盖预检、粘贴预检、上传撞名预检）对预检报错均按「无法判定、不阻断，交由后续执行时报错」的既有惯例处理——预检无法判定时报错优于误判。
+
+### sftp/read
+
+小文件直读（非传输槽，支持 `offset` 偏移分片语义）。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 远端文件路径 |
+| `offset` | number | 否 | 起始字节偏移，默认 `0`；省略或非法值按 `0` 处理 |
+| `maxBytes` | number | 否 | 本次最多返回的字节数，默认 256 KiB，上限 1 MiB（至少为 1） |
+
+**文件名编码（M19.5 落地）**：生效编码为 `latin-1` 时 `path` 是整条 wire 形式（列表回传的 `%XX` 转义路径），sidecar 整条还原为服务器字节后走裸包 READ（与下载分片同一车道）；`auto` 按 UTF-8 走高层客户端。
+
+返回 `{ dataBase64, truncated }`：内容 base64 编码；返回字节数达到 `maxBytes` 且文件还有剩余时 `truncated` 为 `true`，调用方以 `offset += 返回字节数` 续读。`offset` 在文件末尾或超出文件大小时返回空内容且 `truncated: false`（不报错，与 `sudo/readFile` 的「offset 超界报错」语义不同——SFTP 侧以空读表示 EOF）。错误：路径不存在或不是普通文件；无读取权限。
+
+### sftp/touch
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `path` | string | 是 | 目标远端路径 |
+
+创建空文件或刷新时间戳。错误：父目录不存在或无权限；只读连接。
+
+### sftp/write
+
+小文件直写（非传输槽）。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `remotePath` | string | 是 | 目标远端路径 |
+| `dataBase64` | string | 是 | 完整文件内容（base64） |
+
+先写入同目录临时 `.dbx-part` 文件，完成后原子替换目标路径，避免读到半写状态。解码后不得超过 4 MiB，超限报错并提示改走 `sftp/upload/*` 上传槽。错误：载荷超限；父目录不存在或无权限；只读连接。
+
+### sftp/archive
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `sourcePaths` | string[] | 是 | 待打包的远端路径列表（至少一项） |
+| `archivePath` | string | 是 | 输出归档路径（`.tar.gz`） |
+
+在远端执行 `tar -czf` 打包为 tar.gz。返回 `{ path, size }`（归档路径与字节数）。错误：任一源路径不存在；输出父目录不存在或无权限；远端缺少 `tar`；只读连接。
+
+### sftp/extract
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `archivePath` | string | 是 | 归档路径（`.tar.gz` / `.tgz` / `.tar`） |
+| `destinationPath` | string | 是 | 解压目标目录 |
+| `overwrite` | bool | 是 | 是否覆盖已存在的同名条目 |
+
+仅支持 tar.gz / tgz / tar；传入 `.zip` 明确报错（不支持 zip）。`overwrite` 为 `false` 且目标目录下已存在同名条目时报错。错误：归档不存在；格式不支持；目标目录不存在或无权限；远端缺少 `tar`；只读连接。
+
+### sftp/copy
+
+服务器内复制（server-internal copy & paste 语义）。源被复制**进** `toDir`，保留各自的基名；目录递归复制并保留权限（远端 `cp -a --`）。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `from` | string / string[] | 是 | 单个或多个源路径 |
+| `toDir` | string | 是 | 已存在的目标目录 |
+| `overwrite` | bool | 否 | 目标已存在时是否覆盖（默认 `false`，不覆盖时报错） |
+
+会话内 `sessionId` 与连接级 `connectionId` 二选一（`connectionId` 自动解析到该连接的存活会话）。返回 `{ success, results: [{ from, to, ok, error? }] }`：逐项执行、逐项回报，`error` 仅出现在失败项上；任一项失败则 `success` 为 `false`。`overwrite: false` 时先探测目标（latin-1 下逐个裸包 LSTAT，目标整条按 wire 还原字节；其余一轮远端 `test -e`），已存在直接按项失败。同一目录内的 move 优先走 SFTP rename（latin-1 下走裸包 RENAME，失败回落 shell `mv`）。底层 shell `cp`/`mv` 的 exec 命令串是 UTF-8 String，转义名字节的执行层边界见 `sftp/list` 节 M17 段。错误（整体）：参数缺失或非法；只读连接。
+
+### sftp/move
+
+服务器内剪切 / 移动。参数与返回结构同 `sftp/copy`；远端 `mv -f --`（`overwrite: false` 时先探测目标，存在则按项报错），移动完成后源路径不复存在。sudo 模式不做。远端 `cp` / `mv` 的执行预算为 300 秒。
+
+## 服务器指标
+
+`ssh/metrics` 以单条 POSIX 只读命令采集：`/proc` 读取器、两次 `/proc/stat` 采样（间隔 0.4s）算 CPU 利用率、`df -kP` 采集挂载、`df -iP` 采集 inode 使用率，另附网络与进程扩展——两次网络计数快照（间隔 1s；Linux 读 `/proc/net/dev`，macOS/BSD 回退 `netstat -ibn`）差分出每接口速率，`ps` 分别按 CPU 与内存排序取前 8 进程。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `sessionId` | string | 是 | 会话 id |
+| `cached` | bool | 否 | 为 `true` 时优先返回该会话上一次采集的快照（带 `cachedAt` 字段，Unix 秒）；无缓存时现采并回填。默认 `false` 现采（成功后同样回填缓存） |
+
+返回（关键字段，camelCase）：
+
+```
+{
+  "hostname": "...", "kernel": "...", "uptimeSeconds": 123456,
+  "cpu": { "cores": 8, "percent": 12.3, "load1": 0.4, "load5": 0.3, "load15": 0.2 },
+  "memory": { "totalBytes", "availableBytes", "usedBytes", "swapTotalBytes", "swapUsedBytes" },
+  "disks": [{ "filesystem", "mount", "totalBytes", "usedBytes", "availableBytes", "percentUsed",
+              "inodeUsePercent" }],
+  "network":  [{ "name", "rxRate", "txRate", "rxTotal", "txTotal" }],
+  "processes": [{ "pid", "user", "cpuPercent", "memPercent", "command" }],
+  "topMemory": [{ "pid", "user", "cpuPercent", "memPercent", "command" }],
+  "cachedAt": 1756300000        // 仅 cached 命中时出现
+}
+```
+
+`network` 速率为两次快照间的字节/秒；`rxTotal` / `txTotal` 为第二次快照的累计字节数。`processes` 为按 CPU 排序的前 8 进程，`topMemory` 为按内存占用排序的前 8 进程（两者字段同构，均为扩展字段，旧 sidecar 可能缺失——调用方按可选处理）。`disks[].inodeUsePercent` 为该挂载点的 inode 使用率（百分比数值），仅当 `df -iP` 采集到对应挂载时出现（GNU/busybox 列布局差异由解析端吸收）。`command` 截断到 120 字符。快照缓存仅存内存（每会话一份），会话关闭即清除。只读命令，只读连接同样可用。
+
+## Docker 管理面板
+
+Docker 家族（`docker/list` / `docker/logs` / `docker/action`）通过固定采集脚本 + 纯解析器驱动远端或本机容器 CLI，不接 daemon API、零新增依赖。三个方法都接受可选 `target` 与引擎/端点参数（`cli` / `socket` / `host`，兼容 Podman 与自定义 daemon）：
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `target` | string | 否 | `"ssh"`（默认）：按 `sessionId` 在远端主机执行；`"local"`：在 sidecar 所在机器执行（Docker Desktop / OrbStack / rootless），免 `sessionId`。非法值报 `Unsupported docker target` |
+| `cli` | string | 否 | 容器 CLI 命令名或全路径（默认 `"docker"`；如 `"podman"`、`"/usr/local/bin/podman"`）。字符白名单 `[A-Za-z0-9_.\\/:/-]`（1–256），shell/cmd 元字符一律拒绝 |
+| `socket` | string | 否 | daemon unix socket（如 `"/run/user/1000/podman/podman.sock"`；裸路径自动补 `unix://`；显式 `unix://` / `npipe:` 前缀直通）。与 `host` 互斥 |
+| `host` | string | 否 | daemon tcp 端点（如 `"127.0.0.1:2375"` 裸值自动补 `tcp://`；`tcp://` / `http(s)://` 直通）。与 `socket` 互斥 |
+
+端点下发机制：sidecar 把归一后的端点以环境变量形式传给 CLI——POSIX 采集脚本内 `export DOCKER_HOST=<ep> CONTAINER_HOST=<ep>`（sudo 提权重采同样烙在脚本体里，env_reset 剥不走），本机面直呼进程时 `.env()` 注入，Windows cmd 兜底用 `set` 行/`set …&&` 前缀。Docker 读 `DOCKER_HOST`、Podman 读 `CONTAINER_HOST`，一份设置两个引擎通用，且端点永不进命令行参数。
+
+- **docker/list**：返回 `{available, needsSudo, containers}`。采集脚本先探针（`command -v <cli>` + `<cli> info`，区分「未装 CLI」与「daemon socket 拒绝」），再 `<cli> ps -a --no-trunc --format` 七列制表输出（id/name/image/state/status/ports/createdAt）。脚本内预置 PATH 加固（`/usr/local/bin`、`/opt/homebrew/bin`、Docker.app、`~/.docker/bin`、OrbStack、snap 等），修复 macOS GUI 子进程与 sshd 非交互 shell 的残缺 PATH 误报「未安装」。本机面（`target:"local"`）由 `find_local_cli` 按 cli 名/路径发现 CLI（路径形态直接探测、名字形态走 PATH + 同源目录）、argv 直呼进程（无 shell、Windows 可用）。
+- **Windows 远端兜底**：输出不含 `DBXDOCKER_PROBE` 标记（cmd/PowerShell 跑不了 heredoc 的唯一签名）时，自动多花一个往返改用 cmd 版采集器（`where /q <cli>` + `<cli> info` + `<cli> ps`，CRLF 由解析端逐字段吸收；配置端点时以 `set` 行注入）；POSIX 主机恒有标记，不会触发。
+- **Quick Sudo 提权**：探针为 found-but-denied（`needsSudo: true`）且连接配置了 Quick Sudo 时，list 自动用 `sudo -S -p '' sh -c '<脚本体>'` 提权重采（密码走 stdin、脚本体走 argv）；logs 在输出命中 daemon 权限签名时同样提权重采。只读连接、sudoers 白名单拒绝、提权失败一律退回原 payload 保留提示，只读调用不报错。
+- **docker/logs**：`{sessionId|target, containerId, tail?, cli?, socket?, host?}`，返回 `{logs, container?}`；`tail` 钳制到 [10, 2000]（默认 200）。inspect 失败（容器消失）降级 `container: null`。
+- **docker/action**：`{sessionId|target, containerId, action, cli?, socket?, host?}`，动词白名单 `start/stop/restart/kill/rm`；`containerId` 必须 12–64 位小写十六进制（容器名一律拒绝）；执行前写审计（意图行 + 失败行，审计文本为 `<cli> <动词> <id>` 短形态，端点 export 只在执行文本里）。plain 失败且命中 daemon 权限签名才回落 Quick Sudo 管线（重放同一条含端点 export 的执行文本；其余失败重试可能把半执行动作应用两次）；本机面无提权管线，daemon 拒绝返回指引文案。kill/rm 由前端/MCP 确认门强制二次确认，只读连接直接拒绝。
+
+MCP 面同名工具已随 #203 瘦身移出——容器巡检/生命周期走 `ssh_exec` 执行 `docker ps` 等命令（`docker ps` 在只读白名单内，需要 daemon 权限时由 Quick Sudo/`ssh_exec_sudo` 提权）；工作台 Docker 面板继续走上述 sidecar 方法族。
+
+## 二进制通道
+
+- `ssh/terminal/in/{sessionId}`：原始终端输入。
+- `ssh/terminal/out/{sessionId}`：首字节为流类型，随后为大端 `u64` 单调序号，再后为终端数据。
+- `local/terminal/in/{sessionId}`：本地终端输入，与 `ssh/terminal/in` 同形（8 字节大端序号 + 数据）；确认事件为 `local/terminal/inputAck`，死会话镜像 `local/terminal/error`。
+- `local/terminal/out/{sessionId}`：本地终端输出，与 `ssh/terminal/out` 同帧格式（流类型 + u64 序号）；stdout/stderr 在 PTY 内合流，数据帧恒为流 0。
+- `serial/terminal/out/{sessionId}`：串口终端输出，与 `ssh/terminal/out` 同帧格式（流类型 + u64 序号），数据帧恒为 Stdout 流（读线程逐读递增序号）。
+- `telnet/terminal/out/{sessionId}`：Telnet 终端输出，与 `ssh/terminal/out` 同帧格式（流类型 + 大端 u64 单调序号 + 数据）；回附经 `telnet/replay` 按序号重发。
+- `telnet/terminal/in/{sessionId}`：Telnet 终端输入二进制写通道，帧与 `ssh/terminal/in` 同形（8 字节大端序号 + 数据，无流标签）；成功确认 `telnet/terminal/inputAck {sessionId, sequence}`（仅审计用，无重传语义），死会话/写失败镜像 `telnet/terminal/error`，语义与 SSH/local 分支一致。
+- `serial/terminal/in/{sessionId}`：串口终端输入（B1 二进制写通道），帧与输出同构（`TerminalFrame`：1 字节流标签 + 大端 `u64` 序号 + 原始键序字节），标签**恒为 `Stdin = 3`**（避开 local 终端带内状态帧占用的 `State = 2`）；非 Stdin 标签/截断帧由 sidecar 按参数错误拒绝；文件上传活动期间一律拒绝（互斥后盾，第一道闸门在前端）；拒绝与死会话镜像 `serial/terminal/error`，成功确认 `serial/terminal/inputAck {sessionId, sequence}`（sequence 仅审计用，无重传语义）。解码端遇到未知流标签（> 3）一律静默丢帧并计数，不得断连或 panic。设计依据 `docs/SERIAL_ENHANCE_DESIGN.zh-CN.md` §2。
+- `sftp/upload/{taskId}`：大端 `u64` 文件偏移加最多 256 KiB 数据；偏移必须等于服务端期待值。
+- `sftp/download/{taskId}`：大端 `u64` 文件偏移加最多 256 KiB 数据（树任务该偏移为整树聚合字节位置；队列耗尽后的 eof 应答携带 0 字节数据）。
+- `vnc/frame/{sessionId}`：VNC 帧补丁，44 字节头 + RGBA 像素负载，全部**小端**（字段表见下文「VNC 帧补丁」小节）。
+- `rdp/frame/{sessionId}`：RDP 帧补丁，与 `vnc/frame` **同一** 44 字节 patch 头 + RGBA 像素负载（全小端；字段表、校验不变式与跨端 golden 向量同「VNC 帧补丁」小节，前端解码器直接复用）。
+
+终端输出保留 2 MiB 环形缓存。前端检测到序号缺口后停止乱序输出并调用 `ssh/terminal/replay`。文件传输采用逐块 RPC 确认，不依赖广播队列可靠送达。
+
+### VNC 帧补丁（`vnc/frame/{sessionId}`）
+
+VNC 远程桌面的帧缓冲更新以 patch 帧推送：`44 字节头 | RGBA 像素负载`，所有字段一律**小端（LE）**——与 `ssh/terminal/out` 的大端序号刻意不同（逐字段对齐 NyaTerm 的 patch 协议）。字段序与偏移：
+
+| 偏移 | 长度 | 类型 | 字段 | 说明 |
+| --- | --- | --- | --- | --- |
+| 0 | 8 | u64 LE | `sequence` | 单调递增（跨重连持续），前端据此丢弃乱序补丁 |
+| 8 | 4 | u32 LE | `desktopWidth` | 桌面宽（像素，≤3840） |
+| 12 | 4 | u32 LE | `desktopHeight` | 桌面高（像素，≤2160） |
+| 16 | 4 | u32 LE | `x` | 补丁左上角 x |
+| 20 | 4 | u32 LE | `y` | 补丁左上角 y |
+| 24 | 4 | u32 LE | `width` | 补丁宽（像素） |
+| 28 | 4 | u32 LE | `height` | 补丁高（像素） |
+| 32 | 4 | u32 LE | `stride` | 字节/行；恒为 `width*4`（RGBA 紧排），作为对齐 NyaTerm 的保留字段 |
+| 36 | 4 | u32 LE | `pixelFormat` | 恒为 `2`（RGBA8888，R/G/B/A 字节序） |
+| 40 | 4 | u32 LE | `payloadLength` | 负载字节数 |
+| 44 | N | bytes | payload | RGBA 像素数据，按行存放，行尾可有 stride 填充 |
+
+编解码两侧（sidecar `encode_frame_patch` / 前端 `decodeVncFramePatch`）校验同一组不变式，任一不满足整帧丢弃（前端抛错丢帧；sidecar 判会话失败）：桌面与矩形尺寸非零；`x+width ≤ desktopWidth`、`y+height ≤ desktopHeight`（带回绕保护）；`stride ≥ width*4`；`payloadLength ≥ stride*height`；帧总长恰为 `44 + payloadLength`；`pixelFormat == 2`。桌面有界（≤3840×2160）使补丁负载天然 < 64 MiB。`sequence` 无需请求重放——丢帧只影响画面，下一帧补丁或全帧刷新（重连重画）自愈。
+
+参考实现：`backend/src/vnc_session.rs`（编码端）、`frontend/src/lib/vncFrame.ts`（解码端）；跨端 golden 向量以同一 hex 字符串硬编码在两侧测试中（`patch_frame_golden_vector_matches_frontend` / `vncFrame.spec.ts` 的 golden 断言，互指本文档）。`vnc/start {connectionId?, workbenchId, host, port?, runtimeHost?, runtimePort?, ...}` 和 `telnet/start` 同理：`host/port` 是逻辑显示端点、`runtimeHost/runtimePort` 是唯一拨号端点（省略时回退逻辑端点）；`vnc/replay {sessionId}` 通过原帧通道发送当前完整 framebuffer 并返回 `{frameCount, complete:true}`，不会新建会话。
+
+### 死会话输入事件（`ssh/terminal/error`）
+
+二进制 handler 失败只落 sidecar stderr（SDK 循环仅日志），工作台原本对"输入撞上已消失会话"毫无感知——终端看似在线实则打不进字。与 `sftp/upload/error` 同理，`ssh/terminal/in/{sessionId}` 处理失败时镜像发事件 `ssh/terminal/error { sessionId, error }`（错误串即 `write_terminal` 原文，会话不存在时为 `SSH session was not found or expired`，与 `session()` 同契约）。前端收到后按传输断开的同款有界退避梯子自动重连；`ssh/terminal/replay` 因会话消失报错时，前端同样将序号游标 resync 过缺口（让卡在缓冲里的 `ssh-transport-disconnected` 状态帧得以放出）再进入重连。
+
+### 上传两阶段计数与收尾语义（issue #60）
+
+上传事件 `sftp/transfer/progress` 携带 `phase` 字段区分两个独立计数（各自从 0 起步）：`staging` = 字节缓存进本地 spool 文件（`transferred` = 已缓冲字节数，速率≈本机磁盘），`uploading` = 字节真正推送到 SFTP 服务器（`transferred` = 已推送字节数，速率≈网络）。工作台只在 `uploading` 阶段采样速度、并按阶段钳制进度单调，避免"3G→100M 回跳"与"20MB/s 假速度"。`sftp/transfer/list` / `sftp/transfer/status` 的上传行同样带 `phase`（staging 行的 `transferred` 为 spool 字节数）。下载事件无 `phase`。
+
+`sftp/upload/finish` **不再长持 RPC**：校验 spool 完整后把远端推送交给 sidecar 后台任务并立即返回 `{ success: true, taskId, phase: "uploading", accepted }`；完成/失败/取消只经终态 progress 事件回传（此前长持 RPC 会被桥上任一端的 deadline 判死，健康的多 GB 上传被误报为 "upload cancelled"）。`sftp/transfer/cancel` 新增可选 `reason`（字符串 slug，≤120 字符：`user`=用户按钮、`ack-timeout`=分片确认超时、`local-read-error`/`append-failed`/`start-failed`/`client-error`=前端各类异常清理），取消事件的 `error` 文案据此区分（如 "Upload cancelled by user" / "Upload cancelled (ack-timeout)"），sidecar 日志同步打印取消原因。二进制拒收（offset 失配/任务丢失/spool 写失败）新增事件 `sftp/upload/error { taskId, error }`，前端无需等满 30s ack 超时。
+
+传输状态查询（只读，不产生副作用）：
+
+- `sftp/transfer/list`：参数 `sessionId`。返回 `{ tasks: [...] }`——该会话进行中的上传 / 下载与近期历史（每个会话独立记录），元素结构 `{ taskId, sessionId, direction, fileName, size, transferred, status }`，`status` 取 `running` / `completed` / `cancelled`。
+- `sftp/transfer/status`：参数 `taskId`。返回单个任务的同构状态对象；任务不存在时先查历史，仍无则报错。
+- `sftp/transfer/history`：参数 `sessionId?`（可选过滤）、`limit?`（默认 50，上限 200）。返回 `{ tasks: [...] }`——持久化传输历史（`transfer-history.json`，环形上限 200 条，跨 sidecar 重启保留）与内存 live 任务按 `taskId` 去重合并、新→旧排序，元素结构 `{ taskId, sessionId, connectionId, direction, fileName, size, transferred, status, startedAt, finishedAt, error? }`（时间戳 Unix 毫秒；`status` 同上并含 `failed`）。无活动连接也可查询；仅状态跃迁落盘，逐块进度不落盘；跨进程（embedded 与 stdio `--mcp`）last-writer-wins；重启后遗留 `running` 呈现为 `failed`（不回写文件）。不进 MCP 工具面。
+
+## 本地终端
+
+工作台内的本机 shell 入口（sidecar 所在机器，非 SSH 远端）。与远端终端共用二进制帧协议、序号重放（2 MiB 环形缓存）与输出管线，但独立会话表，不依赖任何 SSH 连接：
+
+- `local/terminal/start {workbenchId, cols, rows, shell?, shellIntegration?, cwd?, env?}` → `{sessionId, shell, shellIntegration}`。`shell` 来自选择器偏好（`localShell`，空=自动探测；会话菜单「选择 Shell 打开」子视图可按 shell 一次性 override，不改偏好）；`cwd` 供重开继承上次跟踪目录或偏好启动目录（前端优先级：同工作台重开继承 `localLastCwd` > 偏好 `localShellCwd` > 不传，VS Code 惯例），非法/已删目录静默回落家目录。`env`（map，键值均字符串）为**用户追加环境变量**：在继承的系统环境之上叠加，净化规则——空名/含 `=`/含控制字符/超限（名 ≤128B、值 ≤4096B、≤32 对）的条目静默丢弃，`TERM`/`COLORTERM`/`TERM_PROGRAM` 三个托管键的用户值忽略（大小写不敏感），integration env（`ZDOTDIR` 等）与受管键始终优先——坏 env 绝不让 spawn 失败，也不破坏终端渲染契约。shell 解析顺序：显式 `shell` 参数 → macOS Directory Services `UserShell`（`dscl`）→ `$SHELL` → 平台缺省（macOS `/bin/zsh`、Linux `/bin/bash`、Windows `powershell.exe`）；`nologin`/`false` 一类登录不可用 shell 视为未设置。Unix 侧一律以**登录 shell** 启动（macOS GUI 进程 PATH 不全，Ghostty/Warp 惯例），cwd 为用户家目录，`TERM=xterm-256color`、`COLORTERM=truecolor`、`TERM_PROGRAM=dbx`。**UTF-8 locale 兜底（#173）**：GUI 启动的 sidecar 环境无 `LANG` 时子 shell 回落 C locale、中日韩输入按字节断裂（行编辑/补全/文件名乱码），故在净化后的用户 env 与继承环境都未携带非空 `LANG`/`LC_ALL`/`LC_CTYPE` 时注入 `LANG`（macOS `en_US.UTF-8`——全平台必有且按需合成其他 UTF-8 locale，取通用值；Linux `C.UTF-8`——glibc 恒有的 UTF-8 locale，精简镜像未必生成 `en_US.UTF-8`）；用户显式设置的 locale（连接表单 > 偏好 > 注入）永不被覆盖。**Windows UTF-8 代码页引导（#173 Windows 侧）**：中文 Windows 的 ConPTY 子进程控制台默认 GBK 代码页 936，信任控制台代码页的输出（`cmd type`、git、node 等）与终端 UTF-8 错位乱码；spawn argv 按 shell 类型注入 UTF-8 预设（`chcp 65001` 翻转控制台代码页；PowerShell 另预置 `[Console]::OutputEncoding=UTF8`——ConsoleHost 的原生命令输出解码层缓存在进程启动时，不随 chcp 更新）——PS 折入既有 `-Command` 载荷（integration 关闭时补 `-NoExit -Command`），cmd 包 `/k chcp 65001>nul&title %COMSPEC%`（`title` 复位避免命令行残留为会话标题），wsl/未知 shell 不动；仅 argv 层改写，env 合并语义与启动握手/resize 门控流量不变；已知取舍：GBK 输出的遗留程序反向乱码（同 Windows Terminal「使用 Unicode UTF-8」）。`LANG` 在 Windows 不注入（代码页机制 `LANG` 够不着）。会话关闭先落 master 让 shell 收到 EOF/HUP 干净退出（zsh/bash 仅在干净退出时保存命令历史），5s 宽限后才 SIGKILL 兜底（再给 2s 收取退出码）。
+- shell integration 注入（`shellIntegration: false` 可关闭；脚本落盘/包装失败时静默回退裸 shell）：自带精简脚本集（zsh 经 `ZDOTDIR` 包装链，保留用户 `.zprofile`/`.zshrc`/`.zlogin` 与登录语义；bash 走 `--rcfile` 包装自建 profile 链；fish `-C`；PowerShell `-Command`），每步 fail-safe，用户 rc 损坏不阻断 shell。脚本发射 OSC `133;A/C/D;exit`、`633;E;命令行`、`633;P;Cwd=…` 与 OSC 7（Windows 为 OSC 9;9），前端复用既有命令标记/目录解析渲染运行中命令、退出码与 cwd。**注入数据仅用于装饰与 cwd 跟踪，绝不进入任何执行路径**（VS Code shell integration RCE 前车之鉴）。
+- 输出帧同 `ssh/terminal/out`；会话结束发流 2 State 帧 `local-terminal-exited` 并伴随事件 `local/session/state {sessionId, workbenchId, state: "exited", exitCode}`（`exitCode` 为 null 表示未能取得，如进程被杀）。输入通道失配镜像 `local/terminal/error {sessionId, error}` + `local/terminal/inputAck` 确认，语义与 SSH 同构。
+- **Windows ConPTY 启动握手**：ConPTY 以 `PSEUDOCONSOLE_INHERIT_CURSOR` 创建，每次会话开场向终端发 `CSI 6n` 并**扣留全部输出**直至收到 CPR 应答；该标志的语义是「**继承父终端的光标位置**」——应答被 conhost 读作**终端光标所在行列**，子进程从该位置开始输出。因此应答的取值是有语义的：以**视口尺寸**应答（`rows;cols`）等于宣称"光标在最后一行"，conhost 会先把首个文本批次写在自身缓冲原点（顶部孤字：cmd 的 `M`、WSL 的 `d`），再从继承来的底部位置整屏重画横幅（PowerShell 提示符画两遍）——这正是 Windows 本地终端启动残影的成因。工作台在 `local/terminal/start` 上报真实光标（`cursorRow`/`cursorCol`），sidecar 经 `inherit_cursor` 归一化（缺省 `1;1`、越界钳制到视口内）后以此作答。
+  应答本也走终端→PTY 输入（与按键同一链路），该链路丢帧时本地 shell 会"进程活着但永久静默"（无横幅/提示符/回显）；sidecar 因此自行应答**首个**查询，并把该查询从转发字节流中**摘除**——链路上只留这一份正确应答（重复应答经实测会被 conhost 忽略，但留着一个无人读的查询没有意义），摘除发生在源头，回放缓存同样干净（webview 重载不会重投）。应用层（PSReadLine、vim）与 `CSI ?6n`（DECDSR）的后续查询不受影响，仍由终端如实应答。仅 Windows 会话启用（Unix openpty 无此握手）。
+- **Windows 启动窗口 resize 门控**：ConPTY 对每次 `ResizePseudoConsole`（含同尺寸）都整屏重序列化，与 shell 开场横幅/首个提示符交错即渲染出孤字与整段重复（cmd 顶部 "M"、WSL 顶部 "d"、PowerShell 双提示符的成因）。前端 spawn 前的布局稳定采样与 sidecar 同尺寸去重只能消除插件自身引起的 resize；宿主在 spawn 后仍会继续整理面板几何（dock/tab 布局晚到、窗口缩放），这些**真实跨几何** resize 落在启动输出窗口内依旧触发竞态。故仅 Windows 会话：spawn 起 3s 窗口内，若距上次 PTY 输出不足 500ms（横幅在写），resize 请求被扣留并持续合并（后到覆盖先到），输出安静满 500ms（或窗口到期）后一次性应用最终几何——此时屏幕内容静止，ConPTY 重绘是幂等重排。首个输出之前与窗口之外的 resize 立即应用；Unix PTY 不重绘，恒直通。
+- `local/session/list` 供 webview 重载后接回仍活着的 shell；`workbench/close` 会回收该工作台的本地会话；sidecar 退出即全部终止（本地 PTY 生命周期 = sidecar 生命周期）。
+- 安全语义：入口为工作台显式按钮（未连接也可用；SSH 会话在连时经确认先关闭），无自动开启路径；manifest 权限集不变（复用 `host.binary`），本机命令执行能力与用户自身终端同级，无提权。
+- 偏好（`local/preferences/*` 白名单新增）：`localShell`（字符串 ≤200，空=自动探测）、`localShellIntegration`（布尔，缺省 true）、`localShellCwd`（字符串 ≤512，空=清除，start 时校验现存目录）、`localShellEnv`（`[{name, value}]` 数组，与 `env` 参数同一净化规则集，坏条目入库前静默丢弃）。shell 选择器在工作台本地终端按钮旁的设置菜单（`local/shells/list` 发现 + 注入开关 + 启动目录/环境变量编辑器），另设「选择 Shell 打开」子视图（dock「+」同款列表，点击以该 shell 一次性 override 打开/重启，不改默认偏好），徽标显示 `Local · <shell>`，重开按钮在本地会话存活时保持可用（restart 语义：关当前 → 按新偏好重开）。本地模式下 SFTP 分栏/批量栏整体收口（进入会话前主动收起 + 恢复层对 local-terminal tab 不水合 + 模板 v-if 兜底），metrics/Docker 等本机能力面板照常可用。
+
+## 串口终端回放（`serial/replay`）
+
+与 telnet/local 终端完全同构的序号制输出回放（设计稿 `docs/SERIAL_ENHANCE_DESIGN.zh-CN.md` §3）：读线程在会话生命周期内把输出帧存入按字节预算截断的有界环形缓冲（串口会话 128 KiB，远小于终端的 2 MiB——串口输出是控制台流量而非全屏重绘），`serial/terminal/out` 的在线帧与回放帧共用同一单调序号。
+
+- `serial/replay {sessionId, afterSequence}` → 在 `serial/terminal/out/{id}` 上重发其后帧，并返回摘要 `{frameCount, firstAvailableSequence, tailSequence, complete}`。`complete: false` 表示缓冲已绕回、回放不完整，前端提示截断；会话已关闭时返回 "Serial session was not found"。
+- 前端复用既有 gap 检测/drain 机制（`drainSerialFrames`）：缺口经 `serial/replay` 回填；缺口永不可填时按无进度上限 resync 游标。
+- 能力探测降级（设计稿 §2 兼容策略）：`serial/start` 响应新增 `binaryInput: true` 能力字段；未声明该字段的旧 sidecar 由前端走 JSON `serial/write` 兼容路径，前端对 `serial/terminal/in` 通道报错一律一次性降级 JSON，老前端不受影响。`BackspaceMode` 的 DEL→BS 改写在两个通道上语义一致（sidecar 内统一执行）。
+- RS-232 无窗口尺寸概念，串口会话无 `resize` 方法（设计稿 §4 明确不实现）。
+
+### 写序列化与回压
+
+串口写方向收敛到每会话一条**专用写线程**（独占端口写方向；读线程与写线程共用端口互斥锁但各持短临界区）：键入（B1 二进制帧与 `serial/write` JSON 同源）与上传引擎输出只**入队**不碰锁。设计稿「写序列化与回压」节定稿参数：
+
+- 分帧：键入大包按 **4 KiB** 小块分帧入队，单块持锁写时间有上界（@9600 波特约 4 秒）；上传引擎输出保持块级原样，不受切分影响。
+- 有界队列：按 **256 KiB** 字节预算有界；准入全有或全无（半个包入队会让线上字节流停在任意中断点）。满时键入**整包丢弃**并发事件 `serial/input/dropped {sessionId, bytes, reason: "oversize" | "queue_full"}` 回报前端；引擎输出满时报错终止上传（可读错误，绝不阻塞调用线程）。键入单包上限 **16 KiB**，超限按 `oversize` 丢弃并回报。
+- 可取消：上传取消先清空队列再入队取消序列；会话关闭清空队列并唤醒写线程退出（在途系统调用写入无法中断，其后队列内容保证不再写出）。
+- 写失败镜像事件 `serial/write/error {sessionId, error}`（写线程异步写失败时；会话保持存活，端口消失由读线程 error 状态收场）。
+
+## 串口文件上传（X/Y/ZMODEM）
+
+串口会话（RS-232 控制台）支持向对端设备发送文件，三协议引擎为纯状态机（输入=对端字节流，输出=待写字节序列），由串口读线程在既有泵循环内驱动；对端响应既驱动协议也照常上屏（NyaTerm 语义），上传期间的键入由前端拦截（控制字符窗口），sidecar 拒绝并发第二次上传。
+
+- `serial/upload/start {sessionId, protocol, fileName, totalSize}` → `{sessionId, protocol, totalSize}`。`protocol ∈ "xmodem" | "ymodem" | "zmodem"`（拼写为 `zmodem`）；`fileName` 仅作标签与协议头负载，不落盘；`totalSize` 超过 256 MiB、YMODEM 头元数据（name\0size）超过 128 字节、或该会话已有上传在跑时直接报错。
+- `serial/upload/data {sessionId, dataBase64, final}` → `{received, final}`。前端 File API 分块（≤64KiB）送入；未收尾（`final: false`）时部分数据不会被视为文件尾，引擎在协议请求越过已到数据且未收尾时保持等待（超时时钟暂停），因此文件可在协议握手的同时流式灌入。
+- `serial/upload/cancel {sessionId}` → `{success}`。X/Y 发 CAN×8、ZMODEM 发 ZDLE×5+BS×5 取消序列并落 `failed` 进度事件；幂等。
+- 事件 `serial/upload/progress`（notify）：`{sessionId, protocol, fileName, fileIndex, sent, total, state, reason?}`，`state ∈ "running" | "file_complete" | "complete" | "failed"`；`sent` 为对端已确认（ZMODEM）或已确认收到（X/Y ACK）的字节数，不含文件内容；事件按 ≥4KiB 增量或 200ms 窗口限流，状态变化强制上报。
+
+协议语义（对齐 NyaTerm 及其 vendor zmodem2 发送端行为，代码手写）：XMODEM 128B 块 + CRC16（`C` 握手）或 8-bit checksum（`NAK` 握手）、CPM-EOF 尾填充、EOT 先 NAK 后 ACK；YMODEM 批形态（块 0 头 `name\0size` 零填充、固定 CRC、EOT 后收尾全零头块）；ZMODEM ZRQINIT(hex)→ZRINIT→ZFILE(bin32+CRCW 子包)→ZRPOS→ZDATA（每帧单 ZCRCW 子包等待落盘确认，子包按对端 ZRINIT 声明的接收缓冲截断，上限 8KiB）→ZEOF→ZRINIT→ZFIN(hex)→`OO`，支持 ZRPOS 断点续传与 ZSKIP 拒收；对端连续取消字节（X/Y CAN×2、Z ZDLE×5）判远端取消，静默 10s 重发最后一帧、10 次后失败。
+
+## RDP 远程桌面会话
+
+RDP 客户端（RDP-2，nyaterm-parity P3-4）：引擎为 RDP-1 vendored IronRDP 链（ironrdp 0.17 lockstep，`backend/vendor/`），连接序列（X.224 协商 → TLS → CredSSP/NLA → 虚通道）与 NyaTerm `src/core/rdp.rs` 同构。**范围（评审定案，见 `docs/RDP_CREDSSP_REVIEW_CHECKLIST.zh-CN.md`）**：密码/NLA（CredSSP）+ TLS + 文本剪贴板 + 断线重连；不做音频、驱动器重定向、键盘捕获、网关/RDCleanPath、UDP 传输、Kerberos。仅 TCP 直连形态。
+
+- `rdp/start {workbenchId, connectionId?, host, port?=3389, username, password?, domain?, width?=1280, height?=800, useNla?, certificatePolicy?, clipboard?=true, reconnectAttempts?=5}`。`connectionId` 命中连接表单暂存凭据且请求未带密码时，sidecar 合并表单密码（用户名仅在请求留空时补，见「非 SSH 连接凭据暂存」） → `{sessionId, host, port, useNla, certificatePolicy, clipboard, reconnectAttempts}`。`width/height` 须在 640x480..3840x2160（下界沿 NyaTerm，上界沿插件远程桌面上界，保证补丁负载 < 64 MiB）。`useNla`/`certificatePolicy` 缺省依次回落偏好（`rdp_use_nla`/`rdp_certificate_policy`，见下）与评审锁定缺省（`true`/`prompt`）。密码仅本地 IPC 传输，sidecar 以 `Zeroizing` 持有，不落日志/审计/错误信息。
+- `rdp/input`（别名 `rdp/write`）`{sessionId, kind, ...}`：`kind ∈ key-down | key-up | mouse-move | mouse-button | mouse-wheel | unicode | release-all`。键盘字段 `scan_code`（camelCase `scanCode` 别名）+ `extended`；鼠标 `button ∈ left|middle|right|back|forward`、`pressed`、`x/y`；滚轮 `deltaX/deltaY`（浏览器增量，取反映射为 RDP 旋转单位，NyaTerm 语义）；`unicode` 按字符 press+release（每条 `unicode` 文本 ≤4096 字符，超限整包拒绝——字符逐一展开为 press+release 对，无界文本即无界操作列表；收官审查 E5 修复）。右 Shift（非扩展 0x36）走直发 fast-path（NyaTerm 修复），其余经输入数据库派生 fast-path 事件。返回 `{success}`。
+- `rdp/resize {sessionId, width, height}`：桌面分辨率调整，尺寸门限同 start。返回 `{success, reconnected: true}`。实现为「以新尺寸重连」：会话内 display control 通道（MS-RDPEDISP monitor layout PDU）在 vendored 链上已正确编码发送，但真机 Windows 目标不应用该尺寸，故运行中改尺寸走 generation 重拨（凭据留在条目内复用，sessionId 不变，状态经 `rdp/session/state` connecting→connected）；会话内动态 resize 保留为 vendored 栈的后续工作。
+- `rdp/set-clipboard {sessionId, text}`：本地文本 → 远端（暂存 + 以 CF_UNICODETEXT 广告）。**仅文本**；上限 16 MiB，超限整包拒绝（不截断）。返回 `{success}`。
+- `rdp/reconnect {sessionId}`：手动重连（generation 计数防串话）。返回 `{sessionId, success}`。
+- `rdp/close {sessionId}`：关闭会话（凭据随会话丢弃、待定证书确认全部拒绝、剪贴板暂存清空）。返回 `{success}`。
+- `rdp/replay {sessionId}`：Webview 重建后在原 `rdp/frame/{sessionId}` 通道重发**一张完整合成 framebuffer**，返回 `{frameCount: 1, complete:true}`。只有一张覆盖整个当前桌面的全屏 patch（`x=0,y=0,width=desktopWidth,height=desktopHeight`）才能建立 replay 基线；首帧为局部 patch、尺寸改变、close/error/reconnect 清理后均返回 `{frameCount: 0, complete:false}`，前端必须等待新的全屏基线，绝不得把增量 patch 误当完整桌面。实时 patch 合成、sequence 分配、replay 帧构造与发布由同一个会话锁串行，重挂帧不能插队到已分配但尚未发布的实时 sequence 之前。合成图严格限制为一张 RGBA 画面，尺寸上限 3840×2160，最大 **31,850,496 bytes（约 30.4 MiB）**；不保留多张 patch（旧方案在 4K 下可能累积数百 MiB）。
+- `rdp/list` → `{sessions: [{sessionId, workbenchId, host, port, username, hasPassword, useNla, certificatePolicy, clipboard, createdAt}]}`（按创建时间排序；不含密码与实时状态）。
+- `rdp/certificate/resolve {challengeId, accept?, remember?}`：证书确认应答。`accept` 缺省 false——超时/取消/未知 id 一律拒绝（fail-closed）。`remember=true` 时把指纹记入 `<plugin-data>/rdp-known-certs.json`（`{"host:port": "SHA256:hex"}`，上限 1024 条，与 SSH known_hosts 先例同作用域语义）。共享入口 `connection/challenge/resolve` 亦按 challengeId 路由到 RDP 注册表。
+
+事件：
+
+- `rdp/session/state {sessionId, workbenchId, state, errorKind?, error?, attempt?, maxAttempts?}`：`state ∈ connecting | connected | reconnecting | closed | error`；`connected` 在首个桌面帧到达时发布。`errorKind ∈ transport | tls | certificate | authentication | negotiation | session | clipboard`。**认证失败文案统一为 "RDP authentication failed"**（不区分用户名/密码错误、不回显凭据）。
+- `rdp/frame/{sessionId}`（二进制）：44 字节 patch 头 + RGBA 负载，与 `vnc/frame` 同格式（见上文），`sequence` 跨重连单调。
+- `rdp/clipboard {sessionId, text, chunkIndex?, chunkTotal?}`：远端 → 本地文本（≤16 MiB，仅 CF_UNICODETEXT；由后端格式过滤保证，非 UI 约束）。JSON 转义后超过单事件预算（7 MiB，超出会被 SDK 传输静默丢弃）的文本由后端按字符边界分片发送，多片事件附带 `chunkIndex`/`chunkTotal`，前端按会话隔离缓冲拼接（收官审查 C2 修复；单片事件不附这两个字段）。
+- `rdp/pointer {sessionId, type, ...}`：`type ∈ default | hidden | position(x,y) | bitmap(width,height,hotspotX,hotspotY,rgbaBase64)`（服务端光标形状，NyaTerm 同族事件）。
+- `connection/challenge {challengeId, kind: "rdp-certificate", sessionId, host, port, fingerprint, knownHostStatus}`：证书确认请求（`knownHostStatus ∈ match | changed | unknown`）。确认窗 **120s**，超时即拒绝；generation 变更后到达的应答一律拒绝（防串话）。
+
+重连门控（NyaTerm 同款分类器）：证书/认证/协商类失败**永不**自动重试；TLS/传输类失败有限重试，退避 1/2/4/8/15s 封顶 30s，默认 5 次（上限 10；`reconnectAttempts` 可调）。会话曾进入 active（收到过帧）后失败则重置重试预算；服务端主动断开（graceful disconnect）不自动重连，由用户 `rdp/reconnect` 决定。`rdp/close` 与 `rdp/reconnect` 递增 generation，旧代 worker 静默退出，帧/事件/证书应答均按 generation 过滤。另有**会话生命周期累计重连总预算 50 次**（`MAX_TOTAL_RECONNECTS`，永不重置——active 重置只回退退避步长、不回补总预算，防恶意服务器把有限退避变成无限循环；收官审查 D3 修复），预算耗尽即终局关闭。
+
+安全红线（实现与评审对照见 `docs/RDP_CREDSSP_REVIEW_CHECKLIST.zh-CN.md`）：NTLMv2-only（vendored sspi 明示不支持 NTLMv1/LM，源码断言钉在 `vendored_sspi_marks_ntlmv1_and_lm_as_unsupported`）；CredSSP 仅在 TLS 之上（`with_tls(true)` 恒开）；证书策略 fail-closed（`prompt` 默认 / `strict` / `accept-temporarily`，无「静默接受」路径）；剪贴板 text-only + 16 MiB + 不落审计；凭据 `Zeroizing` 持有、不进日志/事件/错误。用户文档保留「连接期间远端可读写会话剪贴板、凭据实质交付目标主机，仅连接可信主机」警示。
+
+实验门控与偏好（`local/preferences/*` 白名单，RDP-2）：`rdp_experimental_enabled` 仅显式布尔 `true` 才启用，缺失、非法或 false 均默认关闭；用户在**设置 → 实验性 RDP → 启用实验性 RDP**写入该键，前端才展示入口。后端在 `rdp/start` 前独立检查同一偏好，因此门关闭时直接 RPC 默认拒绝，不能绕过 UI。另有 `rdp_use_nla`（布尔，缺省 true）、`rdp_certificate_policy`（`prompt`（缺省）| `strict` | `accept-temporarily`，白名单外拒绝写入）。不新增 manifest 字段。
+
+## 主机密钥确认通道(requestUserInput)
+
+首次连接(或主机密钥变更)时,sidecar 的确认请求按以下顺序选通道:
+
+1. **宿主弹窗(优先)**:宿主在 `plugin/initialize` 通过 `host.features` 广告
+   `host.requestUserInput`(点分形式,Host API 1.1 起)时,sidecar 直接调用
+   `host/requestUserInput`(字符串 id `plugin-N`,`echo: true`,`options:
+   accept/remember`,`timeoutSecs: 300`;title/prompt 超过宿主 200/2000 字符
+   上限时 sidecar 先行截断)。代码门控只按 `host.features` 列表判断,不校验
+   `hostApiVersion` 版本号。弹窗期间宿主暂停 `connection/test` /
+   `connection/connect` 的请求截止时间,连接表单里即可完成信任;sidecar 自身
+   的 connection/test 镜像预算若在弹窗挂起期间到期,会以"挑战等待 + 连接超时"
+   重臂一次(仅弹窗路径;Host API 1.0 路径预算不变)。
+2. **工作台事件(降级)**:宿主不支持(-32601)、参数被宿主拒绝(-32602)或无
+   可用弹窗面(-32001 且非 SDK 本地超时)时,仍发既有事件 `connection/challenge`,
+   由工作台 UI 应答(`connection/challenge/resolve`),语义与字段不变。
+3. **fail closed**:用户 cancel/timeout、宿主对请求不应答(SDK 本地 330s 超时,
+   `-32001` + "did not answer")、或其他错误——一律拒绝握手,不降级、不猜测。
+   弹窗应答仅 `action: "submit"` 且 `value` 为 `accept`/`remember` 才授信,
+   缺失/未知 value 一律视为拒绝。MCP 模式的 `auto_trust`(TOFU)行为不变。
+
+已知限制:Host API 1.0 宿主 + 工作台未打开(连接表单路径)仍无应答者,`connection/test`
+约 9s 后返回可读超时文案(0.4.78+ 缓解),文案在挑战已发出且未走弹窗路径时附指引。
+
+## 主机密钥
+
+`DBX_PLUGIN_DATA_DIR/known_hosts` 保存插件确认过的主机密钥，同时只读系统 `known_hosts`。未知主机通过 `ssh/host-key/prompt` 事件交给工作台确认；已知主机密钥变化直接拒绝，不能用一次确认覆盖。
+
+插件数据目录解析顺序（取第一个可用项，"可用"= 环境变量存在且 trim 后非空）：① `DBX_PLUGIN_DATA_DIR` 原样使用（宿主显式注入，未来方案 A 接入点）；② `DBX_DATA_DIR` → `<DBX_DATA_DIR>/plugin-data/io.dbx.ssh`（便携/web 模式，`plugin-data/` 避开安装器管理的注册树）；③ 平台标准用户数据目录下 `dbx-plugin-data/io.dbx.ssh`（macOS `$HOME/Library/Application Support`、其他 unix `${XDG_DATA_HOME:-$HOME/.local/share}`、Windows `%APPDATA%`）；④ 全缺才回落 `std::env::temp_dir()/dbx-plugin-data/io.dbx.ssh`（临时兜底，永不失败）。当前宿主尚未注入 `DBX_PLUGIN_DATA_DIR`，实际生效的是 ③；切勿将持久数据依赖 ④ 的临时目录（重启即清空）。
+
+框架级连接测试挑战采用事件 `connection/challenge` 和固定响应方法 `connection/challenge/resolve`。原型未声明 `test`，因此暂不触发该流程。
+
+## 本地密钥与 known_hosts
+
+本地能力，不依赖任何连接，均不携带 `sessionId`。两类方法都只返回元信息（路径、算法、指纹），绝不返回私钥内容或口令。
+
+### keys/discover
+
+参数：无（空对象）。扫描 `~/.ssh` 下默认命名的私钥（`id_rsa` / `id_ed25519` / `id_ecdsa` 等，不含 `.pub`）以及 `~/.ssh/config` 中声明的 `IdentityFile`。返回 `{ keys: [...] }`，元素结构：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `path` | string | 私钥绝对路径 |
+| `algorithm` | string | 公钥算法（如 `ssh-ed25519`、`ssh-rsa`、`ecdsa-sha2-nistp256`） |
+| `fingerprint` | string | 公钥指纹，`SHA256:…` 格式 |
+| `hasPassphrase` | bool | 私钥是否带口令 |
+
+`~/.ssh` 不存在或无可识别私钥时返回空 `keys` 数组，不算错误。
+
+### 连接表单的私钥录入（四通道）
+
+`private_key_path`（text，binding config）与 `private_key`（textarea，binding secret）是同一份凭据的两个槽位。表单提供四条录入通道，落到这两个槽位上：
+
+| 通道 | 宿主能力 | 落点 | 适用部署 |
+| --- | --- | --- | --- |
+| 手工输入 | 普通 `text` 字段（**刻意不声明 `options_action`**） | `private_key_path` | 全部 |
+| 建议下拉 | 宿主内置本地密钥建议器（字段 key 恰为 `private_key_path`，`list_local_ssh_keys`） | `private_key_path` | 桌面 |
+| 文件选择 | `picker: { "kind": "file", "content_field": "private_key" }`（Host API 1.1） | 桌面：`private_key_path`；Web/Docker：`private_key` | 桌面与 Web/Docker |
+| 粘贴内容 | 无（普通 textarea） | `private_key` | 全部 |
+
+- **为什么不声明 `options_action`**：宿主对声明了它的字段渲染成**纯下拉**（`selectOptionsFor()` 优先于文本框），既与宿主自身隧道密钥字段（输入框 + 浏览按钮）不一致，也让"发现列表里没有的密钥"（U 盘、导出到 `/tmp` 的临时密钥、非 `~/.ssh` 目录）无法录入。`keys/discover/options` RPC 仍保留（`label` 即路径本身，避免下拉被算法/指纹撑长），宿主或其它集成方需要时自行渲染。
+- 桌面宿主打开原生对话框，把**绝对路径**写回 `private_key_path`（sidecar 与用户同机，自己读文件）；浏览器宿主（dbx-web / Docker）拿不到客户端路径，同一个按钮变成上传：DBX 读取文件内容（上限 1 MiB）写入 `private_key` 并清空路径。
+- 两个槽位互斥：任一方写入会清空另一方，保存时对应地从 `external_config` / `connection_secrets` 删除。sidecar 侧 `private_key` 内容优先于路径（`resolve_private_key_text`），两条通道共用同一套解析（OpenSSH/PEM/PPK，CRLF 归一化）。
+- 刻意不声明 `picker.accept`：私钥常见名为 `id_rsa` / `id_ed25519`（无扩展名），原生对话框的扩展名过滤会把它们置灰、而不是列出来。
+- **兼容性**：`picker` 是新增字段属性，而宿主 manifest 解析器带 `deny_unknown_fields`——不认识该属性的宿主会拒绝整份 manifest，且解析失败先于版本检查发生，因此版本下限只能声明事实、挡不住旧宿主。DBX **0.6.16 是首个带该能力的发行版**（0.6.15 及更早的 `PluginFormFieldDefinition` 没有 `picker`），本 manifest 的 `engines.dbx` 因此固定为 `>=0.6.16`，只允许上移（`scripts/connection-forms/verify.mjs` 断言）。用 `host_api` 无法门控该能力：`SUPPORTED_PLUGIN_HOST_API_VERSION` 在 picker 之前就已是 `1.1.0`。
+- **数据位置**：走上传通道时私钥内容会被复制到 DBX 服务端（容器）的连接密钥库（`plugin_connection.private_key`）；桌面端只记录路径，不复制密钥。
+
+### ssh/knownHosts/list
+
+参数：无。列出插件自身 known_hosts 存储（`DBX_PLUGIN_DATA_DIR/known_hosts`）中的条目；系统 `~/.ssh/known_hosts` 保持只读、不参与管理。返回 `{ entries: [...] }`，元素结构：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `host` | string | 主机名或 IP |
+| `port` | number | 端口（默认 22） |
+| `keyType` | string | 密钥类型（如 `ssh-ed25519`） |
+| `fingerprint` | string | 主机密钥指纹 |
+| `marker` | string / null | OpenSSH 标记：`@cert-authority`（CA 信任）或 `@revoked`（吊销）；普通条目为 `null`。标记条目按其 host 字段（可为通配模式）展示与删除 |
+
+列表按 `host` → `port` → `keyType` 稳定排序。通配模式的标记条目（如 `*.prod.example`）仅按字面 host 匹配删除，不做 glob 展开。
+
+### ssh/knownHosts/remove
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `host` | string | 是 | 主机名或 IP |
+| `port` | number | 是 | 端口 |
+
+返回 `{ removed: n }`（实际删除的行数，可为 0；同一主机的标记行与普通行一并按 host 匹配删除）。条目删除后，对应主机再次连接会重新触发 `ssh/host-key/prompt` 确认。错误：known_hosts 文件读写失败。
+
+### ssh/sessions/list
+
+参数：无。返回 sidecar 内存中当前跟踪的会话清单（不发起任何 SSH 流量），用于诊断与多面板展示。返回 `{ sessions: [...] }`，按 `createdAt` 升序稳定排序：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `sessionId` | string | 会话 id（与 `ssh/session/open` 返回一致） |
+| `connectionId` | string | 所属连接 id |
+| `workbenchId` | string | 所属工作台 id |
+| `readOnly` | bool | 只读连接标志 |
+| `connected` | bool | 会话是否存活（传输层断开后为 `false`） |
+| `sudoKeepalive` | bool | 该连接是否运行 Quick Sudo 时间戳保活循环 |
+| `terminalKeepaliveSecs` | number | 终端活动保活间隔（秒，0=关闭）；回显该连接 `terminal_keepalive_secs` 的生效值 |
+| `createdAt` | number | 会话创建时刻（Unix 秒） |
+| `authMethod` | string | 该连接的认证方式名（`password` / `private-key` / `private-key-password` / `agent` / `none`；连接不在注册表时回退 `password`）。仅方法名，**不含任何凭据材料**；供工作台连接信息面板只读展示 |
+| `host` | string | 所属连接主机名/IP（连接不在注册表时为空串）；只读展示字段 |
+| `port` | number | 所属连接端口（连接不在注册表时回退 22） |
+| `username` | string | 所属连接登录用户（连接不在注册表时为空串） |
+
+内存态清单，sidecar 重启即清零；会话关闭（`ssh/session/close`、`workbench/close`、连接断开）后不再出现。
+
+### ssh/quickCommands/list、ssh/quickCommands/save、ssh/quickCommands/delete
+
+> **⚠️ legacy（存储迁移批 1，`IMPL_PLAN_STORAGE_SYNC.zh-CN.md`）**：工作台权威
+> 已迁宿主 `host.storage`（`ui-storage.json` 的 `ssh-quick-commands` 键，随 DBX
+> secrets 同步加密上云）。本组方法降级为兼容面：仅作旧档一次性搬迁种子（工作台
+> 启动时只在权威键缺失时调 `list`），`save`/`delete` 不再被工作台调用；
+> `quick-commands.json` 自搬迁后冻结为只读旧档。
+
+全局快速命令：用户自定义的常用命令片段（名称 + 命令原文），持久化在
+`DBX_PLUGIN_DATA_DIR/quick-commands.json`（原子写、Unix 0600、坏文件降级为空清单），
+**所有连接与工作台共享一份**（全局共享语义；此前存工作台
+localStorage 会因宿主 webview 存储分区表现为"绑连接"，已废弃该存储）。
+上限 20 条、`name` ≤ 60 字符、`command` ≤ 500 字符（与前端 `lib/quickCommands.ts`
+常量一致）。命令不含凭据字段，无脱敏需求，但文件权限与 sudo 配置存储保持同款收紧。
+
+`ssh/quickCommands/list`：参数无。返回 `{ commands: [{ id, name, command, createdAt, updatedAt }] }`，按插入顺序（`createdAt` 升序）排列。
+
+`ssh/quickCommands/save`：参数 `id?`（空/缺省=新建，非空=更新须存在）、`name?`（空/缺省取 `command` 截断兜底）、`command`（必填，trim 后非空）。返回 `{ quickCommand: {…}, created: bool, commands: [...] }`（完整清单随响应下发，工作台可直接采纳权威顺序）。错误：超限（"At most 20 quick commands…"）、字段超长、`command` 缺失。
+
+`ssh/quickCommands/delete`：参数 `id`。返回 `{ removed: bool, commands: [...] }`；id 不存在时 `removed: false` 不算错误（对齐 `ssh/knownHosts/remove` 语义），此时不重写存储文件。
+
+### sftp/bookmarks/list、sftp/bookmarks/save、sftp/bookmarks/delete
+
+> **⚠️ legacy（存储迁移批 1，`IMPL_PLAN_STORAGE_SYNC.zh-CN.md`）**：工作台权威
+> 已迁宿主 `host.storage`（`ui-storage.json` 的 `ssh-sftp-bookmarks` 键）。仅
+> `list` 保留为一次性搬迁种子；`save`/`delete` 不再被工作台调用，
+> `sftp-bookmarks.json` 自搬迁后冻结为只读旧档。
+
+SFTP 路径书签：用户收藏的命名远端路径（label + path），持久化在
+`DBX_PLUGIN_DATA_DIR/sftp-bookmarks.json`（原子写、Unix 0600、坏文件降级为空清单），
+**全局共享一份**（不按连接分组），模式与 `ssh/quickCommands/*` 同构。上限 20 条
+（仅约束新建）、`label` trim 后 1–64 字符且全库唯一（大小写不敏感）、`path` 非空
+≤ 1024（不做存在性校验，书签可指向未挂载路径）。
+
+`sftp/bookmarks/list`：参数无。返回 `{ bookmarks: [{ id, label, path, createdAt, updatedAt }] }`，按 `label` 排序。
+
+`sftp/bookmarks/save`：参数 `id?`（有=更新须存在，无=新建）、`label`、`path`。返回 `{ bookmark: {…}, created: bool }`。错误：`label` 为空/超长/重复（大小写不敏感）、`path` 为空/超长、`id` 不存在、超出上限。
+
+`sftp/bookmarks/delete`：参数 `id`。返回 `{ success, removed }`；未知 id 报错。工作台方法，不进 MCP 工具面。
+
+### ssh/highlightRules/list、ssh/highlightRules/save、ssh/highlightRules/delete（legacy）
+
+> **⚠️ legacy（存储迁移批 1）**：关键词高亮规则的权威已迁宿主 `host.storage`
+> （`ui-storage.json` 的 `ssh-highlight-rules` 键）；本组此前未入协议文档，
+> 现补记并直接标注 legacy——工作台启动时仅在权威键缺失时调 `list` 搬迁旧档，
+> `save`/`delete` 不再被工作台调用，`highlight-rules.json` 冻结为只读旧档。
+
+形状与 `ssh/quickCommands/*` 同构：`list` 返回 `{ rules: [{ id, pattern, color,
+isRegex, caseSensitive, enabled, createdAt, updatedAt }] }`（`createdAt` 升序，
+上限 30 条）；`save` 参数 `id?`（空/缺省=新建）、`pattern`、`color`（缺省
+`#f59e0b`）、`isRegex`、`caseSensitive`、`enabled`（缺省 true）；`delete` 参数
+`id`。regex 合法性明确不在后端校验（前端编译时静默丢弃非法项）。
+
+### ssh/terminal/batchInput
+
+批量发送命令：把同一条命令写入多个**已打开**会话的
+交互终端（PTY 键盘语义）——输出回显在各自会话的终端里，`cd`/`env` 等状态留在
+各 shell；方法本身不收集远端输出与退出码，只返回逐会话**发送**结果。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `sessionIds` | string[] | 是 | 目标会话 id 非空数组；后端按序去重 |
+| `command` | string | 是 | 命令原文；`\r\n`/`\n`/`\r` 归一为 `\r`（每个即一次回车），归一后上限 256 KiB |
+| `appendNewline` | bool | 否 | 默认 `true`，末尾追加回车即执行 |
+
+返回 `{ results: [{ sessionId, success, error? }], sent, failed }`：会话不存在、输入队列满/关闭记为该目标 `failed`（带 `error` 文本），不影响其他目标。发送语义等同用户键盘输入，命令原文不做 shell 转义；只读连接不拦截（与终端手敲一致）。
+
+### 断点续传（sftp/upload/start resumeTaskId、sftp/download/start offset、sftp/transfer/resumable）
+
+上传**恢复**：`sftp/upload/start` 新增可选 `resumeTaskId` —— 指向一次此前中断的上传任务。后端校验
+`<data_dir>/transfers/upload-<taskId>.json` sidecar meta（`remotePath`/`size` 必须与本次请求一致）与
+`upload-<taskId>.part` spool 文件后，以追加模式复用该 spool，返回 `{ taskId, chunkSize, maxBytes, resumeOffset }`
+（`resumeOffset` = 已 spool 字节数；新任务恒为 0）。调用方只重传 `resumeOffset` 之后的分片（二进制通道
+offset 语义不变）。中断来源不限：前端中止、sidecar 重启、会话断开（meta+spool 保留即列为可续传）。
+任务取消仍删除 spool 与 meta（显式放弃）；`finish_upload` 不完整分支保留它们供续传。历史上限
+`resumeOffset <= size`，非法组合报错。`sftp/transfer/resumable` 无参，返回
+`{ tasks: [{ taskId, direction: "upload", remotePath, fileName, size, resumableBytes }] }`
+（按 taskId 倒序≈最新优先；live 任务与 meta/spool 缺失者不在列）。不进 MCP 工具面。
+
+下载**恢复**：`sftp/download/start` 新增可选 `offset`（默认 0）——调用方本地已持有前 `offset` 字节，
+后端把 `nextOffset` 置为该值继续分片；`offset > size` 报错。身份校验仅为 best-effort 的 size 一致
+（同尺寸改写会拼接错内容，文档明示）；返回体新增 `resumeOffset` 回显。会话内暂停/恢复为纯前端语义
+（分片循环在两分片之间挂起），不涉及新方法。本地落盘下载（`saveToLocal: true`）不支持续传——与
+`offset > 0` 组合直接报错 `Local save downloads cannot resume from an offset`（2026-09-26 审计补记，
+此前该错误语义未入文档）。
+
+**下载限速生效口径（M31-B，issue #66）**：偏好键 `transfer_download_limit_kib`
+（语义见 `local/preferences` 行，0=不限速缺省，单位 KiB/s）在下载任务启动时快照一次，
+单文件与递归目录下载的分块循环（`sftp/download/next`，含 latin-1 raw 车道）按
+「该块理想耗时 − 实际耗时」的差额逐块等待，使平均速率不超过上限；限速为 0 时
+该路径零等待零开销。改动对下一个下载任务生效；sudo 下载（独立车道）本期不限速。
+
+### 压缩传输（gzip 混合方案，M33）
+
+SFTP 单文件上传/下载与目录下载的可选压缩通道：文件超过阈值且可压缩时先 gzip 压缩再过网络，
+对端解回原样。分工——压缩端用程序内置 flate2（纯 Rust，`backend/src/transfer_compress.rs`），
+对端由远端 `gzip`/`gunzip`/`tar` 工具承担（任务 start 时 `command -v` 探测一次）。无新增 RPC
+方法：现有传输方法增可选响应字段与新 `phase` 值，偏好开关走 `local/preferences` 白名单。
+
+**决策（任务 start 时一次定死，响应 `compression` 字段回传）**：`transfer_compress::decide`
+收敛全部本地条件——策略 `off` / 文件 < `transfer_compress_threshold_mib`（0=不限下限）/ 扩展名
+黑名单（jpg/png/mp4/mkv/mp3/flac/zip/7z/rar/gz/xz/bz2/zst/tgz/tar/iso/apk/deb/rpm/dll/exe/dmg/svgz/webp/gif/m4a/m4v/mov/mpeg/mpg/ogg/tbz 等大小写不敏感，无扩展名不拦）/ 远端缺工具 / 只读连接（下载侧远端要写临时件；上传侧 `ensure_writable` 已整体拦截）/ latin-1 裸包车道（用户路径不进 shell）——任一命中即 `none`，维持现状管线零变化；Gzip 判定再做远端工具探测，探测失败/超时（5s）也静默回退。
+
+**CPU 综合判断（M33 补充，弱机不加压）**：`auto` 策略下本机并行度（`available_parallelism`）
+≤2 核直接跳过压缩——压缩吃满单核在低配机上收益为负；`on` 策略是对该门槛的显式豁免（慢网快
+双核仍可能受益）。决策层核数门槛之上，上传预压另有**运行时吞吐守卫**（对所有策略生效）：
+压缩处理满 8 MiB 且耗时满 1s 时测一次速率，低于 20 MiB/s 即中止压缩、删半成品、按「不划算」
+回退普通推送——比核数更真实的「CPU 不行」信号，弱单核与被限流的容器都能兜住。下载方向的
+解压端速率约为压缩 3 倍且回退需重拉整流，不做运行时守卫，由决策层核数门槛覆盖。
+
+**上传**（`sftp/upload/finish` 后台推送段）：spool（存原始字节，分块协议与续传语义不变）→
+`compressing` 阶段本地 gzip 成 `upload-<taskId>.part.gz`（spawn_blocking，逐块检查取消旗标）→
+比率守卫：压缩后 ≥ 原始体积 95% 判不划算，删 .gz 回落普通推送 → 推送 .gz 到远端
+`<temporary>.gz`（`uploading` 事件分母切为压缩后体积）→ 远端 `gunzip -c '<tmp>.gz' > '<tmp>.part'`
+（exec 上限 300s，全路径 shell 单引号转义、临时件名固定派生自 taskId）→ 复用既有原子提交与
+权限保留 → 清理两侧 .gz。推送或 gunzip 失败（非取消）回落普通推送重传原始字节；取消立即终止。
+
+**下载**（`sftp/download/start` 压缩任务异步 prep）：远端 `gzip -c '<src>' > '<dir>/.dbx-download-<taskId>.gz'`
+（不改源文件；exec 上限 300s，超时后命令仍在远端跑，失败清理会把 .gz 摘目录）→ stat 比率
+守卫（同 95% 口径，不划算回退）→ `fetching` 拉取 .gz 到本地 `download-<taskId>.part.gz`
+（限速沿用 `transfer_download_limit_kib`，按压缩流计）→ `decompressing` 本地 MultiGzDecoder
+解压成 `download-<taskId>.plain`（体积与声明 size 不符视为损坏，回退）→ `ready` 事件
+（`phase: "ready"` + `compression` 标明实际通道）→ 此后 `sftp/download/next` 从本地解压暂存按
+offset 读（不再远端 seek），事件带 `compression: "gzip"`、分母回原始体积。saveToLocal 完成时
+`download-<taskId>.plain` rename 落位（沿用冲突让位语义）；浏览器模式字节照常经分片帧到前端，
+暂存在成功后清理。任一 prep 步失败回退：registry 改回 `none`、清理两侧临时件、发
+`ready + compression:"none"`，前端照普通管线直读远端。**压缩下载不支持 offset 续传**——
+`offset > 0` 的 start 恒走普通管线（前端无需特殊处理）。
+
+**目录下载**（树任务）：扫描前置后决策（latin-1 树/空树强制 `none`；树不做比率守卫——归档对
+混合内容几乎必赚）。满足时远端 `tar -czf '<dir>/.dbx-tree-<taskId>.tgz' -C '<root>' .`
+（相对打包，成员名 `./relative/...` 与扫描相对路径直接对齐，不依赖 `--strip-components`）→
+拉取 → 本地 `tar` crate 解包进落点目录内隐藏 staging 根 `.dbx-tree-<taskId>.staging`
+（仅普通文件与目录，链接/特殊文件跳过——与树管线「不跟随 symlink」语义对齐；`unpack_in` 自带
+路径穿越防护，`..`/绝对路径条目静默跳过不入账）→ `ready` → 分块管线从本地 staging 逐文件读。
+完成时 staging rename 成 `final_download_path` 让位名（同卷零拷贝，跨卷递归拷贝兜底）；取消/
+未完成整 staging 删除（沿用树任务 root_local 语义）。目录上传走逐文件压缩（各文件独立任务），
+不引入跨任务打包。
+
+**进度事件（`sftp/transfer/progress`）**：新增可选 `phase` 值与 `compression` 字段（"gzip"）。
+上传：`staging → compressing → uploading`（compressing 分母=原始大小、字节记 staged）；
+下载压缩任务：`compressing → fetching → decompressing → ready → transferring`。各阶段事件
+`transferred/size` 自描述（fetching 分母=压缩流体积，decompressing/transferring 分母=原始
+体积），普通下载与普通树事件无 phase（线上兼容）。前端归并按阶段切计数器，
+本地 CPU 阶段（staging/compressing/decompressing）不计速度。
+**上传事件恒带 `compression`（2026-09-29 补齐，与下载同语义）**：普通管线为 `"none"`；
+决策 gzip 的任务从建卡（start 响应）起各阶段事件带 `"gzip"`，预压不划算/压缩推送或远端
+gunzip 失败回退后，后续（uploading/终态）事件降回 `"none"`——前端据此清徽标；
+`sftp/transfer/list` 的上传行与 `sftp/transfer/status` 的上传分支同字段。
+**`transferring` 阶段（2026-09-30 补齐，评审 M-1）**：压缩单文件与压缩树（含 prep 回退）
+ready 之后的本地暂存分块供给段显式带 `phase: "transferring"`（分母=原始体积）——此前
+供给段无 phase，前端继承 ready 后计数冻结在解压终值（进度恒 100%、速度 0）。普通
+管线（含普通树）仍无 phase。
+
+**清理与磁盘**：两侧临时件（本地 `.part.gz`/`.tgz`、远端 `.dbx-*-<taskId>.gz/.tgz`）在完成/
+失败/取消三态 best-effort 清理（重复删除无害；取消与 prep 建件的竞窗由取消路径的远端删除 +
+prep 退出兜底双保险）。**会话关闭是第四条等价清理路径（2026-09-30 补齐，评审 H-2）**：
+`cleanup_download_assets` 统一收口 sink `.part`、树半成品根目录、sudo 远端暂存与压缩任务的
+plain/`.gz`/远端临时件，取消与会话关闭都穿过它（此前会话关闭只删 `.part`，树半成品与压缩
+资产按 16GiB 级残留）；上传侧同路径补删 `<spool>.gz` 与孤儿 meta。**sidecar 启动清扫**
+（2026-09-30，评审 L-2）：`transfers/downloads/` 整目录清空（下载临时件不可续传），上传侧
+只清「meta 在而 spool 不在」的孤儿 meta、永远可再生的 `.part.gz` 与超过 7 天龄期
+（`UPLOAD_SPOOL_RETENTION`）的超龄 spool（连同 meta——断点续传不跨「7 天前」的窗口），
+健康续传态（`.part`+`.json`）原样保留。磁盘放大：上传本地 spool 2×（原始 + .gz）、远端 .gz+plain 2×、下载
+本地 .gz+.plain 2×、树远端 .tgz+源树 2×；`MAX_TRANSFER_SIZE`（16 GiB）仍按原始大小语义。
+
+### 递归目录下载（sftp/download/tree/start）
+
+纯 SFTP 递归下载一个远端目录，**不依赖远端 shell、不在远端产生临时打包文件**。参数
+`{ sessionId, remotePath, downloadDir? }`（`downloadDir` 为本机绝对目录，缺省用偏好下载目录）。
+`start` 先做远端 BFS 扫描（`read_dir`，有界：≤50 000 文件、≤10 000 目录、深度 ≤64，超限整体报错
+而不静默截断），随后创建本地根目录并镜像全部子目录（**空目录也保留**）。返回
+`{ taskId, fileName, size, chunkSize, fileCount, dirCount, skippedCount }`，其中 `size` 是整树
+字节总量（聚合进度的分母）。
+
+**文件名编码（M15-B，M16 起判定走连接级优先级）**：生效编码为 `latin-1`（全局偏好或本连接覆盖，见 `local/preferences` 行）时远端遍历改走裸包 READDIR（同一
+通道内 LSTAT 根预检 + 递归），整树路径字节保真——远端文件路径用 wire 转义形式（分块下载按
+转义自动走 raw READ——该车道 M19.5 才真正落地，此前转义名的逐文件读取会以 NO_SUCH_FILE
+记失败跳过、本地只剩空目录骨架），本地落盘名（含根目录名）用 latin-1 解码的显示名；symlink/特殊条目同样
+跳过不跟随，容量上限与容错语义不变。裸包通道建立失败自动回退高层遍历（只读，安全）。`auto`
+模式行为完全不变。
+
+之后**复用现有单文件分块管线**：`sftp/download/next` 按序逐文件传输（文件完成即把暂存 `.part`
+改名落位并接续下一文件，调用方循环写法与普通下载完全一致），`next_offset` 语义为整树聚合字节
+位置；队列耗尽后 `next` 返回空 `eof` 块（零字节树由此完成，调用方须循环到 `eof` 而非字节数）。
+`sftp/download/finish` 返回
+`{ success, taskId, localPath, fileCount, failedCount, skippedCount, failedFiles: [{ path, error }] }`
+（`failedFiles` 内联上限 50 条，完整计数始终随行）。`sftp/transfer/progress` 事件为聚合进度，
+树任务额外携带 `fileCount`/`fileIndex`/`currentFile`。
+
+语义约定：
+
+- **符号链接与特殊条目默认跳过**（永不跟随，防环），计入 `skippedCount`。
+- **容错**：单个文件/子目录读取失败只记入失败汇总并继续；整树完成时任务状态仍为 `completed`
+  并携带 `failedCount`，由工作台提示「N 个文件失败」。
+- **同名冲突**：根目录名按单文件下载同一让位策略（` " (n)"`）在 start 时定名；目录下载无
+  「覆盖」语义。
+- **路径防护**：服务端返回的每个路径分量都经文件名消毒（`.`/`..`/分隔符/控制字符中和），落盘
+  前再校验最终路径必须仍在本任务下载根之下。
+- **取消/未完成**：`sftp/transfer/cancel` 或未传完即 `finish` 时**整棵半成品目录删除**（根目录是
+  本任务新建的让位目录，删除不伤及既有文件）；部分成功（`failedCount > 0`）的完成结果保留。
+- 仅桌面本机落盘模式可用（`local/capabilities.canSaveLocal`）；web/docker 无本地文件系统时工作台
+  直接提示不可用。单个文件大小仍受 16 GiB 传输上限约束，超限文件记为失败而非中断。
+
+### 外部编辑器 watcher（watch/start、watch/stop、watch/stop-all、watch/upload）
+
+SFTP「用外部编辑器打开」的回写链（M15 立项，M20/M21 真容器收口；实现 `backend/src/file_watch.rs`）。
+前端先把远端文件经 `sftp/download/start` 带 `downloadDir=<下载目录>/remote-edit/<时间戳>/` 落盘，
+打开 OS 默认应用后调 `watch/start` 登记监听；编辑器保存且 sidecar 确认内容真变后发
+`watch/file-modified` 事件，工作台按回传策略处置（默认 `auto`：保存即静默 `watch/upload` 回传；
+可切 `ask` 逐次弹确认，见下节「外部编辑器目录与打开方式」末段）把当前磁盘字节推回远端。
+
+- `watch/start {sessionId, remotePath, localPath}` → `{watchId}`。仅桌面端（本地下载能力缺失直接拒绝，
+  web/docker 无本机文件系统语义）；`localPath` 必须是插件自身 `remote-edit/` 下载目录之下、经
+  canonicalize 校验的既有普通文件——路径来源门禁（watchId 是持有即可用的令牌，任意本机路径绝不可
+  监听、更不可经回写推到远端）。同一 `{sessionId, canonical localPath}` 重复登记时旧 watcher 先拆、
+  以新快照为基线。**同一远端路径的多个本地副本各自持 watcher**（每次打开落新的时间戳目录，dedup
+  键是本地副本路径而非远端路径）——任何一个副本保存都会对同一远端目标发事件，前端上传串行链保证
+  最后写入者生效（2026-10-03 真机回归：此前前端注册表按 remotePath 顶替，旧窗口保存被静默丢弃）。
+  指纹上限 64 MiB：超过该值的文件登记时**不再拒绝**（2026-10-03 修复：原实现无法建立基线导致
+  外部编辑 >64MiB 文件一律报「远端文件不存在」假错），改以 size+mtime 建基线（无哈希权威比对，
+  判定较粗但可用）；监听期间快照同理降级，len+mtime 即判定。
+- **监听对象是父目录**（`NonRecursive`，2026-10-03 修复）：原子保存（写临时件 + rename 覆盖，WPS/
+  Office 及部分 VS Code 路径的保存形态）会交换 inode，文件级 inotify 监听在首次保存后即失聪；
+  目录级监听对 rename 覆盖免疫，同目录噪音（锁文件/临时件）只会重臂防抖、由指纹判定兜底，不
+  会误发。
+- 事件判定：notify 事件 500ms 防抖合并；**启动抑制窗为 0**（2026-10-03 修复：原 2s 窗口会把
+  「编辑器已在运行、秒开秒存」的真实早期保存静默吞掉——预热噪音本就由基线指纹把关，重写已下载
+  字节分类为 Same 不发事件）；基线指纹（len+mtime 预滤 + SHA-256 权威比对）确认字节真变才发
+  `watch/file-modified {watchId, sessionId, localPath, remotePath}`（不含文件内容）；发出后的状态
+  成为新基线——同内容重复保存不再触发。文件消失或所属会话死亡时 watcher 自清理；
+  `ssh/session/close` 回收该会话的全部 watcher。
+- `watch/stop {watchId}` → `{success}`，未知 id 报 `Watch was not found`；`watch/stop-all {sessionId}`
+  → `{success, stopped}`（移除数量）。
+- `watch/upload {watchId}` → `{remotePath, size}`：sidecar 重新校验路径来源（防 start 后本地路径被
+  符号链接调包）后读取当前字节（≤256 MiB，2026-10-03 起与手动本机上传 `sftp/upload-local` 上限对齐，
+  原 64 MiB 会把能打开的大文件编辑卡死在回传一步；整文件读入内存做单次原子提交，超限拒绝且不启动
+  读取），
+  按 `sftp/write` 同款「`.dbx-part` 暂存 → 原子 rename、权限位保留」落回远端；只读门禁
+  `ensure_writable` 与其他 SFTP 写一致。latin-1 连接按 watch 所属连接的编码判定整条 wire 还原后
+  走裸包字节保真回写（M21）。
+
+### 外部编辑器目录与打开方式（local/editors/list、local/open-with）
+
+「按扩展名映射编辑器」的数据面（编辑器映射增强，对标 WinSCP Preferences→Editors 的文件掩码
+关联与 Explorer「打开方式」；实现 `backend/src/local_editors.rs`）。目录来自内置知名编辑器清单
++ 本机探测：macOS 查 `/Applications`/`~/Applications`，Windows 查标准安装路径（含 WPS
+`<root>\Kingsoft\WPS Office\<version>\office6\` 版本目录扫描），Linux/其他查 PATH——
+探测只查文件系统、绝不 spawn 进程；unavailable 条目仍返回（前端关联列表可引用，编辑器装好
+后即时生效）。映射/关联配置（扩展名→编辑器、默认编辑器、自定义编辑器清单、回传策略）持久化
+在前端 pluginStore 单键（`ssh-editor-config`，`frontend/src/lib/editorRules.ts` 净化），sidecar
+不读——打开时前端把解析结果传给本方法。
+
+- `local/editors/list` → `{platform, editors: [{id, name, available, launch, suggestedExtensions}]}`。
+  `launch` 为 `{kind:"openApp", appId}`（macOS `open -a`）或 `{kind:"exe", exe, args}`（argv 直接
+  spawn，`{file}` 占位符打开时替换为下载路径；缺省占位符则路径追加末尾）。Windows 侧
+  CreateProcess 不能执行 `.cmd`，VS Code 只探测两个标准 `.exe` 安装路径（用户级/机器级）。
+- `local/open-with {path, editorId}` 或 `{path, custom: {name, command}}` → `{success}`。路径
+  allowlist 与 `local/open` 同源（传输历史中已完成下载的 `localPath` 精确匹配，其余一律拒绝，
+  防任意路径执行原语）；`editorId` 未知报 `Unknown editor id: …`，目录中已定义但本机未安装报
+  `Editor '…' is not installed on this machine`。`custom.command` 按 shlex 风格分词（Windows
+  友好偏差：引号外反斜杠除转义引号/反斜杠外保持字面，`"C:\Program Files\app.exe"` 保形），
+  首 token 为可执行文件、其余为参数，argv 直接 spawn 不过 shell；空命令报
+  `Custom editor requires a non-empty command`，分词遇未闭合引号报
+  `Command has an unterminated quote`。
+- 回传策略（`uploadPolicy`）是前端行为：`auto`（默认，FinalShell 式）下 `watch/file-modified`
+  命中即直接 `watch/upload`，`ask` 保持逐次确认弹窗；确认弹窗的「总是上传」仍是逐 watchId
+  记忆（`frontend/src/composables/useExternalEdits.ts`）。
+
+### sudo 下载（DownloadSudo）
+
+root 权限的大文件二进制下载（M14-C，对标 tiny-rdm DownloadSudo），补齐「sudo/readFile 退化下载
+受 exec+base64 包尺寸限制」的缺口。**方案取舍**：选用**远端临时文件**方案——`sudo/download/start`
+把源文件经 sudo 编排（密码/2FA/白名单/只读拒绝与 sudo 族完全一致）拷进远端临时件，再把临时件登记
+进下载注册表；`sftp/download/next`、`sftp/download/finish`、`sftp/transfer/progress` 事件与传输面板
+**全部原样复用**。备选的 `sudo dd` 逐块流式方案被否：exec 输出通道无二进制边界、无 seek/续传、每块
+都要过密码编排，且需要为下载族另建一整套分块/进度/取消管线。
+
+- `sudo/download/start`：参数 `{ sessionId, path, saveToLocal?, downloadDir?, conflict? }`——参数名
+  沿用 sudo 族的 `path`；`saveToLocal`/`downloadDir`/`conflict` 语义与 `sftp/download/start` 完全一致。
+  返回 `{ taskId, fileName, size, chunkSize, resumeOffset, saveToLocal, sudo: true }`（`fileName` 为
+  **源文件名**而非临时件名）。无独立 `status` 方法（对齐下载先例：进度经 `sftp/transfer/progress`
+  事件与 `sftp/transfer/list`/`history` 查询）。
+- **暂存流程**：sudo `stat` 校验源为普通文件并取 size → plain exec `id -u` 取登录用户 uid →
+  `mktemp` 在**源文件同目录**创建 `.dbx-sudo-dl-XXXXXXXX`（同文件系统：空间语义与源一致，避开 /tmp
+  常见 tmpfs——大文件拷贝会吃内存）→ `chown <uid>` + `chmod 600`（SFTP 会话以登录用户读临时件；
+  0600 + 用户属主仍然只有该用户可读，不会出现 root 临时件全局可读的窗口）→ sudo `cat src > tmp` →
+  sudo `stat` 校验临时件与源**等大**（ENOSPC/中断在这里暴露）→ SFTP `metadata` 提前探测登录用户
+  可读（源目录不可穿越——如 `/root` 0700——时给出明确错误而非首块分块才失败）。
+- **限制**：拷贝走一次阻塞 exec，受 5–300s 超时夹取（超时/失败即清理报错）；单个文件仍受 16 GiB
+  传输上限；暂存期间远端需要与源等量的临时空间。
+- **清理（finally 语义）**：完成、失败（未传完即 finish）、取消（`sftp/transfer/cancel` 或
+  `sudo/download/cancel`）、注册失败、会话关闭五条路径都 best-effort sudo `rm -f` 临时件；清理失败
+  不吞掉原结果——成功响应附加 `warning` 字段、其余路径落 sidecar stderr。清理命令有命名空间防护：
+  只允许删除最终文件名以 `.dbx-sudo-dl-` 为前缀的路径。
+- `sudo/download/cancel`：参数 `{ taskId, reason? }`，与 `sftp/transfer/cancel` 同构（任务住同一个
+  传输注册表；reason slug 语义相同）。前端取消路径走 `sftp/transfer/cancel`，效果一致。
+
+### sudo 上传（UploadSudo）
+
+sudo 模式下向登录用户不可写目录（如 `/root`）上传（对标 sudo 下载 M14-C 的对偶缺口）。普通上传车道
+的 `.part` 暂存件必须落在目标目录（同目录 rename 原子提交），在 0700 目录上必然 EACCES；终端里
+`sudo su` 只改变 shell 身份，SFTP 子系统永远以登录用户运行，协议层无解——所以上传换道而不是换身份。
+
+- `sudo/upload/start`：参数与返回同 `sftp/upload/start`（`{ sessionId, remotePath, size,
+  resumeTaskId? }` → `{ taskId, chunkSize, resumeOffset?, compression }`，参数名沿用上传族
+  `remotePath`）。分块二进制帧（`sftp/upload/<taskId>`）、`sftp/transfer/progress` 事件、
+  `sftp/transfer/cancel`、断点续传（`resumeTaskId` 校验同一份 spool meta）**全部复用**。
+  压缩通道（M33）对 sudo 车道**正常参与**：`.gz` 暂存与远端 `gunzip -c` 还原都落在登录用户
+  home 暂存件上（gunzip 为 plain exec，home 由登录用户可写，无需 sudo），全程不触碰目标目录；
+  latin-1 连接决策强制 none（与普通车道同源）。
+- **提交流程**（`sudo/upload/finish`）：spool → SFTP 推到**登录用户 SFTP home** 下的
+  `.dbx-sudo-ul-<taskId>.part`（home 由 `canonicalize "."` 探测，注册前定死以便取消收尾；刻意
+  不用 /tmp——常见 tmpfs 会把大文件吃进内存）→ 压缩任务先推 `.gz` 暂存件再 plain exec
+  `gunzip -c` 还原（推送/解压失败回落普通推送，与普通车道同语义）→ 目标已存在时 sudo `stat`
+  取权限位、sudo `chmod` 拷到暂存件（对齐普通车道「+x 保持」语义，best-effort）→ 单条 sudo
+  `sh -c` 完成「target→backup 让位 → 暂存件 `mv -f` 到位 → backup 清理」，mv 失败把 backup
+  滚回 target 后非零退出。提交 exec 超时 300s。
+- **限制与边界（登记）**：`mv` 跨文件系统时退化为复制+删除（非原子，普通车道的同目录 rename
+  原子性在此不成立）；暂存期间登录用户 home 需要与文件等量的临时空间；latin-1 连接下目标名按
+  显示字符串进 exec 命令串（UTF-8 边界，非 UTF-8 字节名不适用，与 sudo 族其他成员同源）；会话
+  死亡时暂存件残留与普通车道 `.part` 残留同类，不追加清理链。sudo 车道不进 latin-1 裸包快路
+  （暂存件是 ASCII 路径，高层客户端无碍）。
+- **前端分流**：`sudoMode && canWrite` 时上传全链换道——`uploadSource` 换 start/finish 方法；
+  重复预检 `sftp/exists`/`sftp/rename-unique` 分别换 `sudo/exists` 与 `sftp/rename-unique`
+  新增可选 `sudo: true`（后端改走 sudo `test -e` 逐候选探测，撞名让位语义与普通车道一致）；
+  文件夹上传的逐目录建目录换 `sudo/mkdir`。sudo 下载同判定（右键单项「下载」与批量下载对普通
+  文件自动换 `sudo/download/start`，sudo 模式下独立「sudo 下载」菜单项隐藏避免重复入口；目录
+  保持普通树下载——sudo 下载无目录暂存语义）。
+- 只读连接不换道（sudo 族对只读 fail closed，普通车道对可读目标的下载/上传不受影响）。
+
+### 文件夹整包上传（folderArchive）
+
+大目录（≥200 个文件，前端 `FOLDER_ARCHIVE_THRESHOLD`）拖拽/选择器上传自动换「流式 tar 整包」：
+前端把文件清单生成**单个 POSIX ustar tar**（纯实现无新依赖，512 头 + 内容补齐逐字节可预算，
+声明大小精确、无需预压缩），走既有上传管线（网络腿 gzip 由 M33 决策、sudo 车道由 UploadSudo
+接管），落盘后一条命令在远端解包——大目录从「N 次上传（sudo 车道 N 次 sudo 编排）」变成
+「1 次归档上传 + 1 条 `tar -x`」，也绕开宿主桥拖拽目录展开的 2000 文件/8 层上限对**后续**
+上传次数的放大。
+
+- **前端**（`lib/folderArchive.ts`）：tar 名字 ≤100 字节直接入 name 字段，更长先试 ustar
+  前缀拆分（prefix ≤155），拆不开走 GNU LongLink（`././@LongLink`，typeflag `L`）；单文件
+  ≥8 GiB 的 size 字段走 base-256。条目 mode 统一 0644、uid/gid=0；宿主桥清单不含 mtime 的
+  条目落档时刻。`readChunk` 只向前推进，断点续传时本地重生成并丢弃前缀（不经网络）。整包
+  超过 16 GiB（sidecar `MAX_TRANSFER_SIZE`）回退逐文件并提示。latin-1 连接不走该车道
+  （tar 头名字节与解包命令串都是 UTF-8 边界，登记边界）。
+- **远端解包**：复用 `sftp/extract` 新增可选 `sudo: true`——列档（`tar -t` 校验坏档/空档）与
+  解包（`mkdir -p` + `tar -x[z]f`）都经 sudo 编排；sudo 分支跳过 SFTP 撞名预检（整包语义就是
+  解包覆盖，逐文件的 rename/ask 策略作用于归档文件名本身，由上传预检承担）。解包成功后前端
+  删除归档（sudo 车道 `sudo/remove`）；解包失败保留归档供手工处理。
+- **边界（登记）**：进度按归档字节（不再逐文件）；解包非原子（中途失败留部分文件，与逐文件
+  车道同类）；条目权限/属主统一（需要保留可执行位时用单文件/归档右键功能）；宿主桥拖拽清单
+  本身仍受宿主 2000 文件上限——整包车道只影响已交付清单的上传方式，截断提示由前端
+  `hostDrop.truncated` 通知承担。
+
+### ssh/metrics/history
+
+参数 `{ sessionId, limit? }`（默认/上限 720）。返回 `{ connectionId, samples: [...] }`，样本旧→新排列，
+每行 `{ connectionId, ts, cpuPercent?, memoryPercent?, load1?, rxRate, txRate }`（时间戳 Unix 毫秒）。
+落盘为 `<data_dir>/metrics-history.jsonl`，每次**新鲜** `ssh/metrics` 采集追加一行（缓存命中不落），
+环形上限 720 行（≈5s 轮询 × 1h）；行按连接 id 维度过滤读取，跨 sidecar 重启保留；坏行跳过。
+`cpuPercent`/`memoryPercent` 快照缺失时整键省略（非 null 占位）。
+
+### ssh/processes/list、ssh/processes/kill
+
+`ssh/processes/list`：参数 `{ sessionId }`。单条只读命令：`ps` 段
+`ps -eo pid=,ppid=,user=,pcpu=,pmem=,etime=,state=,args= | sort -k3,3nr | head -n 500` 采集，
+其后追加三段 best-effort 段（同一命令内完成）：`--fds--`（纯 shell 内建遍历
+`/proc/<pid>/fd` 计数，无可读权限的目录跳过）、`--sock--`（`find -lname/-printf` 枚举
+`/proc/<pid>/fd/*` 中指向 socket 的符号链接，单次 spawn，映射全在解析端完成）、
+`--netp--`（`cat /proc/net/tcp /proc/net/tcp6` 原始 dump，解析端只取监听态 `0A`）。
+返回 `{ processes: [{ pid, ppid, user, cpuPercent, memPercent, etime, state, command, fdCount, listenPorts }] }`
+（CPU 降序、服务端封顶 500 行、`command` 截断 200 字符；前端可本地重排）。
+`fdCount`（打开句柄数）与 `listenPorts`（该 pid 拥有的监听 TCP 端口，去重升序、上限 16 个，
+由 fd 符号链接 inode 与 `/proc/net/tcp{,6}` inode 匹配得到）为 best-effort 扩展字段：
+取不到（非 root 下的其他用户进程、macOS/BSD 无 procfs、busybox find 不支持 `-printf`）
+时 `fdCount` 为 `null`、`listenPorts` 为空数组，调用方按占位符展示，不要当 0。
+全程只读、无 sudo 降级；不进 MCP 工具面。
+
+`ssh/processes/kill`：参数 `{ sessionId, pid, signal? }`（默认 15）。后端校验：pid 为正整数且
+`> 1`（init/pid 0 直接拒绝），signal 仅接受 `1/2/9/15`；渲染为 `kill -<NAME> <pid>`（数值全部白名单化，
+无注入面）。返回 `{ success: true, pid }`；远端退出码非 0 报错（如进程不存在）。
+
+### ssh/recording/start、stop、list、get、delete、search
+
+会话级录制：`ssh/recording/start`（参数 `{ sessionId }`）在会话读循环安装录制器，输出
+（stdout+stderr、目录跟随过滤后、不含 State 帧）以 asciicast v2 JSONL 写入
+`<data_dir>/recordings/<recordingId>.cast`——首行为 v2 头（`version/width/height/timestamp/env/meta`，
+`meta` 携带 `sessionId/connectionId/host`），其后每行 `{"time": <秒>, "eventtype": "o", "eventdata": "…"}`
+（单事件截断 256 KiB）。每会话同时最多一段录制，重复 start 报错；会话关闭（读循环退出）自动
+finish，无需显式 stop。`stop` 返回摘要
+`{ recordingId, sessionId, connectionId, host, path, startedAt, durationSecs, events, bytes }`。
+
+`ssh/recording/list` 无参 → `{ recordings: [{ recordingId, sessionId, connectionId, host, startedAt,
+durationSecs, bytes }] }`（文件 mtime 新→旧；坏文件跳过）。`ssh/recording/get` 参数
+`{ recordingId, offset?, limit? }`（limit 上限 500）→ `{ recordingId, offset, total, hasMore,
+events: [{ time, type, data }] }`（旧→新分页）。`ssh/recording/delete` 参数 `{ recordingId }`
+删除文件；id 走路径穿越校验（含 `/`、`\`、`..` 拒绝）。录制属工作台能力，不进 MCP 工具面；
+`ssh/sessions/list` 每行新增 `recording: bool` 反映该会话是否录制中。
+
+`ssh/recording/search`（M14）参数 `{ query }` → `{ recordings: [{ recordingId, sessionId,
+connectionId, host, startedAt, durationSecs, bytes, nameMatch, hits: [{ time, excerpt }] }] }`：
+无持久索引，对现存 `.cast` 即时扫描（上限 200 个录制、每录制最多 5 条命中，excerpt 以
+ANSI/OSC 剥离 + 换行压平后的单行文本截取约 120 字符、命中词完整保留）。命中 = 名称命中
+（`host`/`recordingId` 包含查询词，大小写不敏感，`nameMatch: true`、`hits` 可为空）或内容命中
+（stdout 展平文本包含查询词）。空查询返回空集（前端显示未过滤列表）；新→旧排序同 `list`。
+
+会话自动录制（M14）：偏好键 `auto_record`（`local/preferences/set` 白名单布尔，默认关），
+sidecar 启动与偏好写入时同步进程内快速标志（同 `x11_forwarding` 模式）；`ssh/session/open`
+按该标志对每个新会话自动挂录制器（只读连接不禁用——录制是被动输出捕获），已有录制进行中
+则跳过。两种情形均经事件 `ssh/recording/auto` 提示一次，负载 `{ sessionId, recordingId? }` 或
+`{ sessionId, skipped: true }`，只含 id 不含内容。Transcript 纯文本导出在前端完成（复用
+`ssh/recording/get` 分页 + 既有保存桥，ANSI 剥离/时间戳拼接为纯前端逻辑），不新增协议面。
+
+## completion/execute（补全 generator 执行）
+
+FIG 补全引擎的专用执行通道（wave-1 lane B）：把一条 generator 命令执行到**正确的 target 侧**（桌面 OS 与补全目标 OS 解耦——local 目标在 sidecar 所在机器、ssh 目标在远端会话机器），与普通用户 RPC（`ssh/exec`）不耦合，可单独限时、限输出、做安全策略。线协议冻结于 `frontend/src/lib/completion/host/protocol.ts`，字段逐字一致。
+
+参数（camelCase）：
+
+- `target`：`{ kind: "local" | "ssh", sessionId }`（internally tagged）。local 的 `sessionId` 标识发起补全的本地终端会话（wave-1 仅透传）；ssh 的 `sessionId` 是既有 SSH 会话 id。
+- `command`：generator 程序名（非空、不含 NUL）。
+- `args`：参数数组（≤32 个、每个不含 NUL）。
+- `cwd`（可选）：工作目录。local target 生效（子进程 `current_dir`）；**ssh target wave-1 不支持，非空即报 `completion: cwd is not supported for ssh targets in wave 1`**（远端 cwd 语义留 wave 2 定义，显式失败优于静默在错误目录执行）。
+- `timeoutMs`：completion 层超时，clamp 到 [200, 3000]，缺省（0/缺字段）1200。
+- `maxOutputBytes`：单流输出上限，stdout 与 stderr **各自**截断；缺省（0）或超过 256 KiB 时取 256 KiB。
+- `mode`：必须为 `"completion-generator"`（防止普通 RPC 复用本通道）。
+
+返回 `{ exitCode: number | null, stdout, stderr, truncated, timedOut }`：
+
+- `timedOut=true` 表示 completion 层竞速超时（底层执行已尝试取消回收），此时 `exitCode=null`、输出为空；
+- `truncated=true` 表示 stdout 或 stderr 到达 `maxOutputBytes` 上限被截断；
+- ssh target 复用 `SshRuntime::exec` 通道，其返回的 `output` 是 **stdout+stderr 合并流**，显式映射到 `stdout`、`stderr` 恒为空（generator 按约定写 stdout，合并流对解析无影响）。
+
+语义要点：
+
+- **sudo 恒 false**：本通道永不提权；
+- **只读连接拒绝**（决策 D4）：ssh target 在只读连接上一律报错——generator 即命令执行，不能绕过只读承诺；local target 无只读概念；
+- **超时竞速**（决策 D3）：超时在 completion 层用 `tokio::time::timeout` 实现，不改 `ssh/exec` 内部的 5–300 秒下限；ssh 路径超时后以 `execId`（`completion-<uuid>` 前缀，与用户手写 execId 命名空间区分）走 `ssh/exec/cancel` 同路径回收在途任务，local 路径超时杀子进程并收尸；
+- **远端拼装**：`command` 原样 + `args` 逐个 `exec::shell_quote` 单引号转义后拼为一行，由远端默认 shell 解释（注入面只在 args，全部转义）；local 路径 argv 直 exec 不经 shell（Windows 无需引号处理）；
+- **local 隔离**：短生命周期子进程（stdin 接 /dev/null、`kill_on_drop`），不占用 `local/terminal/*` 的交互 PTY；
+- 错误统一字符串 Err 惯例并带 **`completion:` 前缀** 分类（如 `completion: mode not allowed`、`completion: invalid command`、`completion: too many args (max 32)`）。
+
+wave-1 不做 `completion/listDirectory`、`completion/environment`（wave 2+）。端到端冒烟：`scripts/smoke_completion.py`（方法未注册时 SKIP 而非 FAIL）。
+
+## 宿主 AI 通道（Warp AI 对齐批，前端桥）
+
+本插件自 2026-10-02 起经**宿主桥 JS 能力**接入 DBX AI 面板，sidecar 无新增方法、协议帧无变化：
+
+- 桥方法 `host.ai.openConversation`（manifest 需声明 `permissions: ["host.ai"]`）：参数
+  `{ title, prompt, context, send?, mode? }`，由宿主归一化并快照化（`snapshotPluginWorkbenchContext`）。
+  插件侧封装在 `frontend/src/lib/aiBridge.ts`，能力位 `capabilities.ai`（旧宿主缺省 = 不支持）。
+- **上下文契约**：`context.connectionId`（DBX 连接 id，AI 面板据此绑定连接）、`context.cwd`
+  （OSC 7/633 跟踪值）、终端输出快照——快照必须经 `lib/outputRedaction.ts`
+  （截断 + 脱敏）后方可出境；`#` 命令搜索只发自然语言与元数据。
+- **执行红线**：AI 生成内容不回写 PTY、不代执行；Agent 档（opt-in）的执行面为既有
+  MCP 工具 + `execPermissionMode` 审批 + `ssh/agent/prompt` 终端挑战，本插件不新增执行路径。
+- **直连文本生成（宿主 t8y2/dbx#10629 已发布）**：`host.ai.listProviders`/
+  `discoverModels`/`listModels`/`generateText`（能力位 `aiModelDiscovery`/
+  `aiCompletion`，桌面 Tauri 运行时独有；web 面板仅快照对话）。每次发送宿主
+  原生确认（插件名+模型）；输出 ≤16k 纯文本、预算 2048 token；systemPrompt
+  宿主钉死。Agent 档工具面（最新 main 实测）：scoped CLI/AI 会话按全局 MCP
+  策略（`dbx_plugin_tools`/`dbx_plugin_call`）+ 会话 scope 触达插件工具——
+  旧「Scoped AI 会话禁用 dbx_call_plugin_tool」记载过时，工具名已演进为
+  `dbx_plugin_list`/`dbx_plugin_tools`/`dbx_plugin_call`。
+
+## Scheduler Task Provider（task/\* 固定 RPC）
+
+manifest `task-provider` 贡献点（`io.dbx.ssh.tasks`，依赖 `io.dbx.ssh.connection` 与
+`io.dbx.ssh.local`）声明两个 trigger：`execute`（mode=run，一次性命令/脚本执行）与
+`resident`（mode=resident，常驻命令，语义如 `tail -F`）。实现位于
+`backend/src/task_provider.rs`，冻结契约
+（`integration/docs/adr/scheduler-task-contract.md` §6）只允许以下五个方法，
+**没有** `ssh/runScheduledCommand` 之类 provider-specific RPC：
+
+| 方法 | 请求 → 响应 |
+| --- | --- |
+| `task/validate` | `{task: {providerId, triggerId, connectionId, configVersion, config}}` → `{valid, errors[], warnings[]}`（纯配置检查，不拨号、不触碰 secret） |
+| `task/execute` | `{task: {taskId, runId, triggerId, connectionId, config}, run: {runId, attempt}, connection, runtime}` → `{success, exitCode?, message, artifacts}`；命令输出走 `task/log` 事件流 |
+| `task/start` | 同 execute 请求 → `{sessionId, state: "starting"}`；同任务已有存活会话按契约 Replace 语义先停旧 |
+| `task/stop` | `{runId?, sessionId?, reason?}` → `{}`；run 模式按 runId 取消，resident 按 sessionId 停止（等待真实拆链后再返回，上限 10s） |
+| `task/status` | `{sessionId?, taskId?}` → `{state, heartbeatAt, restartCount}`；未知 sessionId 报 `stopped`（sidecar 重启后宿主 reconcile 收敛） |
+
+语义要点：
+
+- **连接集成**：凭据只经既有 `connection/connect` 生命周期进入连接注册表，
+  task config 只携带 `connectionId`（红线：secret 永不进 task config / 日志 /
+  事件）。执行传输优先复用该连接的存活会话 handle；无存活会话时经
+  `connect_authenticated` 独立拨号（含 ProxyJump 链），run 结束即断开。
+- **本地 Shell 目标**（`io.dbx.ssh.local`，见 `src/local_target.rs`）：宿主在
+  `connection/connect` 生命周期 payload 里盖章 `provider.id`，插件据此把无凭据的
+  本地目标登记进 `SshRuntime::local_targets`（`connection/disconnect` 清除）。
+  task 执行按该注册表判定本地/SSH（禁止按 connection id 字符串猜测）：本地目标
+  用 `tokio::process::Command` 直接 spawn 连接表单的 Shell（空 = 本地终端同一
+  默认 Shell 解析链），环境/工作目录走进程级 `envs`/`current_dir`，流式日志、
+  取消、超时与 SSH 同契约；取消/超时对进程组先 TERM、1.5s 后升级 SIGKILL
+  （`process_group(0)` + 外部 `kill` 工具，零新增依赖）；`pty` 字段本地路径忽略。
+- **脚本文件（`script_path`）**：与 `command` 互斥、至少其一（`task/validate`
+  拒绝双填/双空）。运行开始读取本机脚本文件（≤4 MiB，同机同信任域）：SSH 目标
+  经任务传输自己的 handle 开 SFTP 会话上传到远端 `mktemp`（0600），以
+  `bash <tmp>`（无 bash 回退 `sh <tmp>`）作为 build_script 的末行执行——
+  environment/cd 框架照旧；temp 文件在所有路径（完成/取消/超时/出错）run 后
+  `rm -f` 清理。本地目标直接 `shell <script>` 执行文件（无需可执行位），文件
+  不存在在 spawn 前精确报错。
+- **事件**：`task/log {event, taskId, runId, seq, stream, level, message, timestamp}`
+  （seq 按 run 从 1 单调；stream ∈ stdout/stderr/system；stdout=info、
+  stderr=warn、system 按语义）；`task/state {event, taskId, runId, state}`
+  （run 模式：running→success/failed/cancelled/timeout；resident：
+  starting/running/stopping/stopped/crashed/degraded）；`task/progress`
+  （execute 起止 0/100）。所有日志行在出进程前过连接凭据脱敏器。
+- **Cancel/Timeout 真实终止**：`task/stop` 与配置超时都在 await 点退出后
+  显式 `EOF+CLOSE` 关闭 channel，由 sshd 回收远端进程（与
+  `exec_plain_cancellable` 同一不变量：裸 drop 不发 SSH_MSG_CHANNEL_CLOSE，
+  sudo timestamp 锁会残留）。
+- **有界 restart**：resident 崩溃按 `max_restarts`（钳 0..=50，默认 5）/
+  `restart_backoff_seconds`（钳 1..=3600，默认 10）/`restart_window_seconds`
+  （缺省 = 进程生命周期）滑动窗口计数，超限进入 `degraded`，禁止无限
+  crash loop；心跳（输出块 + 20s ticker）推进 `heartbeatAt` 供宿主监管。
+- **脚本编排**：`environment` 以 `export K='V'` 前置（POSIX 单引号转义，
+  不依赖服务端 AcceptEnv）；`working_directory` 以 `cd '<dir>' || exit 125`
+  守卫后另起一行执行命令（`cd X && cmd` 会把多行命令的后续语句泄出目录）。
+  传 WS 服务器（cmd.exe 远端 shell）不受支持，见既有 `remote_command` 同款限制。

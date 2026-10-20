@@ -1,0 +1,2778 @@
+//! Local (client-machine) terminal sessions.
+//!
+//! Spawns an interactive login shell in a pseudo terminal on the machine the
+//! sidecar runs on and pumps it over the same binary frame protocol the SSH
+//! terminal uses — `local/terminal/in/{sessionId}` carries the 8-byte BE
+//! sequence + keystrokes, `local/terminal/out/{sessionId}` answers with the
+//! 9-byte `TerminalFrame` prefix (stream + u64 sequence) backed by a shared
+//! [`ReplayBuffer`]. Output streams merge inside the PTY, so every data frame
+//! is `Stdout`; `State` frames only carry the terminal lifecycle.
+//!
+//! Deliberately out of scope here: everything SSH-specific (triggers,
+//! auto-sudo, directory handshake, recording, SFTP). The runtime owns its own
+//! session table — the SSH `SessionEntry` binds a russh handle and cannot
+//! carry a local child process.
+//!
+//! Shell choice follows the platform terminals' hard-won lesson (Ghostty,
+//! Warp, and the ttyd/Tabby breakage reports): on macOS a GUI process has no
+//! usable `PATH`, so the shell MUST start as a login shell, resolved from
+//! Directory Services' `UserShell` first. Injection only ever wraps the
+//! user's own startup chain — a broken rc must never keep the shell from
+//! reaching a prompt.
+
+use std::collections::{BTreeMap, HashMap};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use dbx_plugin_sdk::PluginEmitter;
+use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{mpsc, RwLock};
+
+use crate::model::TerminalStream;
+use crate::session_recording;
+use crate::ssh::ReplayBuffer;
+
+/// Grace for a EOF'd/HUP'd child to exit on its own (zsh/bash flush command
+/// history only on a clean exit) before the killer escalates to SIGKILL.
+const LOCAL_CLOSE_GRACE: Duration = Duration::from_secs(5);
+/// Second, shorter window after SIGKILL for the waiter thread to deliver the
+/// status; the child is being reaped either way.
+const LOCAL_KILL_GRACE: Duration = Duration::from_secs(2);
+/// Per-chunk budget for draining the PTY tail after the child is gone; the
+/// reader thread gets this long between chunks before the exited State frame
+/// is published without it.
+const LOCAL_EXIT_DRAIN: Duration = Duration::from_millis(500);
+
+const INTEGRATION_ZSH: &str = include_str!("shell_integration/integration.zsh");
+const INTEGRATION_BASH: &str = include_str!("shell_integration/integration.bash");
+const INTEGRATION_FISH: &str = include_str!("shell_integration/integration.fish");
+const INTEGRATION_PWSH: &str = include_str!("shell_integration/integration.ps1");
+const WRAPPER_ZSHRC: &str = include_str!("shell_integration/wrapper.zshrc");
+const WRAPPER_ZPROFILE: &str = include_str!("shell_integration/wrapper.zprofile");
+const WRAPPER_ZLOGIN: &str = include_str!("shell_integration/wrapper.zlogin");
+const WRAPPER_BASH: &str = include_str!("shell_integration/wrapper.bash");
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalTerminalStartRequest {
+    pub workbench_id: String,
+    pub cols: u32,
+    pub rows: u32,
+    /// Explicit shell override (absolute path or PATH-resolvable name).
+    pub shell: Option<String>,
+    /// Opt-out of shell integration injection; defaults to on.
+    pub shell_integration: Option<bool>,
+    /// Working directory to start in (workbench restart inherits the last
+    /// tracked cwd, VS Code new-terminal-in-workspace style). Must be an
+    /// existing directory; invalid values fall back to the home directory.
+    pub cwd: Option<String>,
+    /// The terminal's cursor position (1-based, on-screen) as the workbench
+    /// sees it at spawn time. ConPTY is created with
+    /// `PSEUDOCONSOLE_INHERIT_CURSOR`, so its opening `CSI 6n` asks the
+    /// terminal where the cursor is and starts the shell there; the reply must
+    /// carry this value, never the viewport size. Defaults to the top-left for
+    /// older workbenches that do not send it.
+    pub cursor_row: Option<u16>,
+    pub cursor_col: Option<u16>,
+    /// User-supplied environment variables layered over the inherited system
+    /// environment. Renderer input is sanitized defensively
+    /// ([`sanitize_user_env`]): integration env and the managed TERM family
+    /// always win, so a bad value can never break the rendering contract —
+    /// and a bad entry must never keep the shell from reaching a prompt.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+/// Caps for renderer-supplied env, bounded like every other renderer input.
+pub const USER_ENV_MAX_PAIRS: usize = 32;
+const USER_ENV_MAX_KEY: usize = 128;
+const USER_ENV_MAX_VALUE: usize = 4096;
+/// Env the sidecar manages for the workbench: the TERM family defines how the
+/// embedded terminal renders and `TERM_PROGRAM` is the plugin's detectability
+/// marker. User values for these keys are ignored (case-insensitively).
+const USER_ENV_MANAGED_KEYS: [&str; 3] = ["TERM", "COLORTERM", "TERM_PROGRAM"];
+
+/// Validates one user-supplied env pair: non-empty trimmed key within the size
+/// caps, no `=` and no control bytes (the spawn layer would reject or garble
+/// them), not a managed key, value within the cap. `None` = drop the entry.
+pub fn sanitize_env_pair(name: &str, value: &str) -> Option<(String, String)> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.len() > USER_ENV_MAX_KEY
+        || name.contains('=')
+        || name.bytes().any(|byte| byte.is_ascii_control())
+        || USER_ENV_MANAGED_KEYS
+            .iter()
+            .any(|managed| managed.eq_ignore_ascii_case(name))
+        || value.len() > USER_ENV_MAX_VALUE
+    {
+        return None;
+    }
+    Some((name.to_string(), value.to_string()))
+}
+
+/// Pure core of user-env validation over the request map: keeps the valid
+/// pairs up to the pair cap. `BTreeMap` iterates key-sorted, so the cap trims
+/// deterministically (same input → same survivors).
+fn sanitize_user_env(env: &BTreeMap<String, String>) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for (key, value) in env {
+        if pairs.len() >= USER_ENV_MAX_PAIRS {
+            break;
+        }
+        if let Some(pair) = sanitize_env_pair(key, value) {
+            pairs.push(pair);
+        }
+    }
+    pairs
+}
+
+/// Locale keys that govern character handling (issue #173): when any of them
+/// already carries a value — from the sidecar's own environment or the
+/// request — the shell already has a locale and injection must stay out.
+const LOCALE_KEYS: [&str; 3] = ["LANG", "LC_ALL", "LC_CTYPE"];
+
+/// Platform LANG defaults for a shell whose environment names no locale at
+/// all. macOS picks `en_US.UTF-8` — present on every macOS install and
+/// synthesized on demand for other UTF-8 locales, so it is the universal
+/// value (a `zh_CN` one would print dates in Chinese for users who never
+/// asked). Linux picks `C.UTF-8` — the one UTF-8 locale glibc always
+/// provides (built-in since 2.35, shipped by every mainstream distro and
+/// musl long before), unlike `en_US.UTF-8` which minimal installs never
+/// generate. Windows returns `None`: console encodings there are code pages
+/// driven by `chcp`/console APIs, which `LANG` cannot reach — the UTF-8
+/// switch happens in the spawn argv instead
+/// ([`apply_windows_utf8_console`]).
+fn default_utf8_lang(platform: Platform) -> Option<&'static str> {
+    match platform {
+        Platform::MacOS => Some("en_US.UTF-8"),
+        Platform::Linux => Some("C.UTF-8"),
+        Platform::Windows => None,
+    }
+}
+
+/// The LANG value to hand the PTY shell when it would otherwise run in the C
+/// locale, or `None` when a locale is already spoken. DBX launches the
+/// sidecar as a GUI process, and GUI sessions on macOS carry no `LANG` — the
+/// shell inherited that emptiness and fell back to `C`, where CJK input
+/// breaks down per byte (line editing, completion, filename display garble).
+/// `user_env` is the sanitized request pairs (what will actually be applied);
+/// `inherited` reports the sidecar's own environment. The gap is filled only
+/// when neither names one of [`LOCALE_KEYS`] with a non-empty value — a
+/// user-configured locale always wins, and `None` means the shell keeps what
+/// it already has.
+fn fallback_lang(
+    user_env: &[(String, String)],
+    platform: Platform,
+    inherited: &dyn Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
+    let user_speaks = user_env
+        .iter()
+        .any(|(key, _)| LOCALE_KEYS.contains(&key.as_str()));
+    let inherited_speaks = LOCALE_KEYS
+        .iter()
+        .any(|key| inherited(key).is_some_and(|value| !value.is_empty()));
+    if user_speaks || inherited_speaks {
+        return None;
+    }
+    default_utf8_lang(platform)
+}
+
+/// Switches a Windows ConPTY child's console to the UTF-8 code page by
+/// rewriting the spawn argv (issue #173 Windows side). A Chinese/GBK Windows
+/// boots the child console at code page 936, where conhost's byte-level
+/// console conversions (`ReadConsoleA`/`WriteFile`) and every program that
+/// trusts the console code page (`cmd type`, git, node, …) speak GBK while
+/// the terminal speaks UTF-8 — CJK output garbles the same way the C-locale
+/// shell did on Unix, and this is the same fix in Windows terms.
+///
+/// `chcp 65001` is the one lever that moves the console at once: it flips
+/// the input and output code page, which conhost's byte conversions follow
+/// and which the CRT picks up as its console default. PowerShell needs a
+/// second preset on top: its ConsoleHost pipes native-command output through
+/// its own decode layer keyed to `[Console]::OutputEncoding`, an encoding
+/// .NET Framework caches at process start — a later `chcp` moves the console
+/// but not that cache, so `cmd /c type` of a UTF-8 file kept garbling under a
+/// 65001 console until the .NET layer was pointed at UTF-8 as well (measured:
+/// `cmd /c chcp` reported 65001 while `type` still garbled, and presetting
+/// both layers made the bytes exact). The alternatives were evaluated and
+/// rejected: env injection is a no-op (the console code page is session
+/// state, no environment variable reaches it — `LANG` is unreadable by
+/// cmd/PowerShell), and either preset alone covers only one of the two
+/// layers. The rewrite is argv-only, so the user env merge semantics are
+/// untouched, and `chcp`'s own output is suppressed so the startup output
+/// window (the ConPTY handshake and the resize gate keyed to it) sees the
+/// same traffic as before. WSL manages its own UTF-8 world and arbitrary
+/// shells have no safe argv seam, so both stay untouched; the cmd wrapper
+/// ends with `title %COMSPEC%` because the `/k` command line would otherwise
+/// become the console title for the whole session.
+/// The PowerShell-side UTF-8 prelude: the console code page via `chcp`
+/// (conhost byte conversions + CRT) plus the .NET decode layer that
+/// PowerShell's ConsoleHost caches at process start. See
+/// [`apply_windows_utf8_console`] for why one without the other is not enough.
+const POWERSHELL_UTF8_PRELUDE: &str =
+    "chcp 65001 >$null; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8";
+
+fn apply_windows_utf8_console(
+    platform: Platform,
+    kind: ShellKind,
+    mut args: Vec<String>,
+) -> Vec<String> {
+    if platform != Platform::Windows {
+        return args;
+    }
+    match kind {
+        ShellKind::Cmd => {
+            let mut bootstrapped = vec![
+                "/k".to_string(),
+                "chcp 65001>nul&title %COMSPEC%".to_string(),
+            ];
+            bootstrapped.append(&mut args);
+            bootstrapped
+        }
+        ShellKind::PowerShell => {
+            // Fold into the integration -Command when injection produced one;
+            // a bare shell (integration off or the script write failed) still
+            // needs the switch and must stay open, hence -NoExit. The space
+            // before `>` is load-bearing: PowerShell lexes `65001>$null` as
+            // one literal argument (chcp then fails on `65001>`), cmd's
+            // `65001>nul` below has no such tokenizer rule.
+            if let Some(index) = args.iter().position(|arg| arg == "-Command") {
+                if let Some(payload) = args.get(index + 1) {
+                    args[index + 1] = format!("{POWERSHELL_UTF8_PRELUDE}; {payload}");
+                    return args;
+                }
+            }
+            args.extend([
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                POWERSHELL_UTF8_PRELUDE.to_string(),
+            ]);
+            args
+        }
+        _ => args,
+    }
+}
+
+enum LocalTerminalCommand {
+    Input(Vec<u8>),
+    Resize { cols: u32, rows: u32 },
+    Close,
+}
+
+struct LocalSession {
+    workbench_id: String,
+    shell: String,
+    /// Unix seconds when the session was opened (for `local/session/list`).
+    created_at_secs: u64,
+    terminal_tx: mpsc::Sender<LocalTerminalCommand>,
+    replay: Arc<AsyncMutex<ReplayBuffer>>,
+    /// Active asciicast recorder (`local/recording/start`); `None` while not
+    /// recording. Fed from the pump's output path, finished by the stop RPC —
+    /// a shell exit drops the slot, and the buffered writer flushes on drop.
+    recorder: Arc<Mutex<Option<session_recording::SessionRecorder>>>,
+    /// Spawn-time geometry, reused as the recording header's dimensions.
+    cols: u16,
+    rows: u16,
+}
+
+pub struct LocalTerminalRuntime {
+    sessions: Arc<RwLock<HashMap<String, Arc<LocalSession>>>>,
+}
+
+impl LocalTerminalRuntime {
+    pub fn new() -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub async fn start(
+        &self,
+        request: LocalTerminalStartRequest,
+        emitter: PluginEmitter,
+    ) -> Result<Value, String> {
+        let cols = request.cols.clamp(2, u16::MAX as u32) as u16;
+        let rows = request.rows.clamp(2, u16::MAX as u32) as u16;
+        let requested = request
+            .shell
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let ds_shell = directory_services_shell();
+        let shell_env = std::env::var_os("SHELL").map(|value| value.to_string_lossy().into_owned());
+        let spec = pick_shell(
+            requested,
+            shell_env.as_deref(),
+            ds_shell.as_deref(),
+            current_platform(),
+        );
+        let integration = prepare_integration(spec.kind, request.shell_integration.unwrap_or(true));
+        // The handshake reply is a cursor position, so it must land inside the
+        // viewport: an out-of-range value would inherit a position ConPTY
+        // cannot honour, and the shell's first output would be re-serialized
+        // mid-banner (the orphan-glyph artifact this reply exists to prevent).
+        let cursor = inherit_cursor(request.cursor_row, request.cursor_col, rows, cols);
+        // cwd：显式参数须为现存目录，非法值静默回落家目录（前端传的是上次
+        // 会话跟踪到的 cwd，目录可能已被删除）。
+        let cwd = request
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .or_else(home_dir);
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| format!("Failed to open a pseudo terminal: {error}"))?;
+
+        let mut command = CommandBuilder::new(&spec.program);
+        // Integration args replace the base login args wholesale (the bash
+        // wrapper reproduces the login chain itself — bash cannot combine
+        // `-l` with `--rcfile`). On Windows the UTF-8 console switch folds
+        // into the same argv afterwards (issue #173 Windows side).
+        let argv = apply_windows_utf8_console(current_platform(), spec.kind, integration.args);
+        command.args(&argv);
+        command.env("TERM", "xterm-256color");
+        // 24-bit color for programs that probe COLORTERM (VS Code sets the
+        // same), plus a detectable marker akin to TERM_PROGRAM=vscode.
+        command.env("COLORTERM", "truecolor");
+        command.env("TERM_PROGRAM", "dbx");
+        // UTF-8 locale fallback for a shell that inherited none (issue #173):
+        // a GUI-launched sidecar carries no LANG, so the shell line-edited in
+        // the C locale and CJK garbled. Applied beneath the user env below —
+        // an explicitly configured LANG/LC_* always wins.
+        let user_env_pairs = sanitize_user_env(&request.env);
+        if let Some(lang) = fallback_lang(&user_env_pairs, current_platform(), &|key| {
+            std::env::var(key).ok()
+        }) {
+            command.env("LANG", lang);
+        }
+        // User env sits beneath integration env: injection owns its mechanics
+        // (ZDOTDIR…) and the managed keys above are filtered out entirely, so
+        // the shell's rendering contract holds no matter what was sent.
+        for (key, value) in user_env_pairs {
+            command.env(key, value);
+        }
+        for (key, value) in &integration.env {
+            command.env(key, value);
+        }
+        if let Some(home) = cwd {
+            command.cwd(home);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| format!("Failed to start {}: {error}", spec.program))?;
+        // The sidecar's copy of the slave must die immediately: with it
+        // alive the master never sees EOF once the shell exits.
+        drop(pair.slave);
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|error| format!("Failed to read the pseudo terminal: {error}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|error| format!("Failed to write the pseudo terminal: {error}"))?;
+        let killer = child.clone_killer();
+
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let replay = Arc::new(AsyncMutex::new(ReplayBuffer::default()));
+        let recorder: Arc<Mutex<Option<session_recording::SessionRecorder>>> =
+            Arc::new(Mutex::new(None));
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        self.sessions.write().await.insert(
+            session_id.clone(),
+            Arc::new(LocalSession {
+                workbench_id: request.workbench_id.clone(),
+                shell: spec.program.clone(),
+                created_at_secs: unix_now_secs(),
+                terminal_tx: cmd_tx,
+                replay: replay.clone(),
+                recorder: recorder.clone(),
+                cols,
+                rows,
+            }),
+        );
+        spawn_pump(
+            session_id.clone(),
+            request.workbench_id,
+            rows,
+            cols,
+            cursor,
+            pair.master,
+            reader,
+            writer,
+            killer,
+            child,
+            cmd_rx,
+            replay,
+            recorder,
+            emitter,
+            self.sessions.clone(),
+        );
+        Ok(json!({
+            "sessionId": session_id,
+            "shell": spec.program,
+            "shellIntegration": integration.injected,
+        }))
+    }
+
+    async fn session(&self, session_id: &str) -> Result<Arc<LocalSession>, String> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "Local session was not found".to_string())
+    }
+
+    pub async fn resize(&self, session_id: &str, cols: u32, rows: u32) -> Result<(), String> {
+        self.session(session_id)
+            .await?
+            .terminal_tx
+            .send(LocalTerminalCommand::Resize { cols, rows })
+            .await
+            .map_err(|_| "Local terminal is closed".to_string())
+    }
+
+    pub async fn replay(
+        &self,
+        session_id: &str,
+        after_sequence: u64,
+        emitter: &PluginEmitter,
+    ) -> Result<Value, String> {
+        let session = self.session(session_id).await?;
+        let replay = session.replay.lock().await;
+        let first_available_sequence = replay.first_sequence();
+        let tail_sequence = replay.tail_sequence();
+        let frames = replay.after(after_sequence);
+        drop(replay);
+        for frame in &frames {
+            emitter
+                .binary(&format!("local/terminal/out/{session_id}"), &frame.encode())
+                .map_err(|error| error.message)?;
+        }
+        Ok(json!({
+            "frameCount": frames.len(),
+            "firstAvailableSequence": first_available_sequence,
+            "tailSequence": tail_sequence,
+            "complete": after_sequence.saturating_add(1) >= first_available_sequence
+        }))
+    }
+
+    pub async fn close(&self, session_id: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .write()
+            .await
+            .remove(session_id)
+            .ok_or("Local session was not found")?;
+        let _ = session.terminal_tx.send(LocalTerminalCommand::Close).await;
+        Ok(())
+    }
+
+    /// `local/recording/start`: attaches an asciicast recorder to a live local
+    /// shell. Mirrors `ssh/recording/start` in shape so the workbench's record
+    /// toggle can target either session kind; recordings land in the same
+    /// directory the list/replay family reads, with `host: "local"` metadata.
+    pub async fn recording_start(
+        &self,
+        session_id: &str,
+        data_dir: &Path,
+    ) -> Result<Value, String> {
+        let session = self.session(session_id).await?;
+        let mut slot = session
+            .recorder
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if slot.is_some() {
+            return Err("This session is already being recorded".to_string());
+        }
+        let recording_id = uuid::Uuid::new_v4().to_string();
+        let recorder = session_recording::SessionRecorder::start(
+            data_dir,
+            &recording_id,
+            "local",
+            "local",
+            session_id,
+            u32::from(session.cols),
+            u32::from(session.rows),
+        )?;
+        *slot = Some(recorder);
+        Ok(json!({ "recordingId": recording_id, "recording": true }))
+    }
+
+    /// `local/recording/stop`: finalizes the active recording (if any) and
+    /// returns its summary — the same document `ssh/recording/stop` reports.
+    pub async fn recording_stop(&self, session_id: &str) -> Result<Value, String> {
+        let session = self.session(session_id).await?;
+        let recorder = session
+            .recorder
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
+            .ok_or("This session has no active recording")?;
+        recorder.finish()
+    }
+
+    /// Closing a workbench tears down its local shells; a webview reload does
+    /// NOT pass through here, so a reload finds the shell again via
+    /// `local/session/list` + replay.
+    pub async fn close_workbench(&self, workbench_id: &str) {
+        let session_ids: Vec<String> = self
+            .sessions
+            .read()
+            .await
+            .iter()
+            .filter(|(_, session)| session.workbench_id == workbench_id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in session_ids {
+            let _ = self.close(&session_id).await;
+        }
+    }
+
+    /// Read-only inventory of live local shells (a session only exists while
+    /// its child runs), used by the workbench to reattach after a reload.
+    pub async fn list(&self) -> Value {
+        let sessions = self.sessions.read().await;
+        let mut list: Vec<Value> = sessions
+            .iter()
+            .map(|(session_id, session)| {
+                json!({
+                    "sessionId": session_id,
+                    "workbenchId": session.workbench_id,
+                    "shell": session.shell,
+                    "createdAt": session.created_at_secs,
+                })
+            })
+            .collect();
+        list.sort_by(|a, b| {
+            a["createdAt"]
+                .as_u64()
+                .cmp(&b["createdAt"].as_u64())
+                .then_with(|| a["sessionId"].as_str().cmp(&b["sessionId"].as_str()))
+        });
+        json!({ "sessions": list })
+    }
+
+    /// Keyboard input from the SDK's blocking binary-handler thread; the
+    /// bounded channel applies backpressure instead of dropping keystrokes.
+    pub fn write_input(&self, session_id: &str, data: Vec<u8>) -> Result<(), String> {
+        // Do not hold the session-map read guard while applying backpressure:
+        // closing a dead session needs the write lock to drop the receiver.
+        let terminal_tx = {
+            let sessions = self.sessions.blocking_read();
+            sessions
+                .get(session_id)
+                .map(|session| session.terminal_tx.clone())
+                // Same string contract as the SSH mirror — the workbench's
+                // dead-session detection matches on the error event.
+                .ok_or("Local session was not found or expired")?
+        };
+        terminal_tx
+            .blocking_send(LocalTerminalCommand::Input(data))
+            .map_err(|error| format!("Local terminal input queue is closed: {error}"))
+    }
+}
+
+async fn publish_local_terminal(
+    session_id: &str,
+    stream: TerminalStream,
+    data: Vec<u8>,
+    replay: &Arc<AsyncMutex<ReplayBuffer>>,
+    emitter: &PluginEmitter,
+) {
+    let frame = replay.lock().await.push(stream, data);
+    if let Err(error) = emitter.binary(&format!("local/terminal/out/{session_id}"), &frame.encode())
+    {
+        eprintln!(
+            "[ssh-sftp-plugin] local terminal output failed: {}",
+            error.message
+        );
+    }
+}
+
+/// Feeds the active recorder (if any) with an output burst about to be
+/// published. Stdout-only by construction — State frames never pass through
+/// here, mirroring the SSH pump. Sync and lock-scoped: never held across an
+/// await.
+fn observe_local_recording(
+    recorder: &Arc<Mutex<Option<session_recording::SessionRecorder>>>,
+    data: &[u8],
+) {
+    if let Ok(mut slot) = recorder.lock() {
+        if let Some(active) = slot.as_mut() {
+            active.observe(data);
+        }
+    }
+}
+
+/// Owns the PTY master for one session and multiplexes PTY output, workbench
+/// commands and the child's exit status. Terminal condition is the child's
+/// exit (or the bounded grace after a kill/EOF); the teardown publishes the
+/// State frame, notifies the workbench and drops the session.
+#[allow(clippy::too_many_arguments)]
+fn spawn_pump(
+    session_id: String,
+    workbench_id: String,
+    pty_rows: u16,
+    pty_cols: u16,
+    // The terminal's cursor at spawn time — the value ConPTY's inherit-cursor
+    // handshake must be answered with (see [`LocalTerminalStartRequest`]).
+    cursor: (u16, u16),
+    master: Box<dyn MasterPty + Send>,
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    mut killer: Box<dyn ChildKiller + Send + Sync>,
+    child: Box<dyn Child + Send + Sync>,
+    mut cmd_rx: mpsc::Receiver<LocalTerminalCommand>,
+    replay: Arc<AsyncMutex<ReplayBuffer>>,
+    recorder: Arc<Mutex<Option<session_recording::SessionRecorder>>>,
+    emitter: PluginEmitter,
+    sessions: Arc<RwLock<HashMap<String, Arc<LocalSession>>>>,
+) {
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if out_tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    });
+
+    let (exit_tx, mut exit_rx) = mpsc::unbounded_channel::<Option<u32>>();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let status = child.wait();
+        let _ = exit_tx.send(status.ok().map(|status| status.exit_code()));
+    });
+
+    let writer = Arc::new(Mutex::new(writer));
+    tokio::spawn(async move {
+        let mut master = Some(master);
+        // Tracked so same-size client resizes can be dropped before ConPTY
+        // (requested_pty_size) and so the CPR handshake answers with the live
+        // viewport, not the spawn-time one.
+        let mut pty_rows = pty_rows;
+        let mut pty_cols = pty_cols;
+        let mut closing = false;
+        let mut exit_code: Option<Option<u32>> = None;
+        let mut handshake_filter =
+            ConptyHandshakeFilter::new(current_platform() == Platform::Windows);
+        // Startup-window resize gate (Windows): host-driven geometry changes
+        // racing the shell's opening output are merged here and flushed once
+        // output stays quiet — see [`StartupResizeGate`]. The flush timer is
+        // pinned far-future while nothing is pending and re-armed from
+        // `next_wake` at the top of every loop turn.
+        let mut resize_gate = StartupResizeGate::new(current_platform());
+        let session_started_at = tokio::time::Instant::now();
+        let mut resize_flush_timer = Box::pin(tokio::time::sleep_until(idle_flush_deadline()));
+        loop {
+            if closing {
+                // Graceful-first teardown: with the master dropped the slave
+                // sees EOF and the shell exits cleanly — zsh/bash flush their
+                // command history only on a clean exit, an immediate SIGKILL
+                // would silently drop it. Only a child that outlives the
+                // grace window (hung job, `no hup` shell) gets the killer.
+                match tokio::time::timeout(LOCAL_CLOSE_GRACE, exit_rx.recv()).await {
+                    Ok(code) => {
+                        exit_code = code;
+                    }
+                    Err(_) => {
+                        let _ = killer.kill();
+                        if let Ok(code) =
+                            tokio::time::timeout(LOCAL_KILL_GRACE, exit_rx.recv()).await
+                        {
+                            exit_code = code;
+                        }
+                    }
+                }
+                break;
+            }
+            resize_flush_timer.as_mut().reset(
+                resize_gate
+                    .next_wake()
+                    .map_or_else(idle_flush_deadline, |elapsed| session_started_at + elapsed),
+            );
+            tokio::select! {
+                chunk = out_rx.recv() => match chunk {
+                    Some(data) => {
+                        resize_gate.on_output(session_started_at.elapsed());
+                        let (forward, handshake) = handshake_filter.filter(&data);
+                        if handshake {
+                            let reply = conpty_cpr_reply(cursor.0, cursor.1);
+                            let mut writer = writer.lock().unwrap_or_else(|poison| poison.into_inner());
+                            let _ = writer.write_all(&reply).and_then(|_| writer.flush());
+                        }
+                        if !forward.is_empty() {
+                            observe_local_recording(&recorder, &forward);
+                            publish_local_terminal(&session_id, TerminalStream::Stdout, forward, &replay, &emitter).await;
+                        }
+                    }
+                    None => closing = true,
+                },
+                command = cmd_rx.recv() => match command {
+                    Some(LocalTerminalCommand::Input(data)) => {
+                        let handle = writer.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mut writer =
+                                handle.lock().unwrap_or_else(|poison| poison.into_inner());
+                            writer.write_all(&data).and_then(|_| writer.flush())
+                        })
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(std::io::Error::other("local terminal write task panicked"))
+                        });
+                        if result.is_err() {
+                            closing = true;
+                        }
+                    }
+                    Some(LocalTerminalCommand::Resize { cols, rows }) => {
+                        if let Some(size) = requested_pty_size(pty_rows, pty_cols, rows, cols) {
+                            match resize_gate.resize(size, session_started_at.elapsed()) {
+                                StartupResizeDecision::Apply => {
+                                    // Track the size only after a successful resize:
+                                    // a failed call would poison the same-size dedup
+                                    // and the ConPTY CPR reply, which must answer
+                                    // with the live viewport.
+                                    match apply_pty_resize(master.as_deref(), size) {
+                                        Some((rows, cols)) => {
+                                            pty_rows = rows;
+                                            pty_cols = cols;
+                                        }
+                                        None => eprintln!(
+                                            "[ssh-sftp-plugin] local terminal resize to {}x{} failed",
+                                            size.cols, size.rows
+                                        ),
+                                    }
+                                }
+                                // Deferred: the gate keeps the merged geometry
+                                // and the flush timer (re-armed from next_wake at
+                                // the loop top) applies it once the startup
+                                // output has been quiet.
+                                StartupResizeDecision::Defer => {}
+                            }
+                        }
+                    }
+                    Some(LocalTerminalCommand::Close) | None => {
+                        // Drop the master BEFORE the grace window: the slave
+                        // side sees EOF and interactive shells exit (and flush
+                        // history) on their own; killer only after the grace.
+                        drop(master.take());
+                        closing = true;
+                        // Late/blocked input senders must fail fast instead of
+                        // piling up behind the close grace window.
+                        cmd_rx.close();
+                    }
+                },
+                _ = &mut resize_flush_timer => {
+                    if let Some(size) = resize_gate.poll(session_started_at.elapsed()) {
+                        if let Some((rows, cols)) = apply_pty_resize(master.as_deref(), size) {
+                            pty_rows = rows;
+                            pty_cols = cols;
+                        }
+                    }
+                },
+                code = exit_rx.recv() => {
+                    exit_code = code;
+                    break;
+                }
+            }
+        }
+        // The master may already be taken by a graceful Close; dropping the
+        // remaining value here unblocks the reader thread even when a
+        // background child still holds the slave.
+        drop(master);
+        // The exit signal races the reader thread: the child can be reaped
+        // while the PTY's last bytes (final command output, logout message)
+        // are still in flight, so the channel must be drained before the
+        // exited frame — dropping it here would silently lose the tail the
+        // user is waiting to read.
+        while let Ok(Some(data)) = tokio::time::timeout(LOCAL_EXIT_DRAIN, out_rx.recv()).await {
+            observe_local_recording(&recorder, &data);
+            publish_local_terminal(&session_id, TerminalStream::Stdout, data, &replay, &emitter)
+                .await;
+        }
+        // A handshake prefix held back at the very end of the stream is the
+        // terminal's last visible bytes — never drop them.
+        let residue = handshake_filter.flush();
+        if !residue.is_empty() {
+            observe_local_recording(&recorder, &residue);
+            publish_local_terminal(
+                &session_id,
+                TerminalStream::Stdout,
+                residue,
+                &replay,
+                &emitter,
+            )
+            .await;
+        }
+        publish_local_terminal(
+            &session_id,
+            TerminalStream::State,
+            b"local-terminal-exited".to_vec(),
+            &replay,
+            &emitter,
+        )
+        .await;
+        let _ = emitter.event(
+            "local/session/state",
+            json!({
+                "sessionId": session_id,
+                "workbenchId": workbench_id,
+                "state": "exited",
+                "exitCode": exit_code.flatten(),
+            }),
+        );
+        sessions.write().await.remove(&session_id);
+    });
+}
+
+/// ConPTY's startup cursor-position query. conhost withholds all output behind
+/// it, and the answer is a **cursor position**, not a viewport size: the
+/// pseudo console is created with `PSEUDOCONSOLE_INHERIT_CURSOR`, whose
+/// documented job is to "inherit cursor position from the parent terminal".
+const CONPTY_CPR_QUERY: &[u8] = b"\x1b[6n";
+
+/// Windows ConPTY opens every session with a handshake: conhost sends the
+/// terminal `CSI 6n` and withholds ALL output until a CPR reply arrives.
+/// Because the pseudo console carries `PSEUDOCONSOLE_INHERIT_CURSOR`, the
+/// reply is read as **where the terminal's cursor is**, and the child's first
+/// output starts there.
+///
+/// That makes the reply's *value* load-bearing, and answering it with the
+/// viewport size — the value this sidecar used to send — is wrong: `rows;cols`
+/// tells conhost the cursor sits on the bottom row, so it emits the first text
+/// batch where its own buffer origin was (the orphan glyph: cmd's `M`, WSL's
+/// `d`) and then re-serializes the whole banner from the inherited bottom-row
+/// position (PowerShell's doubled prompt). The workbench knows the real cursor
+/// and passes it in [`LocalTerminalStartRequest::cursor_row`], so the sidecar
+/// answers with the truth and the shell starts where the user sees the cursor.
+///
+/// The reply normally also travels terminal → PTY input, through the same
+/// workbench binary bridge as keystrokes; when that path drops it every local
+/// shell sits alive but permanently silent (no banner, no prompt, no echo —
+/// the terminal looks dead while the child runs). The sidecar therefore
+/// answers the first query itself, which also means the query must not reach
+/// the terminal as well: a second answer would be ignored (measured), but the
+/// query has no reader on the far side worth the round trip. So it is
+/// swallowed here, before it is forwarded, and stripped at the source so it
+/// cannot sit in the replay buffer either. `CSI ?6n` (DECDSR) and every later
+/// `CSI 6n` from applications (PSReadLine, vim) pass through untouched for the
+/// terminal to answer truthfully.
+struct ConptyHandshakeFilter {
+    /// Handshake already answered (or not needed on this platform): from here
+    /// on every byte passes through verbatim.
+    done: bool,
+    /// Trailing bytes that may begin the query; held until the next chunk can
+    /// complete — or rule out — the match.
+    held: Vec<u8>,
+}
+
+impl ConptyHandshakeFilter {
+    fn new(needed: bool) -> Self {
+        Self {
+            done: !needed,
+            held: Vec::new(),
+        }
+    }
+
+    /// Filters one PTY chunk. Returns the bytes to forward to the terminal and
+    /// whether this chunk carries the handshake query — which the caller must
+    /// answer through the PTY input instead of the terminal.
+    fn filter(&mut self, chunk: &[u8]) -> (Vec<u8>, bool) {
+        if self.done {
+            return (chunk.to_vec(), false);
+        }
+        let mut scan = std::mem::take(&mut self.held);
+        scan.extend_from_slice(chunk);
+        if let Some(at) = scan
+            .windows(CONPTY_CPR_QUERY.len())
+            .position(|window| window == CONPTY_CPR_QUERY)
+        {
+            self.done = true;
+            let mut forward = Vec::with_capacity(scan.len() - CONPTY_CPR_QUERY.len());
+            forward.extend_from_slice(&scan[..at]);
+            forward.extend_from_slice(&scan[at + CONPTY_CPR_QUERY.len()..]);
+            return (forward, true);
+        }
+        // No query yet: hold back a trailing proper prefix of it so a query
+        // split across chunks is still caught, and forward everything else.
+        let keep = (1..CONPTY_CPR_QUERY.len())
+            .rev()
+            .find(|length| scan.ends_with(&CONPTY_CPR_QUERY[..*length]))
+            .unwrap_or(0);
+        let split = scan.len() - keep;
+        let forward = scan[..split].to_vec();
+        self.held = scan[split..].to_vec();
+        (forward, false)
+    }
+
+    /// Releases bytes still held when the stream ends.
+    fn flush(&mut self) -> Vec<u8> {
+        self.done = true;
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// The CPR reply ConPTY's inherit-cursor handshake expects: `CSI row;col R` —
+/// the terminal's 1-based cursor position, which is where the shell will start
+/// drawing. Sending the viewport size instead inherits a bottom-row cursor and
+/// produces the orphan-glyph/doubled-prompt artifact (see
+/// [`ConptyHandshakeFilter`]).
+fn conpty_cpr_reply(row: u16, col: u16) -> Vec<u8> {
+    format!("\x1b[{row};{col}R").into_bytes()
+}
+
+/// Normalizes the workbench-reported cursor into the viewport: absent (older
+/// workbenches) means the top-left, and anything out of range is clamped so
+/// conhost never inherits a position outside the screen it just sized.
+fn inherit_cursor(row: Option<u16>, col: Option<u16>, rows: u16, cols: u16) -> (u16, u16) {
+    (
+        row.unwrap_or(1).clamp(1, rows.max(1)),
+        col.unwrap_or(1).clamp(1, cols.max(1)),
+    )
+}
+
+/// Deadline for the resize-flush timer while nothing is pending. tokio's
+/// `Instant::far_future` is crate-private in the version we pin, so park the
+/// timer an hour out instead; every reset is anchored to `now`, so the timer
+/// simply never fires while the gate has nothing to flush.
+fn idle_flush_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(3600)
+}
+
+/// Applies a resize to the PTY when the master is still alive; returns the
+/// new tracked geometry so callers update their size cache only on success.
+fn apply_pty_resize(master: Option<&(dyn MasterPty + Send)>, size: PtySize) -> Option<(u16, u16)> {
+    master?.resize(size).ok().map(|_| (size.rows, size.cols))
+}
+
+/// Gates client resize requests before they reach the PTY. ConPTY
+/// re-serializes its whole screen buffer on every ResizePseudoConsole call —
+/// same-size included — and right after spawn that redraw races the shell
+/// banner into a duplicated prompt (an orphan first glyph on top, a banner
+/// copy without it at the viewport bottom). Same-size requests are therefore
+/// dropped; the tracked size doubles as the ConPTY CPR reply source.
+fn requested_pty_size(
+    current_rows: u16,
+    current_cols: u16,
+    rows: u32,
+    cols: u32,
+) -> Option<PtySize> {
+    let rows = rows.clamp(2, u16::MAX as u32) as u16;
+    let cols = cols.clamp(2, u16::MAX as u32) as u16;
+    if rows == current_rows && cols == current_cols {
+        return None;
+    }
+    Some(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })
+}
+
+/// How long after the last startup output a deferred resize waits before the
+/// screen is considered settled (banner and first prompt fully rendered).
+const STARTUP_RESIZE_QUIET: Duration = Duration::from_millis(500);
+/// Hard cap on deferring: a chatty banner must not hold a real user resize
+/// hostage for more than the typical shell cold start (PowerShell 1-3s).
+const STARTUP_RESIZE_WINDOW: Duration = Duration::from_secs(3);
+
+/// What [`StartupResizeGate::resize`] wants the caller to do with a resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupResizeDecision {
+    /// Safe to call `MasterPty::resize` now — no ConPTY repaint race.
+    Apply,
+    /// Hold the resize; the gate merges it into its pending slot and the
+    /// flush timer applies it once output goes quiet.
+    Defer,
+}
+
+/// Merges startup-window resizes on Windows so ConPTY's whole-screen repaint
+/// never interleaves with the shell's opening output.
+///
+/// ConPTY re-serializes its entire screen buffer on every
+/// `ResizePseudoConsole`. When that lands mid-banner the terminal renders the
+/// snapshot and the live stream as two copies (an orphan glyph on the first
+/// row, a full banner/prompt duplicate below) — the classic "M"/"d" artifact.
+/// Spawn-time sizing and same-size dedup only remove the resizes the plugin
+/// itself causes; the host keeps reshaping the panel after spawn (dock/tab
+/// layout settling, window resize), and those real geometry changes still
+/// race PowerShell's slow first prompt. The gate holds such resizes while
+/// output is in flight and applies the merged geometry once the shell has
+/// been quiet — a repaint over a static screen is an idempotent re-layout,
+/// exactly what a user-initiated resize looks like later in the session.
+///
+/// All timestamps are elapsed-since-spawn `Duration`s so tests drive time
+/// directly. Non-Windows platforms always get [`StartupResizeDecision::Apply`]:
+/// Unix PTYs do not repaint on resize.
+struct StartupResizeGate {
+    platform: Platform,
+    /// Elapsed-since-spawn of the last PTY output; `None` before the first
+    /// byte (an empty screen repaints harmlessly, so no gating then).
+    last_output_at: Option<Duration>,
+    /// Latest deferred geometry; each new resize overwrites the previous one.
+    pending: Option<PtySize>,
+}
+
+impl StartupResizeGate {
+    fn new(platform: Platform) -> Self {
+        Self {
+            platform,
+            last_output_at: None,
+            pending: None,
+        }
+    }
+
+    fn on_output(&mut self, elapsed: Duration) {
+        self.last_output_at = Some(elapsed);
+    }
+
+    fn resize(&mut self, size: PtySize, elapsed: Duration) -> StartupResizeDecision {
+        if self.platform != Platform::Windows || elapsed >= STARTUP_RESIZE_WINDOW {
+            self.pending = None;
+            return StartupResizeDecision::Apply;
+        }
+        let output_in_flight = self
+            .last_output_at
+            .is_some_and(|at| elapsed.saturating_sub(at) < STARTUP_RESIZE_QUIET);
+        if output_in_flight {
+            self.pending = Some(size);
+            StartupResizeDecision::Defer
+        } else {
+            // No output yet, or it already went quiet: a repaint now is safe.
+            self.pending = None;
+            StartupResizeDecision::Apply
+        }
+    }
+
+    /// The elapsed-since-spawn instant when a pending resize can flush:
+    /// last output + QUIET, capped at the startup window. `None` when nothing
+    /// is pending (drives a never-firing timer on non-Windows).
+    fn next_wake(&self) -> Option<Duration> {
+        let _pending = self.pending.as_ref()?;
+        let quiet_at = self.last_output_at? + STARTUP_RESIZE_QUIET;
+        Some(quiet_at.min(STARTUP_RESIZE_WINDOW))
+    }
+
+    /// Releases the pending resize once quiet (or the window) has been
+    /// reached; consumes it so it applies exactly once.
+    fn poll(&mut self, elapsed: Duration) -> Option<PtySize> {
+        let size = self.pending?;
+        let flush_at = self.last_output_at.map_or(STARTUP_RESIZE_WINDOW, |at| {
+            (at + STARTUP_RESIZE_QUIET).min(STARTUP_RESIZE_WINDOW)
+        });
+        if elapsed >= flush_at {
+            self.pending = None;
+            Some(size)
+        } else {
+            None
+        }
+    }
+
+    /// Test-only view of the deferred geometry.
+    #[cfg(test)]
+    fn pending(&self) -> Option<PtySize> {
+        self.pending
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    MacOS,
+    Linux,
+    Windows,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKind {
+    Zsh,
+    Bash,
+    Fish,
+    PowerShell,
+    Cmd,
+    Other,
+}
+
+struct ShellSpec {
+    program: String,
+    kind: ShellKind,
+}
+
+fn current_platform() -> Platform {
+    if cfg!(target_os = "macos") {
+        Platform::MacOS
+    } else if cfg!(target_os = "windows") {
+        Platform::Windows
+    } else {
+        Platform::Linux
+    }
+}
+
+/// Basename without directory separators and a trailing `.exe`.
+fn shell_basename(program: &str) -> String {
+    let name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name).to_string()
+}
+
+fn shell_kind_from_program(program: &str) -> ShellKind {
+    match shell_basename(program).as_str() {
+        "zsh" => ShellKind::Zsh,
+        "bash" => ShellKind::Bash,
+        "fish" => ShellKind::Fish,
+        "pwsh" | "powershell" => ShellKind::PowerShell,
+        "cmd" => ShellKind::Cmd,
+        _ => ShellKind::Other,
+    }
+}
+
+/// Shells that would terminate immediately (service accounts); treated as
+/// "unset" so detection falls through to the platform default.
+fn is_login_unusable(program: &str) -> bool {
+    matches!(shell_basename(program).as_str(), "nologin" | "false")
+}
+
+fn base_args(kind: ShellKind, platform: Platform) -> Vec<String> {
+    if platform == Platform::Windows || kind == ShellKind::Cmd {
+        Vec::new()
+    } else {
+        // macOS GUI apps ship with a skeletal PATH; Linux daemons too. Every
+        // Unix shell therefore starts as a login shell to pick up
+        // /etc/profile & friends (Ghostty's macOS login-shell rule).
+        vec!["-l".to_string()]
+    }
+}
+
+/// Resolve which program to launch. `requested` wins; on Unix the user's
+/// login shell (macOS Directory Services first, `$SHELL` second) and on
+/// Windows PowerShell — Warp's default-shell matrix.
+fn pick_shell(
+    requested: Option<&str>,
+    shell_env: Option<&str>,
+    ds_shell: Option<&str>,
+    platform: Platform,
+) -> ShellSpec {
+    let (program, kind) = if let Some(value) = requested {
+        (value.to_string(), shell_kind_from_program(value))
+    } else {
+        match platform {
+            Platform::Windows => ("powershell.exe".to_string(), ShellKind::PowerShell),
+            _ => {
+                let detected = [ds_shell, shell_env]
+                    .into_iter()
+                    .flatten()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .find(|value| !is_login_unusable(value));
+                match detected {
+                    Some(value) => (value.to_string(), shell_kind_from_program(value)),
+                    None => match platform {
+                        Platform::MacOS => ("/bin/zsh".to_string(), ShellKind::Zsh),
+                        _ => ("/bin/bash".to_string(), ShellKind::Bash),
+                    },
+                }
+            }
+        }
+    };
+    ShellSpec { program, kind }
+}
+
+/// One row of `local/shells/list`: a launchable shell with display metadata.
+#[derive(Debug, Clone)]
+pub struct ShellEntry {
+    /// Program path/name to spawn (also the stored preference value).
+    pub program: String,
+    /// Basename for display ("zsh", "PowerShell", …).
+    pub name: String,
+    /// The platform default this runtime would pick with no explicit choice.
+    pub is_default: bool,
+    /// The user's login shell (dscl / $SHELL / USERPROFILE-adjacent).
+    pub is_user_shell: bool,
+    /// Whether shell integration injection applies to this shell kind
+    /// (ksh/csh/cmd-style shells open bare, the toggle is inert for them).
+    pub injectable: bool,
+}
+
+/// Pure core of shell discovery: merge candidate program paths in priority
+/// order (user login shell first, then /etc/shells, then platform defaults),
+/// deduplicating case-insensitively on the basename and dropping login-unusable
+/// entries (`nologin`/`false` are real files in `/etc/shells` but would exit
+/// immediately). `exists` is injected so
+/// tests can simulate the filesystem.
+fn merge_shell_candidates(
+    user_shell: Option<&str>,
+    etc_shells: &[String],
+    fallbacks: &[&str],
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<String> = Vec::new();
+    let mut push = |program: &str| {
+        let program = program.trim();
+        if program.is_empty() || !exists(program) || is_login_unusable(program) {
+            return;
+        }
+        let key = shell_basename(program);
+        if seen.insert(key) {
+            ordered.push(program.to_string());
+        }
+    };
+    if let Some(value) = user_shell.map(str::trim).filter(|v| !v.is_empty()) {
+        push(value);
+    }
+    for line in etc_shells {
+        let candidate = line.trim();
+        if candidate.is_empty() || candidate.starts_with('#') {
+            continue;
+        }
+        push(candidate);
+    }
+    for candidate in fallbacks {
+        push(candidate);
+    }
+    ordered
+}
+
+/// `/etc/shells` content (Unix). Empty on Windows or when unreadable.
+fn etc_shells() -> Vec<String> {
+    if cfg!(windows) {
+        return Vec::new();
+    }
+    std::fs::read_to_string("/etc/shells")
+        .map(|text| text.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Windows candidate lookup over PATH-style directories (pure in `dirs`).
+fn find_in_dirs(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(program))
+        .find(|path| path.is_file())
+}
+
+/// Windows shell candidates, best first: PowerShell 7 if installed, the
+/// always-present Windows PowerShell, cmd, and WSL for Unix tooling.
+fn windows_shell_candidates() -> Vec<String> {
+    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    let mut dirs = dirs;
+    if let Some(windir) = std::env::var_os("SystemRoot").map(PathBuf::from) {
+        let system32 = windir.join("System32");
+        dirs.push(system32.clone());
+        dirs.push(system32.join("WindowsPowerShell").join("v1.0"));
+    }
+    ["pwsh.exe", "powershell.exe", "cmd.exe", "wsl.exe"]
+        .iter()
+        .filter_map(|name| find_in_dirs(name, &dirs))
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Discover launchable shells for `local/shells/list`: the user's login shell
+/// first, then `/etc/shells` (Unix), then platform defaults — each row marked
+/// with the default/user-shell roles the picker UI renders.
+pub fn discover_shells(platform: Platform) -> Vec<ShellEntry> {
+    let ds_shell = directory_services_shell();
+    let shell_env = std::env::var_os("SHELL").map(|value| value.to_string_lossy().into_owned());
+    let user_shell = ds_shell.as_deref().or(shell_env.as_deref());
+    let fallbacks: Vec<String> = match platform {
+        Platform::Windows => windows_shell_candidates(),
+        _ => {
+            let default = match platform {
+                Platform::MacOS => "/bin/zsh",
+                _ => "/bin/bash",
+            };
+            vec![default.to_string()]
+        }
+    };
+    let exists = |program: &str| Path::new(program).is_file();
+    let ordered = merge_shell_candidates(
+        user_shell,
+        &etc_shells(),
+        &fallbacks.iter().map(String::as_str).collect::<Vec<_>>(),
+        &exists,
+    );
+    let default_program = pick_shell(None, None, None, platform).program;
+    ordered
+        .into_iter()
+        .map(|program| {
+            let name = shell_basename(&program);
+            let kind = shell_kind_from_program(&program);
+            ShellEntry {
+                name: shell_display_name(&name),
+                is_default: name == shell_basename(&default_program),
+                is_user_shell: user_shell
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| shell_basename(value) == name)
+                    .unwrap_or(false),
+                injectable: injection_plan(kind, Path::new("/dev/null"), None).is_some(),
+                program,
+            }
+        })
+        .collect()
+}
+
+/// Friendlier picker label: basename without the .exe already applied.
+fn shell_display_name(basename: &str) -> String {
+    match basename {
+        "powershell" => "Windows PowerShell".to_string(),
+        "pwsh" => "PowerShell".to_string(),
+        "wsl" => "WSL".to_string(),
+        other => {
+            let mut name = other.to_string();
+            if let Some(first) = name.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            name
+        }
+    }
+}
+
+/// Copy for the launch-option group, keyed by the host UI locale (the host
+/// sends it as the `locale` param on `local/terminal/launch-options`). The
+/// table mirrors the workbench locale set (frontend/src/lib/i18n.ts); unknown
+/// or missing locales fall back to English. Returns (default entry label,
+/// group label, description prefix) — the caller appends the resolved default
+/// shell program. Discovered shells carry the `group` label so the host
+/// renders them as one collapsible "local shell" section; the default
+/// entry stays top-level.
+fn launch_option_copy(locale: &str) -> (&'static str, &'static str, &'static str) {
+    match locale {
+        "zh-CN" | "zh" => ("本地终端", "本地SHELL", "默认 Shell："),
+        "zh-TW" => ("本地終端", "本地SHELL", "預設 Shell："),
+        "ja" => ("ローカルターミナル", "ローカルシェル", "デフォルトシェル: "),
+        "es" => ("Terminal local", "Shell local", "Shell predeterminado: "),
+        "it" => ("Terminale locale", "Shell locale", "Shell predefinita: "),
+        "pt-BR" | "pt" => ("Terminal local", "Shell local", "Shell padrão: "),
+        _ => ("Local terminal", "Local shell", "Default shell: "),
+    }
+}
+
+/// The shell a plain "local terminal" opens with: the configured `localShell`
+/// preference when set, otherwise the same auto-detect chain as
+/// `local/terminal/start` (Directory Services → `$SHELL` → platform default).
+/// Surfaced in the dock picker description; the default itself is set from the
+/// workbench settings dialog (also the shell picker's `localShell` key).
+pub fn resolve_default_shell(data_dir: &Path) -> String {
+    resolve_configured_shell(data_dir).unwrap_or_else(|| {
+        let shell_env = std::env::var("SHELL").ok();
+        pick_shell(
+            None,
+            shell_env.as_deref(),
+            directory_services_shell().as_deref(),
+            current_platform(),
+        )
+        .program
+    })
+}
+
+/// The explicitly configured `localShell` preference, or `None` when unset —
+/// the dock picker collapses its discovery list to the single configured
+/// shell exactly when this returns `Some`.
+pub fn resolve_configured_shell(data_dir: &Path) -> Option<String> {
+    crate::preferences::load_preferences(data_dir)
+        .get("localShell")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+impl LocalTerminalRuntime {
+    /// PR-A4 generic launch-options contract (host dock "+"): the default
+    /// "local terminal" entry first — carried WITHOUT a `group` so the host
+    /// pins it top-level as the quickest action — followed by one entry per
+    /// discovered shell sharing the localized `group` label, which the host
+    /// renders as one collapsible section right below. The default entry
+    /// opens with the configured `localShell` preference (auto-detect chain
+    /// as fallback) — resolved by `resolve_default_shell` on the host call
+    /// path — while the per-shell entries pin an explicit shell via their
+    /// context fragment. `configured_shell` (the raw `localShell` preference,
+    /// via `resolve_configured_shell`) collapses the discovery group: once
+    /// the user picked a default there is nothing to choose among, so the
+    /// picker carries just the one configured entry. Business meaning stays
+    /// on the plugin side; the host renders labels and never interprets the
+    /// contexts. `locale` is the host UI language (the host-side
+    /// `options_action` contract); older hosts omit it and get English.
+    pub fn launch_options(
+        &self,
+        locale: &str,
+        default_shell: &str,
+        configured_shell: Option<&str>,
+    ) -> Value {
+        let (label, group, description_prefix) = launch_option_copy(locale);
+        let mut entries = vec![json!({
+            "label": label,
+            "description": format!("{description_prefix}{default_shell}"),
+            "context": { "plugin": { "mode": "local-terminal" } },
+        })];
+        if configured_shell.is_some() {
+            return json!({ "entries": entries });
+        }
+        for shell in discover_shells(current_platform()) {
+            if shell.program.is_empty() {
+                continue;
+            }
+            entries.push(json!({
+                "label": shell.name,
+                "description": shell.program,
+                "context": { "plugin": { "mode": "local-terminal", "shell": shell.program } },
+                "group": group,
+            }));
+        }
+        json!({ "entries": entries })
+    }
+
+    /// Read-only shell inventory for the workbench's shell picker.
+    pub fn shells(&self) -> Value {
+        let platform = current_platform();
+        json!({
+            "platform": match platform {
+                Platform::MacOS => "macos",
+                Platform::Linux => "linux",
+                Platform::Windows => "windows",
+            },
+            "shells": discover_shells(platform)
+                .iter()
+                .map(|entry| json!({
+                    "program": entry.program,
+                    "name": entry.name,
+                    "isDefault": entry.is_default,
+                    "isUserShell": entry.is_user_shell,
+                    "injectable": entry.injectable,
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// macOS only: the user's real login shell from Directory Services, which is
+/// authoritative when `$SHELL` is missing inside a GUI-launched process.
+fn directory_services_shell() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let user = std::env::var_os("USER")?;
+    let output = std::process::Command::new("dscl")
+        .args([
+            ".",
+            "-read",
+            &format!("/Users/{}", user.to_string_lossy()),
+            "UserShell",
+        ])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("UserShell:").map(str::trim_start))
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(key)
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+}
+
+fn integration_dir() -> PathBuf {
+    std::env::temp_dir().join("net-iborshell-shell-integration")
+}
+
+fn render_template(template: &str, integration_dir: &str) -> String {
+    template.replace("{{INTEGRATION_DIR}}", integration_dir)
+}
+
+fn escape_posix_single_quoted(text: &str) -> String {
+    text.replace('\'', "'\\''")
+}
+
+fn escape_powershell_single_quoted(text: &str) -> String {
+    text.replace('\'', "''")
+}
+
+/// Materialize the integration + wrapper scripts for this process. Content is
+/// static and secret-free, so a predictable temp location is fine; on any IO
+/// failure injection is silently skipped (the terminal still opens raw).
+fn write_integration_files(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let dir_text = dir.to_string_lossy().into_owned();
+    // zsh resolves `$ZDOTDIR/.zshrc` etc. — the wrapper files MUST carry the
+    // dotted names; the bash wrapper is free-form (`--rcfile wrapper.bash`).
+    let files: [(&str, String); 8] = [
+        ("integration.zsh", INTEGRATION_ZSH.to_string()),
+        ("integration.bash", INTEGRATION_BASH.to_string()),
+        ("integration.fish", INTEGRATION_FISH.to_string()),
+        ("integration.ps1", INTEGRATION_PWSH.to_string()),
+        (".zshrc", render_template(WRAPPER_ZSHRC, &dir_text)),
+        (".zprofile", render_template(WRAPPER_ZPROFILE, &dir_text)),
+        (".zlogin", render_template(WRAPPER_ZLOGIN, &dir_text)),
+        ("wrapper.bash", render_template(WRAPPER_BASH, &dir_text)),
+    ];
+    for (name, content) in files {
+        std::fs::write(dir.join(name), content)?;
+    }
+    Ok(())
+}
+
+/// Launch args + env additions for injection, or `None` when the shell has no
+/// integration (cmd, unknown) or injection is off. Args REPLACE the base
+/// login args: bash cannot combine `-l` with `--rcfile`, so the bash wrapper
+/// reproduces the login chain itself (see wrapper.bash).
+/// Launch args plus `(name, value)` env additions for injection.
+type InjectionPlan = (Vec<String>, Vec<(String, String)>);
+
+fn injection_plan(
+    kind: ShellKind,
+    dir: &Path,
+    user_zdotdir: Option<&str>,
+) -> Option<InjectionPlan> {
+    let dir_text = dir.to_string_lossy().into_owned();
+    match kind {
+        ShellKind::Zsh => {
+            let mut env = vec![("ZDOTDIR".to_string(), dir_text)];
+            if let Some(value) = user_zdotdir
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                env.push(("DBX_USER_ZDOTDIR".to_string(), value.to_string()));
+            }
+            Some((vec!["-l".to_string()], env))
+        }
+        ShellKind::Bash => Some((
+            vec![
+                "--rcfile".to_string(),
+                dir.join("wrapper.bash").to_string_lossy().into_owned(),
+            ],
+            Vec::new(),
+        )),
+        ShellKind::Fish => {
+            let script = dir.join("integration.fish");
+            Some((
+                vec![
+                    "-l".to_string(),
+                    "-C".to_string(),
+                    format!(
+                        "source '{}'",
+                        escape_posix_single_quoted(&script.to_string_lossy())
+                    ),
+                ],
+                Vec::new(),
+            ))
+        }
+        ShellKind::PowerShell => {
+            let script = dir.join("integration.ps1");
+            // -ExecutionPolicy Bypass is process-scoped: it lets the temp-dir
+            // script run on machines whose machine/user policy is Restricted
+            // (Windows client default) without touching their policy settings.
+            // Group-policy-enforced MachinePolicy/UserPolicy still win, in
+            // which case the dot-source fails the same way as before and the
+            // shell keeps its built-in prompt (fail-safe contract).
+            Some((
+                vec![
+                    "-NoExit".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "& '{}'",
+                        escape_powershell_single_quoted(&script.to_string_lossy())
+                    ),
+                ],
+                Vec::new(),
+            ))
+        }
+        ShellKind::Cmd | ShellKind::Other => None,
+    }
+}
+
+struct PreparedIntegration {
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    /// Whether integration actually attached (drives the start() response).
+    injected: bool,
+}
+
+fn prepare_integration(kind: ShellKind, enabled: bool) -> PreparedIntegration {
+    let none = PreparedIntegration {
+        args: base_args(kind, current_platform()),
+        env: Vec::new(),
+        injected: false,
+    };
+    if !enabled {
+        return none;
+    }
+    let dir = integration_dir();
+    if write_integration_files(&dir).is_err() {
+        eprintln!(
+            "[ssh-sftp-plugin] shell integration files unavailable at {}; continuing without injection",
+            dir.display()
+        );
+        return none;
+    }
+    let user_zdotdir =
+        std::env::var_os("ZDOTDIR").map(|value| value.to_string_lossy().into_owned());
+    match injection_plan(kind, &dir, user_zdotdir.as_deref()) {
+        Some((args, env)) => PreparedIntegration {
+            args,
+            env,
+            injected: true,
+        },
+        None => none,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::TerminalFrame;
+
+    #[test]
+    fn start_request_env_defaults_to_empty() {
+        // Older workbenches never send `env`: the field must stay optional.
+        let request: LocalTerminalStartRequest =
+            serde_json::from_str(r#"{"workbenchId":"w","cols":80,"rows":24}"#).unwrap();
+        assert!(request.env.is_empty());
+    }
+
+    #[test]
+    fn user_env_sanitizes_drops_and_reserves() {
+        let env = BTreeMap::from([
+            ("HOME".to_string(), "/tmp/x".to_string()),
+            ("TERM".to_string(), "vt100".to_string()),
+            ("colorterm".to_string(), "none".to_string()),
+            ("  ".to_string(), "v".to_string()),
+            ("A=B".to_string(), "v".to_string()),
+            ("BAD\u{7}".to_string(), "v".to_string()),
+            ("OVER".to_string(), "x".repeat(USER_ENV_MAX_VALUE + 1)),
+            (" OK ".to_string(), "kept".to_string()),
+        ]);
+        // BTreeMap iterates by the RAW keys (space sorts below letters), so
+        // the trimmed " OK " pair comes out first — order stays deterministic.
+        assert_eq!(
+            sanitize_user_env(&env),
+            vec![
+                ("OK".to_string(), "kept".to_string()),
+                ("HOME".to_string(), "/tmp/x".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn user_env_pair_cap_trims_deterministically() {
+        let env: BTreeMap<String, String> = (0..USER_ENV_MAX_PAIRS + 5)
+            .map(|i| (format!("K{i:03}"), "v".to_string()))
+            .collect();
+        let pairs = sanitize_user_env(&env);
+        assert_eq!(pairs.len(), USER_ENV_MAX_PAIRS);
+        assert_eq!(pairs[0].0, "K000");
+        assert_eq!(pairs[USER_ENV_MAX_PAIRS - 1].0, "K031");
+    }
+
+    /// The sanitized-pairs shape `start` feeds [`fallback_lang`].
+    fn sanitized(map: &[(&str, &str)]) -> Vec<(String, String)> {
+        map.iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn nothing_set(_key: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn fallback_lang_fills_the_gap_when_no_locale_is_spoken() {
+        let no_env: Vec<(String, String)> = Vec::new();
+        assert_eq!(
+            fallback_lang(&no_env, Platform::MacOS, &nothing_set),
+            Some("en_US.UTF-8")
+        );
+        assert_eq!(
+            fallback_lang(&no_env, Platform::Linux, &nothing_set),
+            Some("C.UTF-8")
+        );
+    }
+
+    #[test]
+    fn fallback_lang_stays_out_when_the_user_configured_a_locale() {
+        for key in ["LANG", "LC_ALL", "LC_CTYPE"] {
+            let pairs = sanitized(&[(key, "zh_CN.UTF-8")]);
+            assert_eq!(fallback_lang(&pairs, Platform::MacOS, &nothing_set), None);
+        }
+        // An unrelated LC_* key does not decide the character locale: the
+        // fallback still applies beneath it.
+        let pairs = sanitized(&[("LC_MESSAGES", "zh_CN.UTF-8")]);
+        assert_eq!(
+            fallback_lang(&pairs, Platform::MacOS, &nothing_set),
+            Some("en_US.UTF-8")
+        );
+    }
+
+    #[test]
+    fn fallback_lang_stays_out_when_the_sidecar_environment_has_one() {
+        let inherited = |key: &str| (key == "LC_CTYPE").then(|| "en_US.UTF-8".to_string());
+        let no_env: Vec<(String, String)> = Vec::new();
+        assert_eq!(fallback_lang(&no_env, Platform::MacOS, &inherited), None);
+        // An inherited EMPTY value speaks no locale (an exported-but-empty
+        // LANG must not veto the fallback): the gap still gets filled.
+        let empty = |key: &str| (key == "LANG").then(String::new);
+        assert_eq!(
+            fallback_lang(&no_env, Platform::MacOS, &empty),
+            Some("en_US.UTF-8")
+        );
+    }
+
+    #[test]
+    fn fallback_lang_skips_windows_where_lang_cannot_reach_the_console() {
+        let no_env: Vec<(String, String)> = Vec::new();
+        assert_eq!(
+            fallback_lang(&no_env, Platform::Windows, &nothing_set),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_utf8_console_folds_into_the_integration_command() {
+        // Injection on: the switch joins the existing -Command payload —
+        // argv stays one command, no extra window of shell startup args.
+        let args = apply_windows_utf8_console(
+            Platform::Windows,
+            ShellKind::PowerShell,
+            vec![
+                "-NoExit".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-Command".to_string(),
+                "& 'C:\\temp\\si\\integration.ps1'".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-NoExit",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "chcp 65001 >$null; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & 'C:\\temp\\si\\integration.ps1'"
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_utf8_console_switches_a_bare_powershell_and_keeps_it_open() {
+        // Injection off (toggle or script-write failure): the shell still
+        // gets the switch, and -NoExit keeps it interactive as before.
+        assert_eq!(
+            apply_windows_utf8_console(Platform::Windows, ShellKind::PowerShell, Vec::new()),
+            vec![
+                "-NoExit",
+                "-Command",
+                "chcp 65001 >$null; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8"
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_utf8_console_wraps_cmd_and_restores_its_title() {
+        // cmd has no injection seam: /k runs the switch, the title reset
+        // keeps the console title on the cmd path (what a plain cmd shows)
+        // instead of leaking the chcp command line into the tab.
+        assert_eq!(
+            apply_windows_utf8_console(Platform::Windows, ShellKind::Cmd, Vec::new()),
+            vec!["/k", "chcp 65001>nul&title %COMSPEC%"]
+        );
+    }
+
+    #[test]
+    fn windows_utf8_console_leaves_other_shells_and_unix_untouched() {
+        // WSL (arrives as ShellKind::Other) manages its own UTF-8 world and
+        // arbitrary shells have no safe argv seam.
+        assert_eq!(
+            apply_windows_utf8_console(
+                Platform::Windows,
+                ShellKind::Other,
+                vec!["--flag".to_string()]
+            ),
+            vec!["--flag"]
+        );
+        // Unix keeps its locale injection path; the argv rewrite never runs.
+        assert_eq!(
+            apply_windows_utf8_console(Platform::MacOS, ShellKind::Cmd, Vec::new()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            apply_windows_utf8_console(
+                Platform::Linux,
+                ShellKind::PowerShell,
+                vec!["-Command".to_string(), "exit".to_string()]
+            ),
+            vec!["-Command", "exit"]
+        );
+    }
+
+    #[test]
+    fn handshake_filter_swallows_the_query_and_reports_it() {
+        let mut filter = ConptyHandshakeFilter::new(true);
+        let (forward, handshake) = filter.filter(b"noise\x1b[6n");
+        assert!(handshake);
+        assert_eq!(forward, b"noise");
+        // Once answered, everything passes through — terminal-visible bytes
+        // never lose their tail and the terminal never sees the query.
+        let (forward, handshake) = filter.filter(b"banner");
+        assert!(!handshake);
+        assert_eq!(forward, b"banner");
+    }
+
+    #[test]
+    fn handshake_filter_catches_a_query_split_across_chunks() {
+        let mut filter = ConptyHandshakeFilter::new(true);
+        let (forward, handshake) = filter.filter(b"banner\x1b[6");
+        // The partial query is held, not forwarded, and not yet answered.
+        assert!(!handshake);
+        assert_eq!(forward, b"banner");
+        let (forward, handshake) = filter.filter(b"n rest");
+        assert!(handshake);
+        assert_eq!(forward, b" rest");
+    }
+
+    #[test]
+    fn handshake_filter_flushes_held_bytes_that_never_complete() {
+        let mut filter = ConptyHandshakeFilter::new(true);
+        let (forward, handshake) = filter.filter(b"prompt\x1b[");
+        assert!(!handshake);
+        assert_eq!(forward, b"prompt");
+        // Not a query after all: the held prefix reaches the terminal.
+        let (forward, handshake) = filter.filter(b"?6n");
+        assert!(!handshake);
+        assert_eq!(forward, b"\x1b[?6n");
+    }
+
+    #[test]
+    fn handshake_filter_ignores_private_dsr_and_leaves_stream_intact() {
+        let mut filter = ConptyHandshakeFilter::new(true);
+        let (forward, handshake) = filter.filter(b"\x1b[?6n\x1b[?25h");
+        assert!(!handshake);
+        assert_eq!(forward, b"\x1b[?6n\x1b[?25h");
+        // DECDSR is not the handshake, so the real query is still answered —
+        // and swallows only itself.
+        let (forward, handshake) = filter.filter(b"\x1b[?6n\x1b[6n\x1b[?25h");
+        assert!(handshake);
+        assert_eq!(forward, b"\x1b[?6n\x1b[?25h");
+    }
+
+    #[test]
+    fn handshake_filter_passes_everything_when_not_needed() {
+        // Unix openpty has no handshake: not a byte is held back or dropped.
+        let mut filter = ConptyHandshakeFilter::new(false);
+        let (forward, handshake) = filter.filter(b"\x1b[6n");
+        assert!(!handshake);
+        assert_eq!(forward, b"\x1b[6n");
+    }
+
+    #[test]
+    fn handshake_filter_flush_releases_a_trailing_prefix() {
+        let mut filter = ConptyHandshakeFilter::new(true);
+        let (forward, _) = filter.filter(b"bye\x1b[6");
+        assert_eq!(forward, b"bye");
+        assert_eq!(filter.flush(), b"\x1b[6");
+        assert!(filter.flush().is_empty());
+    }
+
+    #[test]
+    fn conpty_cpr_reply_carries_cursor_position() {
+        assert_eq!(conpty_cpr_reply(3, 7), b"\x1b[3;7R".to_vec());
+        assert_eq!(conpty_cpr_reply(1, 1), b"\x1b[1;1R".to_vec());
+    }
+
+    #[test]
+    fn inherited_cursor_defaults_to_top_left_without_a_report() {
+        // An older workbench sends nothing: the top-left is the only truthful
+        // guess for a terminal that was just laid out for a new session.
+        assert_eq!(inherit_cursor(None, None, 30, 100), (1, 1));
+        assert_eq!(inherit_cursor(Some(5), None, 30, 100), (5, 1));
+    }
+
+    #[test]
+    fn inherited_cursor_is_clamped_into_the_viewport() {
+        // conhost reads the reply as a real position; a row past the last one
+        // would be an inherit it cannot honour.
+        assert_eq!(inherit_cursor(Some(0), Some(0), 30, 100), (1, 1));
+        assert_eq!(inherit_cursor(Some(999), Some(999), 30, 100), (30, 100));
+        assert_eq!(inherit_cursor(Some(12), Some(7), 30, 100), (12, 7));
+    }
+
+    /// Windows-only probe of conhost's startup handshake, measured on the
+    /// windows-2022 runner (inbox conhost 20348). Facts established here, each
+    /// one refuting a theory that had been shipping:
+    ///
+    ///   * conhost issues `CSI 6n` **exactly once**, and only after the child
+    ///     exists — nothing arrives while the PTY has no client (0 bytes).
+    ///   * a **duplicate** CPR reply is ignored outright (0 bytes followed it),
+    ///     so neither the terminal's leaked answer nor the sidecar's own reply
+    ///     can resize anything. The "duplicate reply" family of theories is dead.
+    ///   * the orphan first glyph is **conhost's own doing**, and where it lands
+    ///     follows the reply's numbers: replying `30;100` produced
+    ///     `... \e[?25h M\r\n \e[29;100H Microsoft Windows [Version ...` — the
+    ///     banner's first character printed at the top, an absolute jump to the
+    ///     viewport's bottom row, then the banner re-drawn there. That is
+    ///     precisely the "M" users report.
+    ///
+    /// So the remaining variable is the reply's *value*. This runs one cmd.exe
+    /// session per variant and prints the raw bytes (`--nocapture`): the sidecar's
+    /// viewport-size answer, a truthful cursor position (what xterm would say), a
+    /// mismatched size to tell "read as a position" from "read as a size", and no
+    /// reply at all as the output-withholding control.
+    /// Escapes raw terminal bytes for the CI log (`--nocapture`).
+    fn probe_escape(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| match byte {
+                b'\x1b' => "\\e".to_string(),
+                b'\r' => "\\r".to_string(),
+                b'\n' => "\\n".to_string(),
+                0x20..=0x7e => (*byte as char).to_string(),
+                other => format!("\\x{other:02x}"),
+            })
+            .collect::<String>()
+    }
+
+    /// Drives one real ConPTY session and returns everything the PTY emitted.
+    ///
+    /// `reply` answers the inherit-cursor handshake the way the sidecar does.
+    /// `None` means the program could not be spawned (not installed on this
+    /// machine) — callers skip it instead of failing the suite.
+    fn probe_conpty_session(
+        program: &str,
+        reply: Option<&[u8]>,
+        rows: u16,
+        cols: u16,
+    ) -> Option<Vec<u8>> {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let saw = |haystack: &[u8], needle: &[u8]| {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        };
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .ok()?;
+        let mut child = pair
+            .slave
+            .spawn_command(CommandBuilder::new(program))
+            .ok()?;
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().ok()?;
+        let mut writer = pair.master.take_writer().ok()?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 || tx.send(buffer[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut stream = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut answered = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(400)) {
+                Ok(chunk) => {
+                    stream.extend_from_slice(&chunk);
+                    if !answered && saw(&stream, CONPTY_CPR_QUERY) {
+                        if let Some(reply) = reply {
+                            writer.write_all(reply).expect("write reply");
+                            writer.flush().expect("flush reply");
+                        }
+                        answered = true;
+                        // Let the first frame settle before finishing.
+                        std::thread::sleep(Duration::from_millis(700));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if answered {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        Some(stream)
+    }
+
+    /// Runs one probed session with a watchdog: a wedged ConPTY must not hang
+    /// the runner. Returns `None` for a missing program or a timeout.
+    fn probe_once(program: &str, reply: Option<Vec<u8>>, rows: u16, cols: u16) -> Option<Vec<u8>> {
+        use std::sync::mpsc;
+        let program = program.to_string();
+        let label = program.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_conpty_session(&program, reply.as_deref(), rows, cols));
+        });
+        match rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!("[{label}] HUNG: no result within 60s");
+                None
+            }
+        }
+    }
+
+    /// Windows-only probe of conhost's startup handshake, measured on the
+    /// windows-2022 runner (inbox conhost 20348). Facts established here, each
+    /// one refuting a theory that had been shipping:
+    ///
+    ///   * conhost issues `CSI 6n` **exactly once**, and only after the child
+    ///     exists — nothing arrives while the PTY has no client (0 bytes).
+    ///   * a **duplicate** CPR reply is ignored outright (0 bytes followed it),
+    ///     so neither the terminal's leaked answer nor the sidecar's own reply
+    ///     can resize anything. The "duplicate reply" family of theories is dead.
+    ///   * the orphan first glyph is **conhost's own doing**, and where it lands
+    ///     follows the reply's numbers: answering the viewport size (`30;100`)
+    ///     produced `... \e[?25h M\r\n \e[29;100H Microsoft Windows ...` — the
+    ///     banner's first character printed at the top, an absolute jump to the
+    ///     viewport's bottom row, then the banner re-drawn there. That is
+    ///     precisely the "M" users reported, and it is why answering with the
+    ///     cursor position (`1;1`, what the workbench now reports) is the fix:
+    ///     the same session then emits one clean frame with no jump.
+    ///
+    /// Both variants are asserted, so a conhost change that invalidates the
+    /// reasoning fails here rather than in a user's terminal.
+    ///
+    /// Deliberately NOT `#[cfg(windows)]`: the body drives a real ConPTY, but
+    /// gating the whole item would hide it from `cargo test` on macOS/Linux —
+    /// where a type error in it (a moved closure, say) only surfaces after a
+    /// Windows CI round trip. It compiles everywhere and returns early where
+    /// there is no ConPTY to drive.
+    #[test]
+    fn conpty_handshake_reply_variants() {
+        if !cfg!(windows) {
+            return;
+        }
+        const ROWS: u16 = 30;
+        const COLS: u16 = 100;
+        // The artifact signature: after the handshake, conhost jumps to the
+        // inherited bottom row and re-serializes the screen from there.
+        let bottom_jump = format!("\x1b[{};{}H", ROWS - 1, COLS).into_bytes();
+
+        let shipping = probe_once(
+            "cmd.exe",
+            Some(format!("\x1b[{ROWS};{COLS}R").into_bytes()),
+            ROWS,
+            COLS,
+        )
+        .expect("cmd.exe did not start");
+        eprintln!(
+            "[size {ROWS};{COLS}] {} bytes: {}",
+            shipping.len(),
+            probe_escape(&shipping)
+        );
+        assert!(
+            shipping
+                .windows(bottom_jump.len())
+                .any(|window| window == bottom_jump),
+            "the viewport-size reply no longer triggers the bottom-row \
+             re-serialization this fix was built on: {}",
+            probe_escape(&shipping)
+        );
+
+        let truthful = probe_once("cmd.exe", Some(b"\x1b[1;1R".to_vec()), ROWS, COLS)
+            .expect("cmd.exe did not start");
+        eprintln!(
+            "[cursor 1;1] {} bytes: {}",
+            truthful.len(),
+            probe_escape(&truthful)
+        );
+        assert!(
+            !truthful
+                .windows(bottom_jump.len())
+                .any(|window| window == bottom_jump),
+            "the cursor-position reply still produced a bottom-row \
+             re-serialization: {}",
+            probe_escape(&truthful)
+        );
+        // The banner is written once, not echoed back from the inherited
+        // position — the doubled-prompt shape starts with a lone first glyph.
+        let banner = b"Microsoft Windows";
+        let banner_hits = truthful
+            .windows(banner.len())
+            .filter(|window| *window == banner)
+            .count();
+        assert_eq!(
+            banner_hits,
+            1,
+            "banner written {banner_hits} times with the cursor reply: {}",
+            probe_escape(&truthful)
+        );
+    }
+
+    /// The three shells users reported the artifact on, each driven under the
+    /// reply the sidecar now sends. Their banners differ, but the failure mode
+    /// is conhost-side and identical: a jump to the inherited bottom row with
+    /// the first frame re-serialized there. Shells that are not installed on
+    /// the runner are skipped (recorded in the log, not failed).
+    #[test]
+    fn conpty_first_frame_stays_clean_across_windows_shells() {
+        if !cfg!(windows) {
+            return;
+        }
+        const ROWS: u16 = 30;
+        const COLS: u16 = 100;
+        let bottom_jump = format!("\x1b[{};{}H", ROWS - 1, COLS).into_bytes();
+        for program in ["cmd.exe", "powershell.exe", "wsl.exe"] {
+            match probe_once(program, Some(b"\x1b[1;1R".to_vec()), ROWS, COLS) {
+                Some(stream) => {
+                    eprintln!(
+                        "[{program}] {} bytes: {}",
+                        stream.len(),
+                        probe_escape(&stream)
+                    );
+                    assert!(
+                        !stream
+                            .windows(bottom_jump.len())
+                            .any(|window| window == bottom_jump),
+                        "{program} re-serialized its first frame from the inherited \
+                         bottom row: {}",
+                        probe_escape(&stream)
+                    );
+                }
+                None => eprintln!("[{program}] skipped (not installed or no output)"),
+            }
+        }
+    }
+
+    #[test]
+    fn pty_resize_drops_same_size_requests() {
+        assert_eq!(requested_pty_size(32, 120, 32, 120), None);
+        assert_eq!(requested_pty_size(24, 80, 24, 80), None);
+    }
+
+    #[test]
+    fn pty_resize_passes_real_geometry_changes() {
+        let size = requested_pty_size(24, 80, 30, 100).unwrap();
+        assert_eq!((size.rows, size.cols), (30, 100));
+        assert_eq!(requested_pty_size(24, 80, 24, 81).unwrap().cols, 81);
+        assert_eq!(requested_pty_size(24, 80, 25, 80).unwrap().rows, 25);
+    }
+
+    #[test]
+    fn pty_resize_clamps_out_of_range_values() {
+        // Same 2-row floor as `start` — ConPTY misbehaves on 1-row geometry.
+        let size = requested_pty_size(24, 80, 0, 500_000).unwrap();
+        assert_eq!((size.rows, size.cols), (2, u16::MAX));
+        // Clamped onto the current size: nothing reaches the PTY.
+        assert_eq!(requested_pty_size(2, u16::MAX, 0, 500_000), None);
+    }
+
+    fn gate_size(rows: u16, cols: u16) -> PtySize {
+        PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    #[test]
+    fn startup_resize_gate_passes_through_on_unix() {
+        // Unix PTYs do not repaint on resize (shells reflow themselves on
+        // SIGWINCH), so the gate must never engage there.
+        let mut gate = StartupResizeGate::new(Platform::MacOS);
+        gate.on_output(Duration::from_millis(100));
+        assert_eq!(
+            gate.resize(gate_size(30, 100), Duration::from_millis(150)),
+            StartupResizeDecision::Apply
+        );
+        assert_eq!(gate.next_wake(), None);
+    }
+
+    #[test]
+    fn startup_resize_gate_applies_before_first_output() {
+        // A resize racing ahead of the banner lands on an empty screen —
+        // ConPTY's repaint is trivially safe, so apply immediately.
+        let mut gate = StartupResizeGate::new(Platform::Windows);
+        assert_eq!(
+            gate.resize(gate_size(30, 100), Duration::from_millis(100)),
+            StartupResizeDecision::Apply
+        );
+        assert_eq!(gate.pending(), None);
+    }
+
+    #[test]
+    fn startup_resize_gate_defers_while_banner_in_flight() {
+        let mut gate = StartupResizeGate::new(Platform::Windows);
+        gate.on_output(Duration::from_millis(200));
+        assert_eq!(
+            gate.resize(gate_size(30, 100), Duration::from_millis(400)),
+            StartupResizeDecision::Defer
+        );
+        // A second geometry wins: only the latest viewport is worth applying.
+        assert_eq!(
+            gate.resize(gate_size(32, 120), Duration::from_millis(450)),
+            StartupResizeDecision::Defer
+        );
+        assert_eq!(gate.pending(), Some(gate_size(32, 120)));
+    }
+
+    #[test]
+    fn startup_resize_gate_next_wake_tracks_last_output() {
+        let mut gate = StartupResizeGate::new(Platform::Windows);
+        assert_eq!(gate.next_wake(), None);
+        gate.on_output(Duration::from_millis(200));
+        gate.resize(gate_size(30, 100), Duration::from_millis(400));
+        // Fresh output while deferred pushes the quiet point out with it.
+        gate.on_output(Duration::from_millis(600));
+        assert_eq!(
+            gate.next_wake(),
+            Some(Duration::from_millis(600) + STARTUP_RESIZE_QUIET)
+        );
+        // ...and the startup window caps how long the flush can wait.
+        gate.on_output(Duration::from_millis(2_900));
+        assert_eq!(gate.next_wake(), Some(STARTUP_RESIZE_WINDOW));
+    }
+
+    #[test]
+    fn startup_resize_gate_flushes_after_quiet() {
+        let mut gate = StartupResizeGate::new(Platform::Windows);
+        gate.on_output(Duration::from_millis(200));
+        gate.resize(gate_size(30, 100), Duration::from_millis(400));
+        gate.resize(gate_size(32, 120), Duration::from_millis(450));
+        // One tick before the quiet point: still held.
+        let quiet = Duration::from_millis(200) + STARTUP_RESIZE_QUIET;
+        assert_eq!(gate.poll(quiet - Duration::from_millis(1)), None);
+        // Quiet reached: the merged geometry applies exactly once.
+        assert_eq!(gate.poll(quiet), Some(gate_size(32, 120)));
+        assert_eq!(gate.poll(quiet + Duration::from_millis(1)), None);
+        assert_eq!(gate.pending(), None);
+    }
+
+    #[test]
+    fn startup_resize_gate_force_flushes_at_window_expiry() {
+        // Output still trickling at the cap: flush anyway rather than hold a
+        // real resize hostage to a chatty banner.
+        let mut gate = StartupResizeGate::new(Platform::Windows);
+        gate.on_output(Duration::from_millis(2_900));
+        gate.resize(gate_size(30, 100), Duration::from_millis(2_950));
+        assert_eq!(
+            gate.poll(STARTUP_RESIZE_WINDOW - Duration::from_millis(1)),
+            None
+        );
+        assert_eq!(gate.poll(STARTUP_RESIZE_WINDOW), Some(gate_size(30, 100)));
+    }
+
+    #[test]
+    fn startup_resize_gate_inert_after_window() {
+        // Past the window the gate is gone: every resize applies at once.
+        let mut gate = StartupResizeGate::new(Platform::Windows);
+        gate.on_output(Duration::from_millis(2_900));
+        gate.resize(gate_size(30, 100), Duration::from_millis(2_950));
+        assert_eq!(
+            gate.resize(
+                gate_size(40, 140),
+                STARTUP_RESIZE_WINDOW + Duration::from_millis(50)
+            ),
+            StartupResizeDecision::Apply
+        );
+        assert_eq!(gate.pending(), None);
+        assert_eq!(gate.next_wake(), None);
+    }
+
+    #[test]
+    fn observe_local_recording_writes_stdout_events() {
+        let dir = std::env::temp_dir().join(format!("dbx-local-rec-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let recorder = session_recording::SessionRecorder::start(
+            &dir,
+            "unit-local-rec",
+            "local",
+            "local",
+            "unit-session",
+            100,
+            24,
+        )
+        .expect("start recorder");
+        let slot: Arc<Mutex<Option<session_recording::SessionRecorder>>> =
+            Arc::new(Mutex::new(Some(recorder)));
+        observe_local_recording(&slot, b"hello ");
+        observe_local_recording(&slot, b"world");
+        let summary = slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("active recorder")
+            .finish()
+            .expect("finish recorder");
+        assert_eq!(summary["events"], 2);
+        // The two bursts must land as one `o` event each, in order — replay
+        // re-serializes the terminal from exactly these bytes.
+        let path = session_recording::cast_path(&dir, "unit-local-rec").expect("cast path");
+        let text = std::fs::read_to_string(&path).expect("read cast");
+        let events: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(events.len(), 2);
+        assert!(events[0].contains("\"eventdata\":\"hello \""));
+        assert!(events[1].contains("\"eventdata\":\"world\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn launch_options_default_first_then_local_terminal_shell_group() {
+        let runtime = LocalTerminalRuntime::new();
+        let options = runtime.launch_options("zh-CN", "/bin/zsh", None);
+        let entries = options["entries"].as_array().unwrap();
+        // First entry: the default-shell launcher, carried without a `group`
+        // so the host pins it top-level as the quickest action.
+        assert_eq!(entries[0]["label"], "本地终端");
+        assert_eq!(entries[0]["description"], "默认 Shell：/bin/zsh");
+        assert_eq!(entries[0]["context"]["plugin"]["mode"], "local-terminal");
+        assert!(entries[0]["group"].is_null());
+        // Discovered shells share the localized group label — the host renders
+        // them as one collapsible "本地SHELL" section right below the default.
+        for entry in entries.iter().skip(1) {
+            assert_eq!(entry["group"], "本地SHELL");
+            assert_eq!(entry["context"]["plugin"]["mode"], "local-terminal");
+            assert!(entry["context"]["plugin"]["shell"].as_str().is_some());
+            assert!(!entry["label"].as_str().expect("label string").is_empty());
+        }
+    }
+
+    #[test]
+    fn launch_options_fall_back_to_english_for_unknown_locale() {
+        // Older hosts pass no locale at all (empty string) — same fallback.
+        let runtime = LocalTerminalRuntime::new();
+        let english = runtime.launch_options("ko", "/bin/bash", None);
+        assert_eq!(english["entries"][0]["label"], "Local terminal");
+        assert!(english["entries"][0]["group"].is_null());
+        assert_eq!(
+            runtime.launch_options("", "/bin/bash", None)["entries"][0]["description"],
+            "Default shell: /bin/bash"
+        );
+    }
+
+    #[test]
+    fn launch_options_configured_shell_collapses_the_discovery_group() {
+        // The user picked a default shell: the picker has nothing left to
+        // choose among, so only the single configured entry remains.
+        let runtime = LocalTerminalRuntime::new();
+        let options = runtime.launch_options("zh-CN", "/usr/bin/fish", Some("/usr/bin/fish"));
+        let entries = options["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["label"], "本地终端");
+        assert_eq!(entries[0]["description"], "默认 Shell：/usr/bin/fish");
+        assert!(entries[0]["group"].is_null());
+    }
+
+    #[test]
+    fn resolve_default_shell_prefers_configured_preference() {
+        let dir =
+            std::env::temp_dir().join(format!("dbx-launch-shell-prefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create prefs dir");
+        std::fs::write(
+            dir.join("preferences.json"),
+            r#"{"prefs":{"localShell":"/usr/bin/fish"}}"#,
+        )
+        .expect("write prefs");
+        assert_eq!(resolve_default_shell(&dir), "/usr/bin/fish");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_default_shell_falls_back_to_auto_detect_chain() {
+        let dir =
+            std::env::temp_dir().join(format!("dbx-launch-shell-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create empty prefs dir");
+        // No preference file: the chain resolves to something (Directory
+        // Services / $SHELL / platform default — never empty).
+        assert!(!resolve_default_shell(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn macos_prefers_directory_services_shell_over_env() {
+        let spec = pick_shell(
+            None,
+            Some("/bin/bash"),
+            Some("/opt/homebrew/bin/fish"),
+            Platform::MacOS,
+        );
+        assert_eq!(spec.program, "/opt/homebrew/bin/fish");
+        assert_eq!(spec.kind, ShellKind::Fish);
+    }
+
+    #[test]
+    fn shell_env_is_used_when_directory_services_has_nothing() {
+        let spec = pick_shell(None, Some("/usr/bin/fish"), None, Platform::Linux);
+        assert_eq!(spec.program, "/usr/bin/fish");
+        assert_eq!(spec.kind, ShellKind::Fish);
+    }
+
+    #[test]
+    fn login_reject_shells_fall_through_to_next_candidate() {
+        let spec = pick_shell(
+            None,
+            Some("/bin/bash"),
+            Some("/usr/sbin/nologin"),
+            Platform::Linux,
+        );
+        assert_eq!(spec.program, "/bin/bash");
+    }
+
+    #[test]
+    fn platform_defaults_when_nothing_detected() {
+        let macos = pick_shell(None, None, None, Platform::MacOS);
+        assert_eq!(macos.program, "/bin/zsh");
+        assert_eq!(macos.kind, ShellKind::Zsh);
+        let linux = pick_shell(None, None, None, Platform::Linux);
+        assert_eq!(linux.program, "/bin/bash");
+        assert_eq!(linux.kind, ShellKind::Bash);
+    }
+
+    #[test]
+    fn windows_defaults_to_powershell_with_no_login_args() {
+        let spec = pick_shell(None, None, None, Platform::Windows);
+        assert_eq!(spec.program, "powershell.exe");
+        assert_eq!(spec.kind, ShellKind::PowerShell);
+        assert!(base_args(ShellKind::PowerShell, Platform::Windows).is_empty());
+    }
+
+    #[test]
+    fn unix_shells_start_as_login_shells() {
+        assert_eq!(base_args(ShellKind::Zsh, Platform::MacOS), vec!["-l"]);
+        assert_eq!(base_args(ShellKind::Bash, Platform::Linux), vec!["-l"]);
+    }
+
+    #[test]
+    fn requested_shell_overrides_detection_and_keeps_login_args() {
+        let spec = pick_shell(Some("/bin/bash"), Some("/bin/zsh"), None, Platform::MacOS);
+        assert_eq!(spec.program, "/bin/bash");
+        assert_eq!(spec.kind, ShellKind::Bash);
+    }
+
+    #[test]
+    fn shell_kind_handles_windows_paths_exe_and_case() {
+        assert_eq!(
+            shell_kind_from_program(r"C:\Program Files\PowerShell\7\pwsh.EXE"),
+            ShellKind::PowerShell
+        );
+        assert_eq!(
+            shell_kind_from_program("/opt/homebrew/bin/Zsh"),
+            ShellKind::Zsh
+        );
+        assert_eq!(shell_kind_from_program("/bin/bash"), ShellKind::Bash);
+        assert_eq!(shell_kind_from_program("cmd.exe"), ShellKind::Cmd);
+        assert_eq!(shell_kind_from_program("/usr/bin/ksh"), ShellKind::Other);
+    }
+
+    #[test]
+    fn zsh_injection_wraps_zdotdir_and_keeps_login() {
+        let dir = Path::new("/tmp/si");
+        let plan = injection_plan(ShellKind::Zsh, dir, Some("/Users/u/zdot")).expect("zsh plan");
+        assert_eq!(plan.0, vec!["-l"]);
+        assert!(plan
+            .1
+            .contains(&("ZDOTDIR".to_string(), "/tmp/si".to_string())));
+        assert!(plan
+            .1
+            .contains(&("DBX_USER_ZDOTDIR".to_string(), "/Users/u/zdot".to_string())));
+        // Without a pre-existing ZDOTDIR the wrapper falls back to HOME.
+        let plain = injection_plan(ShellKind::Zsh, dir, None).expect("zsh plan");
+        assert_eq!(plain.1.len(), 1);
+    }
+
+    #[test]
+    fn bash_injection_swaps_login_for_rcfile_wrapper() {
+        let dir = Path::new("/tmp/si");
+        let plan = injection_plan(ShellKind::Bash, dir, None).expect("bash plan");
+        // 期望值经 PathBuf 拼接生成，分隔符断言在 Windows（\）上同样成立。
+        assert_eq!(
+            plan.0,
+            vec![
+                "--rcfile",
+                dir.join("wrapper.bash").to_string_lossy().as_ref()
+            ]
+        );
+        assert!(plan.1.is_empty());
+    }
+
+    #[test]
+    fn fish_and_powershell_quote_script_paths() {
+        let dir = Path::new("/tmp/my si");
+        let fish = injection_plan(ShellKind::Fish, dir, None).expect("fish plan");
+        assert_eq!(fish.0[0], "-l");
+        assert_eq!(fish.0[1], "-C");
+        assert_eq!(
+            fish.0[2],
+            format!(
+                "source '{}'",
+                escape_posix_single_quoted(dir.join("integration.fish").to_string_lossy().as_ref())
+            )
+        );
+
+        let pwsh = injection_plan(ShellKind::PowerShell, dir, None).expect("pwsh plan");
+        assert_eq!(pwsh.0[0], "-NoExit");
+        // Restricted-policy machines (Windows client default) must still be
+        // able to run the temp-dir integration script.
+        assert_eq!(pwsh.0[1], "-ExecutionPolicy");
+        assert_eq!(pwsh.0[2], "Bypass");
+        assert_eq!(pwsh.0[3], "-Command");
+        assert_eq!(
+            pwsh.0[4],
+            format!(
+                "& '{}'",
+                escape_powershell_single_quoted(
+                    dir.join("integration.ps1").to_string_lossy().as_ref()
+                )
+            )
+        );
+    }
+
+    #[test]
+    fn cmd_and_unknown_shells_get_no_injection() {
+        assert!(injection_plan(ShellKind::Cmd, Path::new("/tmp/si"), None).is_none());
+        assert!(injection_plan(ShellKind::Other, Path::new("/tmp/si"), None).is_none());
+    }
+
+    #[test]
+    fn prepare_integration_disabled_falls_back_to_base_args_without_io() {
+        let prepared = prepare_integration(ShellKind::Bash, false);
+        // Windows 无登录参数概念（见 base_args），Unix 一律 -l 登录 shell。
+        if cfg!(windows) {
+            assert!(prepared.args.is_empty());
+        } else {
+            assert_eq!(prepared.args, vec!["-l"]);
+        }
+        assert!(prepared.env.is_empty());
+        assert!(!prepared.injected);
+    }
+
+    #[test]
+    fn integration_scripts_emit_lifecycle_marks() {
+        for script in [
+            INTEGRATION_ZSH,
+            INTEGRATION_BASH,
+            INTEGRATION_FISH,
+            INTEGRATION_PWSH,
+        ] {
+            assert!(script.contains("133;A"), "missing prompt mark");
+            assert!(script.contains("133;D;"), "missing exit-code mark");
+            assert!(script.contains("633;P;Cwd="), "missing cwd report");
+        }
+        // 633;E command line is emitted by the POSIX scripts; PowerShell
+        // reports cwd over OSC 9;9 because OSC 7 is POSIX-path shaped.
+        assert!(INTEGRATION_ZSH.contains("633;E;"));
+        assert!(INTEGRATION_BASH.contains("633;E;"));
+        assert!(INTEGRATION_PWSH.contains("9;9;"));
+    }
+
+    #[test]
+    fn wrappers_chain_user_startup_files_fail_safe() {
+        // Only the rc-entry wrappers reference the integration directory;
+        // the zprofile/zlogin chains just forward the user's own files.
+        for wrapper in [WRAPPER_ZSHRC, WRAPPER_BASH] {
+            assert!(wrapper.contains("{{INTEGRATION_DIR}}"));
+        }
+        // Guarded user-rc chaining: DBX_USER_ZDOTDIR, HOME fallback, -f tests.
+        for zsh_wrapper in [WRAPPER_ZSHRC, WRAPPER_ZPROFILE, WRAPPER_ZLOGIN] {
+            assert!(zsh_wrapper.contains("DBX_USER_ZDOTDIR"));
+            assert!(zsh_wrapper.contains("$HOME"));
+        }
+        assert!(WRAPPER_BASH.contains("/etc/profile"));
+        assert!(WRAPPER_BASH.contains("$HOME/.bash_profile"));
+    }
+
+    #[test]
+    fn render_template_substitutes_the_integration_dir() {
+        let rendered = render_template("source '{{INTEGRATION_DIR}}/integration.zsh'", "/opt/x");
+        assert_eq!(rendered, "source '/opt/x/integration.zsh'");
+    }
+
+    #[test]
+    fn shell_discovery_merges_user_shell_etc_shells_and_defaults() {
+        // /etc/shells 注释与空行跳过；用户 shell 置顶；basename 大小写不敏感去重；
+        // 不存在的候选被 exists 谓词过滤。
+        let exists = |program: &str| {
+            matches!(
+                program,
+                "/opt/homebrew/bin/fish" | "/bin/zsh" | "/bin/bash" | "/usr/bin/fish"
+            )
+        };
+        let merged = merge_shell_candidates(
+            Some("/opt/homebrew/bin/fish"),
+            &[
+                "# comment".to_string(),
+                "".to_string(),
+                "/bin/zsh".to_string(),
+                "/opt/homebrew/bin/FISH".to_string(),
+                "/usr/bin/fish".to_string(),
+                "/bin/bash".to_string(),
+            ],
+            &["/bin/zsh", "/bin/bash"],
+            &exists,
+        );
+        // "/opt/homebrew/bin/FISH" 与 "/usr/bin/fish" 都是 basename fish，
+        // 大小写不敏感去重后只保留先到的用户 shell。
+        assert_eq!(
+            merged,
+            vec!["/opt/homebrew/bin/fish", "/bin/zsh", "/bin/bash"]
+        );
+    }
+
+    #[test]
+    fn shell_discovery_survives_missing_user_shell_and_empty_etc_shells() {
+        let merged = merge_shell_candidates(None, &[], &["/bin/bash"], &|p| p == "/bin/bash");
+        assert_eq!(merged, vec!["/bin/bash"]);
+    }
+
+    #[test]
+    fn shell_discovery_skips_login_unusable_entries() {
+        // /etc/shells 常见 /sbin/nologin 与 /bin/false：文件存在但不能登录，
+        // 列进选择器就是"点了就闪退"的启动项，必须与 pick_shell 同规则过滤。
+        let exists = |program: &str| {
+            matches!(
+                program,
+                "/bin/bash" | "/sbin/nologin" | "/usr/sbin/false" | "/bin/zsh"
+            )
+        };
+        let merged = merge_shell_candidates(
+            None,
+            &[
+                "/bin/bash".to_string(),
+                "/sbin/nologin".to_string(),
+                "/usr/sbin/false".to_string(),
+                "/bin/zsh".to_string(),
+            ],
+            &[],
+            &exists,
+        );
+        assert_eq!(merged, vec!["/bin/bash", "/bin/zsh"]);
+    }
+
+    #[test]
+    fn discovery_marks_injectable_kinds() {
+        let platform = if cfg!(windows) {
+            Platform::Windows
+        } else {
+            Platform::Linux
+        };
+        let shells = discover_shells(platform);
+        assert!(!shells.is_empty());
+        for entry in &shells {
+            let kind = shell_kind_from_program(&entry.program);
+            let expected = !matches!(kind, ShellKind::Cmd | ShellKind::Other);
+            assert_eq!(entry.injectable, expected, "entry {}", entry.program);
+        }
+    }
+
+    #[test]
+    fn display_names_read_naturally() {
+        assert_eq!(shell_display_name("zsh"), "Zsh");
+        assert_eq!(shell_display_name("powershell"), "Windows PowerShell");
+        assert_eq!(shell_display_name("pwsh"), "PowerShell");
+        assert_eq!(shell_display_name("wsl"), "WSL");
+    }
+
+    #[test]
+    fn quoting_survives_embedded_single_quotes() {
+        assert_eq!(
+            escape_posix_single_quoted("/tmp/o'brien/si"),
+            "/tmp/o'\\''brien/si"
+        );
+        assert_eq!(
+            escape_powershell_single_quoted("C:\\o'brien"),
+            "C:\\o''brien"
+        );
+    }
+
+    #[test]
+    fn write_integration_files_materializes_every_script() {
+        let dir = std::env::temp_dir().join(format!("dbx-si-test-{}", uuid::Uuid::new_v4()));
+        write_integration_files(&dir).expect("write files");
+        for name in [
+            "integration.zsh",
+            "integration.bash",
+            "integration.fish",
+            "integration.ps1",
+            ".zshrc",
+            ".zprofile",
+            ".zlogin",
+            "wrapper.bash",
+        ] {
+            assert!(dir.join(name).is_file(), "missing {name}");
+        }
+        let rendered = std::fs::read_to_string(dir.join(".zshrc")).expect("read wrapper");
+        assert!(rendered.contains(dir.to_string_lossy().as_ref()));
+        assert!(!rendered.contains("{{INTEGRATION_DIR}}"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn terminal_frame_encode_roundtrip() {
+        let frame = TerminalFrame {
+            sequence: 42,
+            stream: TerminalStream::Stdout,
+            data: b"hello".to_vec(),
+        };
+        let encoded = frame.encode();
+        assert_eq!(encoded[0], 0);
+        assert_eq!(&encoded[1..9], &42u64.to_be_bytes());
+        assert_eq!(&encoded[9..], b"hello");
+
+        let state = TerminalFrame {
+            sequence: 7,
+            stream: TerminalStream::State,
+            data: b"local-terminal-exited".to_vec(),
+        };
+        assert_eq!(state.encode()[0], 2);
+    }
+}

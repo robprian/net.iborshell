@@ -1,0 +1,470 @@
+// @vitest-environment happy-dom
+import { afterEach, describe, expect, it, vi } from "vitest";
+import type { TriageResult } from "./lib/alertTriage";
+
+// mockDbxHost 是可视化夹具（mock.html 的宿主模拟器）。这里的用例锁定两个
+// 曾经缺失的行为：默认 reattach 启动路径的终端回放内容（P2-2）与
+// ?err=disconnect 在 attach 路径的可达性/单发语义（P2-1）。
+const MOCK_URL = "http://localhost:5291/mock.html";
+
+interface RecordedEvent {
+  method: string;
+  params: Record<string, unknown>;
+}
+
+async function loadMock(search: string) {
+  vi.resetModules();
+  window.location.href = `${MOCK_URL}${search}`;
+  await import("./mockDbxHost");
+  return window.dbxPlugin;
+}
+
+function frameText(data: Uint8Array) {
+  return new TextDecoder().decode(data.slice(9));
+}
+
+function stateEvents(events: RecordedEvent[]) {
+  return events.filter((event) => event.method === "ssh/session/state");
+}
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.resetModules();
+});
+
+describe("mockDbxHost fixture", () => {
+  it("fileTransfer.write acknowledges decoded bytes for base64, typed-array slices and ArrayBuffer", async () => {
+    const plugin = await loadMock("");
+    const bytes = new Uint8Array([99, 0, 128, 255, 98]).subarray(1, 4);
+    const payloads = [bytes, bytes.slice().buffer, plugin.encodeBase64(bytes)];
+    for (const data of payloads) {
+      expect(await plugin.fileTransfer!.write("fixture-save", 11, data)).toEqual({ written: 3, nextOffset: 14 });
+    }
+    expect(await plugin.fileTransfer!.write("fixture-save", 14, "AA==")).toEqual({ written: 1, nextOffset: 15 });
+    expect(await plugin.fileTransfer!.write("fixture-save", 15, "")).toEqual({ written: 0, nextOffset: 15 });
+  });
+
+  it("replays Welcome + OSC 633 transcript on the default reattach startup path (P2-2)", async () => {
+    vi.useFakeTimers();
+    const plugin = await loadMock("");
+    const frames: Uint8Array[] = [];
+    plugin.onBinary((event) => {
+      if (event.channel.startsWith("ssh/terminal/out/") && event.data) frames.push(event.data);
+    });
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+
+    await plugin.invoke("ssh/session/attach", { connectionId: "visual-connection", workbenchId: "visual-workbench", afterSequence: 0 });
+    await vi.advanceTimersByTimeAsync(50);
+
+    const text = frames.map(frameText).join("");
+    expect(text).toContain("Welcome to DBX SSH/SFTP visual fixture");
+    expect(text).toContain("\u001b]633;A\u0007");
+    expect(text.endsWith("user@server:~$ ")).toBe(true);
+    // 默认参数不断开。
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(stateEvents(events)).toEqual([]);
+  });
+
+  it("fires ?err=disconnect on the attach startup path exactly once (P2-1)", async () => {
+    vi.useFakeTimers();
+    const plugin = await loadMock("?err=disconnect");
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+
+    await plugin.invoke("ssh/session/attach", { connectionId: "visual-connection", workbenchId: "visual-workbench", afterSequence: 0 });
+    await vi.advanceTimersByTimeAsync(30);
+    expect(stateEvents(events)).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(stateEvents(events)).toEqual([
+      { method: "ssh/session/state", params: { sessionId: "visual-session", state: "disconnected" } },
+    ]);
+
+    // 自动重连（再次 attach / open）后单发不复发。
+    await plugin.invoke("ssh/session/attach", {});
+    await plugin.invoke("ssh/session/open", {});
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(stateEvents(events)).toHaveLength(1);
+  });
+
+  it("keeps ?err=disconnect working on the explicit open path (manual reconnect)", async () => {
+    vi.useFakeTimers();
+    const plugin = await loadMock("?err=disconnect");
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+
+    await plugin.invoke("ssh/session/open", {});
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(stateEvents(events)).toEqual([
+      { method: "ssh/session/state", params: { sessionId: "visual-session", state: "disconnected" } },
+    ]);
+  });
+
+  // R3-P2-2 夹具缺陷收口：撞名 rename 不得丢失源文件（旧实现先摘源再写目标，
+  // mockWriteEntry 撞名抛错后源节点已丢）。
+  it("sftp/rename overwrites an existing target atomically without losing the source", async () => {
+    const plugin = await loadMock("");
+    await plugin.invoke("sftp/rename", { sourcePath: "/home/demo/deploy.sh", targetPath: "/home/demo/docker-compose.yml" });
+    const list = (await plugin.invoke("sftp/list", { path: "/home/demo" })) as { entries: Array<{ name: string }> };
+    const names = list.entries.map((entry) => entry.name).sort();
+    // deploy.sh 已改名落位到 docker-compose.yml（覆盖），server.log 不受影响，
+    // 且源位置不会出现"既无 deploy.sh 也无 docker-compose.yml"的丢源状态。
+    expect(names).toContain("docker-compose.yml");
+    expect(names).toContain("server.log");
+    expect(names).not.toContain("deploy.sh");
+    expect(names.filter((name) => name === "docker-compose.yml")).toHaveLength(1);
+    const moved = (await plugin.invoke("sftp/stat", { path: "/home/demo/docker-compose.yml" })) as { kind: string };
+    expect(moved.kind).toBe("file");
+  });
+
+  it("sftp/rename moves across directories without duplicating or dropping nodes", async () => {
+    const plugin = await loadMock("");
+    await plugin.invoke("sftp/rename", { sourcePath: "/home/demo/server.log", targetPath: "/tmp/server.log" });
+    const home = (await plugin.invoke("sftp/list", { path: "/home/demo" })) as { entries: Array<{ name: string }> };
+    const tmp = (await plugin.invoke("sftp/list", { path: "/tmp" })) as { entries: Array<{ name: string }> };
+    expect(home.entries.map((entry) => entry.name)).not.toContain("server.log");
+    expect(tmp.entries.map((entry) => entry.name)).toContain("server.log");
+  });
+
+  // round2：锁定 ssh/alert/triage mock 的契约形状（镜像后端 alert_triage::
+  // TriageResult：normalized/category/suggestions + purposeKey），让告警排查
+  // 弹窗在 mock.html 可无手填走查（P1-1 焦点/Esc 修复的浏览器级验证面）。
+  it("ssh/alert/triage mirrors the sidecar TriageResult shape for JSON and plain-text payloads", async () => {
+    const plugin = await loadMock("");
+    const payloadText = JSON.stringify({ alertId: "a-1", title: "Disk pressure", severity: "Critical", source: "Node", data: { used: "87%" } });
+    const json = (await plugin.invoke("ssh/alert/triage", { payload: payloadText })) as TriageResult;
+    expect(json.category).toBe("disk");
+    // severity/source 小写化；message 缺失时回退整段 payload（后端 openocta
+    // 兼容语义，不因 title 存在而变空）；data 对象转 pretty JSON。
+    expect(json.normalized.alertId).toBe("a-1");
+    expect(json.normalized.title).toBe("Disk pressure");
+    expect(json.normalized.message).toBe(payloadText);
+    expect(json.normalized.severity).toBe("critical");
+    expect(json.normalized.source).toBe("node");
+    expect(json.normalized.dataJson).toContain('"used"');
+    // disk 分类命中后端 Disk playbook 的同款命令清单。
+    expect(json.suggestions).toEqual([
+      { command: "df -h", purposeKey: "diskUsage" },
+      { command: "du -x -d 1 / | sort -rh | head -15", purposeKey: "diskDu" },
+    ]);
+
+    const plain = (await plugin.invoke("ssh/alert/triage", { payload: "  kernel: oom killer triggered on pid 4211  " })) as TriageResult;
+    expect(plain.category).toBe("oom");
+    // 纯文本告警：trim 后整段作为 message，severity 兜底 unknown。
+    expect(plain.normalized.message).toBe("kernel: oom killer triggered on pid 4211");
+    expect(plain.normalized.severity).toBe("unknown");
+    for (const suggestion of plain.suggestions) {
+      expect(typeof suggestion.command).toBe("string");
+      expect(suggestion.purposeKey.length).toBeGreaterThan(0);
+    }
+  });
+
+  // X-P2/P5 对齐真桥：无 onLocaleChange 订阅（真桥 API 面不存在），locale 经
+  // onEvent 投递 {type:"env", locale}（镜像真桥 updateLocale）；?locale= 定初值。
+  it("delivers runtime locale switches via onEvent env push and exposes no ghost bridge APIs", async () => {
+    const plugin = await loadMock("?locale=ja");
+    expect(plugin.locale).toBe("ja");
+    // 规则 7 机械守卫：mock 不得提供真桥不存在的幽灵 API；onContext 必须在。
+    expect(plugin).not.toHaveProperty("onLocaleChange");
+    expect(plugin).not.toHaveProperty("onContextChange");
+    expect(typeof plugin.onContext).toBe("function");
+
+    const seen: string[] = [];
+    const unsubscribe = plugin.onEvent((event) => {
+      if (event.type === "env" && typeof event.locale === "string") seen.push(event.locale);
+    });
+    const setLocale = (window as unknown as { __dbxMockSetLocale?: (next: string) => void }).__dbxMockSetLocale;
+    expect(typeof setLocale).toBe("function");
+    setLocale!("zh-CN");
+    expect(plugin.locale).toBe("zh-CN");
+    expect(seen).toEqual(["zh-CN"]);
+    unsubscribe();
+    setLocale!("en");
+    expect(plugin.locale).toBe("en");
+    expect(seen).toEqual(["zh-CN"]);
+  });
+
+  // round4：sftp/transfer/history 夹具补齐——此前落 catch-all（success:true 无
+  // tasks），面板在 mock.html 恒为空态，loadFailed+重试态与历史渲染无法走查。
+  it("sftp/transfer/history mirrors the sidecar contract (newest-first, failed rows, limit, err knob)", async () => {
+    const plugin = await loadMock("");
+    const ok = (await plugin.invoke("sftp/transfer/history", { limit: 50 })) as { tasks: Array<Record<string, unknown>> };
+    expect(ok.tasks.length).toBeGreaterThan(0);
+    // 新→旧排序；status 枚举无 queued；failed 行带 error。
+    const startedAts = ok.tasks.map((task) => task.startedAt as number);
+    expect([...startedAts].sort((a, b) => b - a)).toEqual(startedAts);
+    for (const task of ok.tasks) {
+      expect(["running", "completed", "cancelled", "failed"]).toContain(task.status);
+      expect(typeof task.taskId).toBe("string");
+    }
+    const failed = ok.tasks.find((task) => task.status === "failed");
+    expect(failed?.error).toBeTruthy();
+    // limit 收敛到实际条数。
+    const capped = (await plugin.invoke("sftp/transfer/history", { limit: 2 })) as { tasks: unknown[] };
+    expect(capped.tasks).toHaveLength(2);
+
+    const failing = await loadMock("?err=transferHistory");
+    await expect(failing.invoke("sftp/transfer/history", {})).rejects.toThrow(/transfer history/);
+  });
+
+  // round4：sftp/copy | sftp/move | sftp/write 夹具补齐——此前落 catch-all
+  // （静默 success 但树不变），粘贴/编辑保存流在 mock.html 无法闭环走查。
+  it("sftp/copy and sftp/move mutate the fixture tree per the sidecar contract", async () => {
+    const plugin = await loadMock("");
+    // copy：目标落位、源保留；撞名不覆盖时按项失败。
+    const copy = (await plugin.invoke("sftp/copy", { from: ["/home/demo/deploy.sh"], toDir: "/tmp", overwrite: false })) as {
+      success: boolean;
+      results: Array<{ from: string; to: string; ok: boolean; error?: string }>;
+    };
+    expect(copy.success).toBe(true);
+    expect(copy.results[0].ok).toBe(true);
+    const tmp1 = (await plugin.invoke("sftp/list", { path: "/tmp" })) as { entries: Array<{ name: string }> };
+    expect(tmp1.entries.map((entry) => entry.name)).toContain("deploy.sh");
+    const home1 = (await plugin.invoke("sftp/list", { path: "/home/demo" })) as { entries: Array<{ name: string }> };
+    expect(home1.entries.map((entry) => entry.name)).toContain("deploy.sh");
+
+    const conflict = (await plugin.invoke("sftp/copy", { from: ["/home/demo/deploy.sh"], toDir: "/tmp" })) as {
+      success: boolean;
+      results: Array<{ ok: boolean; error?: string }>;
+    };
+    expect(conflict.success).toBe(false);
+    expect(conflict.results[0].ok).toBe(false);
+    expect(conflict.results[0].error).toContain("target exists");
+
+    const overwrite = (await plugin.invoke("sftp/copy", { from: ["/home/demo/deploy.sh"], toDir: "/tmp", overwrite: true })) as { success: boolean };
+    expect(overwrite.success).toBe(true);
+    const tmp2 = (await plugin.invoke("sftp/list", { path: "/tmp" })) as { entries: Array<{ name: string }> };
+    expect(tmp2.entries.filter((entry) => entry.name === "deploy.sh")).toHaveLength(1);
+
+    // move：目标落位、源摘除。
+    const move = (await plugin.invoke("sftp/move", { from: ["/home/demo/server.log"], toDir: "/tmp" })) as { success: boolean };
+    expect(move.success).toBe(true);
+    const home2 = (await plugin.invoke("sftp/list", { path: "/home/demo" })) as { entries: Array<{ name: string }> };
+    const tmp3 = (await plugin.invoke("sftp/list", { path: "/tmp" })) as { entries: Array<{ name: string }> };
+    expect(home2.entries.map((entry) => entry.name)).not.toContain("server.log");
+    expect(tmp3.entries.map((entry) => entry.name)).toContain("server.log");
+  });
+
+  it("sftp/write persists content that sftp/read echoes back (editor save roundtrip)", async () => {
+    const plugin = await loadMock("");
+    const encoded = btoa("#!/usr/bin/env sh\necho edited\n");
+    await plugin.invoke("sftp/write", { remotePath: "/home/demo/deploy.sh", dataBase64: encoded });
+    const read = (await plugin.invoke("sftp/read", { path: "/home/demo/deploy.sh" })) as { dataBase64: string; truncated: boolean };
+    expect(read.truncated).toBe(false);
+    expect(atob(read.dataBase64)).toBe("#!/usr/bin/env sh\necho edited\n");
+    const stat = (await plugin.invoke("sftp/stat", { path: "/home/demo/deploy.sh" })) as { size: number };
+    expect(stat.size).toBe(30);
+  });
+
+  // PR-A4: the mock fixture serves the target contract — the context.plugin namespace (spec §4/§11).
+  // after the ?local=1 passthrough migration the legacy top-level localTerminal key must be gone.
+  it("?local=1 serves the A4 plugin-mode context without the legacy localTerminal key", async () => {
+    const plugin = await loadMock("?local=1");
+    expect(plugin.context).toEqual({
+      plugin: { mode: "local-terminal" },
+      workbenchId: "visual-workbench",
+      restored: false,
+      surface: "tab",
+    });
+    expect((plugin.context as Record<string, unknown>).localTerminal).toBeUndefined();
+  });
+
+  // PR-A4 恢复语义（spec §7.6/§8.4）：restored 夹具把恢复事实暴露给 App 的
+  // passthrough branch (no-replay restore — the App.vue restored branch guarantees no automatic shell; the browser
+  // side is locked to zero local/terminal/start calls by the A4 anchors in scripts/smoke_ui_mock.mjs).
+  it("?local=1&restored=1 exposes the restored fixture for the no-replay shell state", async () => {
+    const plugin = await loadMock("?local=1&restored=1");
+    expect(plugin.context).toMatchObject({
+      plugin: { mode: "local-terminal" },
+      restored: true,
+      surface: "tab",
+    });
+    // The fixture itself is passive: any local/terminal/start at load time would be an App-side bug,
+    // so this locks the mock's own zero bridge calls on the load path.
+    const starts: string[] = [];
+    const raw = plugin.invoke.bind(plugin);
+    plugin.invoke = ((method: string, ...rest: unknown[]) => {
+      if (method === "local/terminal/start") starts.push(method);
+      return (raw as (method: string, ...rest: unknown[]) => Promise<unknown>)(method, ...rest);
+    }) as typeof plugin.invoke;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(starts).toEqual([]);
+  });
+
+  // 本地 Shell 偏好（localShellCwd/localShellEnv）：mock 镜像 sidecar 白名单
+  // 合并语义——cwd 字符串裁剪存储、空串=清除不回传；env 数组内坏条目（空名/
+  // 含 =/托管键）静默丢弃。local/terminal/start 的 env/cwd 载荷由 App 层组装，
+  // sidecar 侧另有单测与 smoke_local_shell.py 端到端把关。
+  it("local/preferences persists localShellCwd and sanitizes localShellEnv like the sidecar allowlist", async () => {
+    const plugin = await loadMock("");
+    await plugin.invoke("local/preferences/set", { localShellCwd: "  /tmp/work  " });
+    let prefs = await plugin.invoke<{ localShellCwd?: string; localShellEnv?: Array<{ name: string; value: string }> }>("local/preferences/get", {});
+    expect(prefs.localShellCwd).toBe("/tmp/work");
+    await plugin.invoke("local/preferences/set", { localShellCwd: "" });
+    prefs = await plugin.invoke("local/preferences/get", {});
+    expect(prefs.localShellCwd).toBe("");
+
+    await plugin.invoke("local/preferences/set", { localShellEnv: [
+      { name: " DBX_WORK ", value: "1" },
+      { name: "", value: "drop" },
+      { name: "A=B", value: "drop" },
+      { name: "TERM", value: "drop" },
+      { name: "colorterm", value: "drop" },
+      { name: "NO_VALUE" },
+    ]});
+    prefs = await plugin.invoke("local/preferences/get", {});
+    // 缺 value 视为空值保留（sidecar unwrap_or("") 语义）。
+    expect(prefs.localShellEnv).toEqual([
+      { name: "DBX_WORK", value: "1" },
+      { name: "NO_VALUE", value: "" },
+    ]);
+  });
+
+  // PR-A4 host authority (spec §11): the mock's openWorkbench mirrors host A1 behavior —
+  // reserved fields supplied by the plugin (workbenchId/restored/surface) are dropped and the identity is generated by the host.
+  it("openWorkbench discards plugin-forged reserved fields and injects host identity", async () => {
+    const plugin = await loadMock("");
+    await plugin.openWorkbench!("net.iborshell.workbench", {
+      plugin: { mode: "local-terminal" },
+      reuseAuthenticatedTransport: true,
+      reuseAuthenticatedSessionId: "source-session",
+      workbenchId: "plugin-forged-id",
+      restored: true,
+      surface: "panel",
+    });
+    const calls = (window as unknown as { __dbxMockOpenWorkbench?: Array<{ contributionId: string; context: Record<string, unknown> }> }).__dbxMockOpenWorkbench ?? [];
+    expect(calls).toHaveLength(1);
+    expect(calls[0].contributionId).toBe("net.iborshell.workbench");
+    const ctx = calls[0].context;
+    // The plugin payload is preserved verbatim; reserved fields are overridden by the host identity.
+    expect(ctx.plugin).toEqual({ mode: "local-terminal" });
+    expect(ctx.reuseAuthenticatedTransport).toBe(true);
+    expect(ctx.reuseAuthenticatedSessionId).toBe("source-session");
+    expect(ctx.workbenchId).not.toBe("plugin-forged-id");
+    expect(String(ctx.workbenchId)).toMatch(/^mock-workbench-/);
+    expect(ctx.restored).toBe(false);
+    expect(ctx.surface).toBe("tab");
+  });
+
+  // M14-C DownloadSudo: sudo/download/start 用 path 参数、返回源文件名与
+  // sudo 标记；分块循环复用 sftp/download/next 的 binary 通道；cancel 清任务。
+  it("sudo/download mock streams through the shared sftp/download chunk pipeline", async () => {
+    const plugin = await loadMock("");
+    const events: Array<{ method: string; params: Record<string, unknown> }> = [];
+    plugin.onEvent((event) => events.push(event as unknown as { method: string; params: Record<string, unknown> }));
+    const info = await plugin.invoke<{ taskId: string; fileName: string; size: number; chunkSize: number; sudo: boolean }>("sudo/download/start", { sessionId: "visual-session", path: "/etc/nginx/nginx.conf" });
+    expect(info.taskId).toMatch(/^sudo-download-/);
+    expect(info.sudo).toBe(true);
+    expect(info.chunkSize).toBe(262144);
+    let offset = 0;
+    let eof = false;
+    while (!eof) {
+      const result = await plugin.invoke<{ length: number; eof: boolean }>("sftp/download/next", { taskId: info.taskId, offset });
+      offset += result.length;
+      eof = result.eof;
+    }
+    expect(offset).toBe(info.size);
+    // start/next 的进度事件沿既有 sftp/transfer/progress 通道广播（面板复用）。
+    expect(events.some((event) => event.method === "sftp/transfer/progress" && event.params.taskId === info.taskId)).toBe(true);
+    const finish = await plugin.invoke<{ success: boolean }>("sftp/download/finish", { taskId: info.taskId });
+    expect(finish.success).toBe(true);
+    const cancel = await plugin.invoke<{ success: boolean }>("sudo/download/cancel", { taskId: "sudo-download-unknown" });
+    expect(cancel.success).toBe(true);
+  });
+
+  // M18（M13 遗留 3 之 mock 补齐）：?auth=auto 按 AUTO_AUTH_ORDER 逐方式发
+  // ssh/auth/auto 进度事件（App.vue 据此渲染 Show logs 的逐方式日志：status
+  // skipped → info、failed → warn，method+detail 走 authAuto 文案），agent 兜底
+  // 成功（成功方式不发事件），会话仍建立；渲染数据面 authMethod 回 "auto"。
+  it("?auth=auto emits per-method ssh/auth/auto progress in AUTO_AUTH_ORDER and still opens the session", async () => {
+    vi.useFakeTimers();
+    const plugin = await loadMock("?auth=auto");
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+    const opened = await plugin.invoke("ssh/session/open", {}) as Record<string, unknown>;
+    expect(opened.sessionId).toBe("visual-session");
+
+    const autoEvents = events.filter((event) => event.method === "ssh/auth/auto");
+    // 顺序 = AUTO_AUTH_ORDER 的前三跳；agent 兜底成功不发事件。
+    expect(autoEvents.map((event) => event.params.method)).toEqual(["password", "private-key", "keyboard-interactive"]);
+    expect(autoEvents.map((event) => event.params.status)).toEqual(["failed", "skipped", "failed"]);
+    for (const event of autoEvents) {
+      // 事件形状镜像 backend/src/ssh.rs authenticate_auto 的 emitter.event：
+      // App 只消费 method/status/detail，operationId/connectionId 随包可诊断。
+      expect(event.params.operationId).toBe("visual-auth-auto");
+      expect(event.params.connectionId).toBe("visual-connection");
+      expect(typeof event.params.detail).toBe("string");
+      expect(String(event.params.detail).length).toBeGreaterThan(0);
+    }
+    // 逐方式日志的渲染数据：连接信息面板 authMethod（connectionInfo 翻译）。
+    const sessions = await plugin.invoke("ssh/sessions/list", {}) as { sessions: Array<{ authMethod?: string }> };
+    expect(sessions.sessions[0]?.authMethod).toBe("auto");
+  });
+
+  // ?auth=autofail：四方式全败，agent 也发 failed 事件，invoke 抛聚合错误串
+  // （auto_auth_failure_message 同构，逐方式按 try 顺序拼接 skipped/failed 原因）。
+  it("?auth=autofail reports every stage then rejects with the aggregated Auto failure message", async () => {
+    const plugin = await loadMock("?auth=autofail");
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+    await expect(plugin.invoke("ssh/session/open", {})).rejects.toThrow(
+      /SSH authentication failed in Auto mode, tried in order — password \(password rejected by server\); private-key \(skipped: no private key configured for this connection\)/,
+    );
+    const autoEvents = events.filter((event) => event.method === "ssh/auth/auto");
+    expect(autoEvents.map((event) => event.params.method)).toEqual(["password", "private-key", "keyboard-interactive", "agent"]);
+    expect(autoEvents.map((event) => event.params.status)).toEqual(["failed", "skipped", "failed", "failed"]);
+  });
+
+  // 缺省（显式认证方式）：不发任何 ssh/auth/auto 事件——回退叙事仅 Auto 场景。
+  it("default fixture emits no ssh/auth/auto progress events", async () => {
+    const plugin = await loadMock("");
+    const events: RecordedEvent[] = [];
+    plugin.onEvent((event) => events.push(event as unknown as RecordedEvent));
+    await plugin.invoke("ssh/session/open", {});
+    expect(events.filter((event) => event.method === "ssh/auth/auto")).toEqual([]);
+  });
+
+  // Docker 面板夹具（P2-4 走查）：默认返回容器表（payload 形状与 sidecar
+  // docker/list 契约一致），?docker=off|sudo 两个探针叙事可切换。
+  it("docker family mocks mirror the sidecar payload contract with off/sudo knobs", async () => {
+    const plugin = await loadMock("");
+    const listed = await plugin.invoke("docker/list", {}) as { available: boolean; needsSudo: boolean; containers: Array<Record<string, unknown>> };
+    expect(listed.available).toBe(true);
+    expect(listed.needsSudo).toBe(false);
+    expect(listed.containers.length).toBeGreaterThan(2);
+    for (const key of ["id", "name", "image", "state", "status", "ports", "createdAt"]) {
+      expect(key in listed.containers[0]).toBe(true);
+    }
+    // 状态枚举覆盖：表格状态徽标四色（running/exited/paused/unknown）。
+    expect(new Set(listed.containers.map((row) => row.state))).toEqual(new Set(["running", "exited", "paused"]));
+
+    const logs = await plugin.invoke("docker/logs", { containerId: listed.containers[0].id, tail: 200 }) as { logs: string; container: { health: string } | null };
+    expect(logs.logs.split("\n").length).toBeGreaterThan(3);
+    expect(logs.container?.health).toBe("healthy");
+    // 非法 id 拒绝（与 sidecar 同口径错误文案）。
+    await expect(plugin.invoke("docker/logs", { containerId: "web-nginx" })).rejects.toThrow(/Invalid containerId/);
+    await expect(plugin.invoke("docker/action", { containerId: listed.containers[0].id, action: "exec" })).rejects.toThrow(/Unsupported docker action/);
+    const action = await plugin.invoke("docker/action", { containerId: "d4a7c9f1e2b3", action: "restart" }) as { success: boolean };
+    expect(action.success).toBe(true);
+  });
+
+  it("docker fixture knobs switch the probe narrative (off = missing CLI, sudo = denied socket)", async () => {
+    const off = await (await loadMock("?docker=off")).invoke("docker/list", {}) as { available: boolean; needsSudo: boolean; containers: unknown[] };
+    expect(off).toEqual({ available: false, needsSudo: false, containers: [] });
+    const sudo = await (await loadMock("?docker=sudo")).invoke("docker/list", {}) as { available: boolean; needsSudo: boolean; containers: unknown[] };
+    expect(sudo).toEqual({ available: false, needsSudo: true, containers: [] });
+    // off 叙事下动作直接失败（面板 actionFailed 错误态走查）。
+    await expect((await loadMock("?docker=off")).invoke("docker/action", { containerId: "d4a7c9f1e2b3", action: "stop" })).rejects.toThrow(/docker CLI not found/);
+  });
+
+  it("throws for unimplemented methods instead of silently succeeding (strictness)", async () => {
+    const plugin = await loadMock("");
+    // 严格化（docs/MOCK_HOST_STRICTNESS_PLAN.zh-CN.md）：未实现方法显式
+    // 报错，错误信息必须带方法名与处理指引；已实现方法不受影响。
+    await expect(plugin.invoke("ssh/status", {})).rejects.toThrow(/unimplemented method: ssh\/status/);
+    await expect(plugin.invoke("watch/start", { sessionId: "s" })).rejects.toThrow(/unimplemented method: watch\/start/);
+    const listed = await plugin.invoke("docker/list", {}) as { available: boolean };
+    expect(listed.available).toBe(true);
+  });
+});

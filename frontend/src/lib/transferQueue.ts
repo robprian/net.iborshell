@@ -1,0 +1,273 @@
+
+// 传输任务统一账本行（progress 事件归并产物，updateTransfer 维护）。
+import type { TransferPhase } from "./transferProgress";
+
+export interface TransferTask {
+  taskId: string;
+  sessionId?: string;
+  direction: "upload" | "download";
+  fileName: string;
+  size: number;
+  transferred: number;
+  status: "queued" | "running" | "completed" | "cancelled" | "failed";
+  error?: string;
+  // saveToLocal 下载完成后的本机落盘路径（用于展示与在文件管理器中定位）。
+  localPath?: string;
+  // 上传分两阶段计数（issue #60）：staging=字节缓存进本地 spool（快），
+  // uploading=字节真正推到 SFTP 服务器（慢）。transferred 只反映 uploading，
+  // staged 单独记录 staging 字节，面板不再出现"3G→100M"回跳与假速度。
+  // 压缩通道（M33）阶段扩展见 transferProgress.TransferPhase。
+  phase?: TransferPhase;
+  staged?: number;
+  // 压缩通道标记（M33）：事件/start 响应携带 compression=gzip 时展示徽标；
+  // prep 回退（compression=none）时清除。
+  compression?: "gzip";
+  // 本工作台首次见到该任务的时间（issue #18 排序：live 行缺 startedAt 时
+  // 用它兜底，保证活跃区顺序稳定可解释）。
+  joinedAt?: number;
+  // 目录下载（sftp/download/tree/start）扩展：整树文件数、在传相对路径与
+  // 失败汇总（完成但部分文件失败时面板提示）。（issue #46）
+  fileCount?: number;
+  currentFile?: string;
+  failedCount?: number;
+  failureSample?: string;
+  // 多文件上传批次标记（issue #165）：同一批（一次选择/拖拽/粘贴）的
+  // 任务共享一个 batchId，面板聚合成「文件 N/M + 总字节」进度卡。事件
+  // 从不携带该键，updateTransfer 透传已有记录上的值。
+  batchId?: string;
+}
+
+/** 一批多文件上传的聚合视图（issue #165）：文件计数由批次编排器（已知
+ * 总数）给出，字节进度按 batchId 从任务账本聚合。纯函数，可单测。 */
+export interface BatchUploadSummary {
+  filesDone: number;
+  filesTotal: number;
+  /** 失败收场的文件数（cancelled 是用户主动取消，不计失败；两者都已计入
+   * filesDone——失败计入进度但不吞掉总数）。 */
+  filesFailed: number;
+  bytesDone: number;
+  totalBytes: number;
+  currentFile?: string;
+}
+
+export function summarizeBatchUpload(
+  tasks: TransferTask[],
+  batchId: string,
+  filesTotal: number,
+  totalBytes: number,
+): BatchUploadSummary {
+  let filesDone = 0;
+  let filesFailed = 0;
+  let bytesDone = 0;
+  let currentFile: string | undefined;
+  for (const task of tasks) {
+    if (task.batchId !== batchId) continue;
+    if (task.status === "completed" || task.status === "failed" || task.status === "cancelled") {
+      filesDone += 1;
+      if (task.status === "failed") filesFailed += 1;
+    }
+    bytesDone += Math.min(task.transferred, task.size || task.transferred);
+    if (!currentFile && (task.status === "running" || task.status === "queued")) {
+      currentFile = task.fileName;
+    }
+  }
+  return { filesDone, filesTotal, filesFailed, bytesDone, totalBytes, currentFile };
+}
+
+/** 批次聚合卡百分比（issue #165）：字节进度为准；总字节未知（全 0，尚未
+ * 见到任何任务行）时回落文件数占比，避免恒 0 的死条。 */
+export function batchUploadPercent(summary: BatchUploadSummary): number {
+  if (summary.totalBytes > 0) return Math.min(100, Math.round((summary.bytesDone / summary.totalBytes) * 100));
+  if (summary.filesTotal > 0) return Math.round((summary.filesDone / summary.filesTotal) * 100);
+  return 0;
+}
+// 传输并发调度（P1-5）：把 App 里"固定 3 路并发"的硬编码抽成可配置的
+// 调度策略。槽位语义：running 与 paused 都占位（暂停中的任务不释放并发
+// 槽，恢复后原地继续），done/cancelled 释放；多方向混合队列按方向计数
+// 均衡取件，同方向保持入队顺序。纯调度 + 一个可注入 runner 的编排函数。
+
+export type TransferDirection = "upload" | "download";
+
+export type TransferQueueStatus = "queued" | "running" | "paused" | "done" | "cancelled";
+
+/** 上传重复目标策略：rename（自动重命名，默认）/ ask（每次询问）/ overwrite（覆盖）。 */
+export type TransferDuplicatePolicy = "rename" | "ask" | "overwrite";
+
+export const TRANSFER_DUPLICATE_POLICIES: readonly TransferDuplicatePolicy[] = ["rename", "ask", "overwrite"];
+
+export function sanitizeTransferDuplicatePolicy(value: unknown, fallback: TransferDuplicatePolicy = "rename"): TransferDuplicatePolicy {
+  return value === "rename" || value === "ask" || value === "overwrite" ? value : fallback;
+}
+
+export interface TransferQueueItem {
+  id: string;
+  direction: TransferDirection;
+  status: TransferQueueStatus;
+}
+
+export interface RunTransfersOptions<T> {
+  /** 每个元素的稳定 id（取消/完成状态回写用）。 */
+  id: (item: T) => string;
+  /** 方向抽取器；缺省视为 upload（现有两条入口都是上传批次）。 */
+  direction?: (item: T) => TransferDirection;
+  /** 单个传输的执行体；抛错 = 该项取消（释放槽位）并停止派发后续项。 */
+  run: (item: T) => Promise<void>;
+}
+
+/** 占用并发槽的状态：暂停项占位不释放，取消/完成项释放。 */
+function occupiesSlot(status: TransferQueueStatus): boolean {
+  return status === "running" || status === "paused";
+}
+
+/** 用户主动取消的错误码：cancelTransfer 拒绝 ack 等待器与终态 cancelled
+ * 事件的拒绝错误都带它（评审 H-3）。runTransfers 据此把取消与真实失败
+ * 区分开——取消项释放槽位，剩余项照常派发，批次不中止。 */
+export const TRANSFER_CANCELLED_CODE = "transfer-cancelled";
+
+export function isTransferCancelledCause(cause: unknown): boolean {
+  return (cause as { code?: unknown } | null | undefined)?.code === TRANSFER_CANCELLED_CODE;
+}
+
+export function transferSlotsInUse(queue: readonly TransferQueueItem[]): number {
+  return queue.reduce((count, item) => count + (occupiesSlot(item.status) ? 1 : 0), 0);
+}
+
+/** 传输并发上限钳制：1..10，非法值回落 3。 */
+export function clampTransferConcurrency(value: unknown, fallback = 3): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(10, Math.max(1, Math.floor(parsed)));
+}
+
+/**
+ * 会话级传输并发深度（M14-B）：1..8，非法值回落 3。与批次队列的
+ * clampTransferConcurrency（1..10）是两个维度：本值约束同一 SSH 会话
+ * 同时活跃的传输任务数（sidecar 权威），批次值约束前端批量派发。
+ */
+export function clampTransferMaxActive(value: unknown, fallback = 3): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(8, Math.max(1, Math.floor(parsed)));
+}
+
+/**
+ * 下载限速（issue #66）：0..1048576 KiB/s（0=不限速，缺省），非法值回落 0。
+ * 与 sidecar preferences 的 sanitize_transfer_download_limit_kib 同向钳制。
+ */
+export const TRANSFER_DOWNLOAD_LIMIT_KIB_MAX = 1_048_576;
+
+export function clampTransferDownloadLimit(value: unknown, fallback = 0): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.min(TRANSFER_DOWNLOAD_LIMIT_KIB_MAX, Math.floor(parsed));
+}
+
+/**
+ * 下一个可派发的排队项；没有空槽或没有可跑项时返回 null。
+ * 全局槽位用 `runningCount` 传入（running + paused 之和），方向均衡只在
+ * 有多个方向可跑时影响取件顺序，不改变全局上限。
+ */
+export function nextRunnable<T extends TransferQueueItem>(queue: readonly T[], runningCount: number, limit: number): T | null {
+  const boundedLimit = Math.max(1, Math.floor(limit));
+  const active = Math.max(0, Math.floor(runningCount));
+  if (active >= boundedLimit) return null;
+  // 两个方向的占槽数先一遍数清，再一遍选件——旧实现对每个 queued 项都重扫
+  // 全队列数槽（O(n²)），大批量派发时是主线程卡顿源。取件语义不变：低槽
+  // 方向赢，槽位相同时队列顺序优先（严格小于）。
+  let uploadSlots = 0;
+  let downloadSlots = 0;
+  for (const item of queue) {
+    if (!occupiesSlot(item.status)) continue;
+    if (item.direction === "upload") uploadSlots += 1;
+    else downloadSlots += 1;
+  }
+  let best: T | null = null;
+  let bestDirectionSlots = Number.POSITIVE_INFINITY;
+  for (const item of queue) {
+    if (item.status !== "queued") continue;
+    const directionSlots = item.direction === "upload" ? uploadSlots : downloadSlots;
+    if (directionSlots < bestDirectionSlots) {
+      best = item;
+      bestDirectionSlots = directionSlots;
+    }
+  }
+  return best;
+}
+
+/**
+ * 按调度策略批量执行传输：并发上限内逐个取 queued 项置 running 并交给
+ * runner；runner 抛错视为该项取消（状态 cancelled、槽位释放）并向外传播，
+ * 失败后不再派发新项（在途项自然跑完）。用户取消（transfer-cancelled 码，
+ * 评审 H-3）只终止当前项，不置 failed、不外抛——剩余项继续派发。
+ */
+export async function runTransfers<T>(items: readonly T[], limit: number, options: RunTransfersOptions<T>): Promise<void> {
+  const directionOf = options.direction ?? (() => "upload" as TransferDirection);
+  const tracked: TransferQueueItem[] = items.map((item, index) => ({
+    id: options.id(item) || `transfer-${index}`,
+    direction: directionOf(item),
+    status: "queued",
+  }));
+  if (!tracked.length) return;
+  const originals = new Map(tracked.map((item, index) => [item.id, items[index]]));
+  let failed = false;
+  // 增量调度账本：批次内状态单向（queued → running → done/cancelled），占槽
+  // 计数与每方向取件指针随迁移同步维护，取件摊还 O(1)——旧实现每次派发都
+  // 全队列重扫（每批 O(n²)，数千文件的文件夹上传会冻结主线程）。取件契约与
+  // nextRunnable 相同：有槽且存在 queued 项才派发；低槽方向赢，槽位相同时
+  // 队列顺序（index 小者）优先。
+  let activeTotal = 0;
+  const activeByDirection: Record<TransferDirection, number> = { upload: 0, download: 0 };
+  const cursorByDirection: Record<TransferDirection, number> = { upload: 0, download: 0 };
+
+  const firstQueued = (direction: TransferDirection): { item: TransferQueueItem; index: number } | null => {
+    for (let index = cursorByDirection[direction]; index < tracked.length; index += 1) {
+      const item = tracked[index];
+      if (item.direction !== direction) continue;
+      if (item.status === "queued") return { item, index };
+      // 终态项永不再回 queued，指针推过即可。
+      cursorByDirection[direction] = index + 1;
+    }
+    return null;
+  };
+
+  const pickNext = (): TransferQueueItem | null => {
+    if (activeTotal >= Math.max(1, Math.floor(limit))) return null;
+    const upload = firstQueued("upload");
+    const download = firstQueued("download");
+    if (!upload && !download) return null;
+    if (!upload) return download!.item;
+    if (!download) return upload.item;
+    const upSlots = activeByDirection.upload;
+    const downSlots = activeByDirection.download;
+    if (downSlots < upSlots) return download.item;
+    if (upSlots < downSlots) return upload.item;
+    return upload.index < download.index ? upload.item : download.item;
+  };
+
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      if (failed) return;
+      const next = pickNext();
+      if (!next) return;
+      next.status = "running";
+      activeTotal += 1;
+      activeByDirection[next.direction] += 1;
+      try {
+        await options.run(originals.get(next.id)!);
+        next.status = "done";
+      } catch (cause) {
+        next.status = "cancelled";
+        if (!isTransferCancelledCause(cause)) {
+          failed = true;
+          throw cause;
+        }
+      } finally {
+        activeTotal -= 1;
+        activeByDirection[next.direction] -= 1;
+      }
+    }
+  };
+
+  const workerCount = Math.max(1, Math.min(clampTransferConcurrency(limit), tracked.length));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+}
