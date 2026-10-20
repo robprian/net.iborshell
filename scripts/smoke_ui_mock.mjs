@@ -274,13 +274,15 @@ try {
   );
   await webglPage.close();
 
-  // --- Warp-style history panel: ↑ opens with focus kept on the terminal; --
-  // search box filters after click-focus; terminal Enter runs the line (#138).
+  // --- History panel REMOVED (iBorShell): ArrowUp / Ctrl+R / Ctrl+Shift+H --
+  // no longer open any panel; the keystrokes fall through to the shell.
+  // Seeded command history still feeds the INLINE suggestion overlay
+  // (history collection itself was kept; only the panel UI was removed).
   // 独立页面 + addInitScript 种子：commandHistory 水合在 App setup（晚于
   // addInitScript），mock 宿主 storage 的兜底档正是 window.localStorage。
   // 值为分桶档（scope = connectionId）：历史按连接隔离，mock 页面的作用域
   // 是 mock 宿主注入的 "visual-connection"。
-  console.log("==> history panel walkthrough");
+  console.log("==> history removal + inline suggestions walkthrough");
   const historyPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   historyPage.on("pageerror", (err) => pageError.push(String(err)));
   await historyPage.addInitScript(() => {
@@ -323,182 +325,58 @@ try {
   check("shortcut hint strip returns after clearing the line", hintsAfterBackspace === 1, `hints=${hintsAfterBackspace}`);
 
   await historyPage.keyboard.press("ArrowUp");
-  await expect(historyPage, ".terminal-history-panel", "history panel opens on ArrowUp");
-  // #138 交互跟进：面板打开不抢焦点，光标留在命令行（xterm textarea）。
+  await sleep(400);
+  const panelsAfterArrowUp = await historyPage.locator(".terminal-history-panel").count();
+  check("ArrowUp opens no history panel (panel removed)", panelsAfterArrowUp === 0, `panels=${panelsAfterArrowUp}`);
+  // 焦点不被抢：光标留在命令行（xterm textarea），↑ 作为 shell 历史键直达 PTY。
   const focusOnLine = await historyPage.evaluate(() => document.activeElement?.classList?.contains("xterm-helper-textarea") === true);
   check("focus stays on the terminal input line after ArrowUp", focusOnLine, `active=${await historyPage.evaluate(() => document.activeElement?.className ?? "null")}`);
-  // mock PTY 启动回放会额外入一条 E 帧命令，计数不固定——只断言种子条目在列。
-  await expectText(historyPage, ".terminal-history-hit", "echo ui-mock-history-a", "history panel lists the seeded history");
-  const unfilteredRows = await historyPage.locator(".terminal-history-hit").count();
-  // 终端焦点路径：打字进命令行（shell 语义），面板不过滤、列表保持原样。
-  await historyPage.keyboard.type("tail");
-  const rowsAfterLineTyping = await historyPage.locator(".terminal-history-hit").count();
-  check("terminal typing goes to the input line (panel stays unfiltered)", rowsAfterLineTyping === unfilteredRows, `rows=${rowsAfterLineTyping}/${unfilteredRows}`);
-  // 搜索框不再自动聚焦：点击聚焦后才过滤。
-  // 面板锚点经 rAF 合帧随回显 settle 收敛（高负载下构建刚结束的宿主上可达
-  // 秒级），且面板可能落在可滚动区边缘：点击前先 scrollIntoViewIfNeeded，
-  // 消除「可见但瞬时不稳定/差一格视口」的误报；scroll 不可达的面板仍会以
-  // 原生 actionability 失败暴露，不掩盖真实定位缺陷。
-  await historyPage.click(".terminal-history-search-input");
-  const focusOnSearch = await historyPage.evaluate(() => document.activeElement?.classList?.contains("terminal-history-search-input") === true);
-  check("clicking the search box focuses it", focusOnSearch, `active=${await historyPage.evaluate(() => document.activeElement?.className ?? "null")}`);
-  await historyPage.keyboard.type("tail");
-  const filteredRows = await historyPage.locator(".terminal-history-hit").count();
-  check("search-box typing filters the panel to the single fuzzy hit", filteredRows === 1, `rows=${filteredRows}`);
-  await expectText(historyPage, ".terminal-history-hit", "tail -f /var/log/ui-mock.log", "filtered entry text");
-  await historyPage.screenshot({ path: `${SHOT_DIR}/04-history-panel.png`, fullPage: false }).catch(() => undefined);
-  // Enter（搜索框路径）仅收起不执行：面板关闭、焦点归还终端（无 \r，mock 只回显）。
-  await historyPage.keyboard.press("Enter");
-  const panelsAfterEnter = await historyPage.locator(".terminal-history-panel").count();
-  check("Enter closes the panel without auto-run (search-box path)", panelsAfterEnter === 0, `panels=${panelsAfterEnter}`);
-  const focusBackOnLine = await historyPage.evaluate(() => document.activeElement?.classList?.contains("xterm-helper-textarea") === true);
-  check("focus returns to the terminal after search-box Enter", focusBackOnLine, `active=${await historyPage.evaluate(() => document.activeElement?.className ?? "null")}`);
-  try {
-    await historyPage.waitForFunction(
-      () => document.querySelector(".terminal-host")?.textContent?.includes("tail -f /var/log/ui-mock.log"),
-      null,
-      { timeout: 10_000 },
-    );
-    console.log('  ok  selected command echoed into the input line ("tail -f …")');
-  } catch {
-    failures.push('selected command not echoed ("tail -f /var/log/ui-mock.log")');
-    console.log('  FAIL selected command echo');
-  }
-  // Esc 关闭语义：重开 → ↑ 按到超过条目数（stay 停住不关面板，P0-D）→ Esc → 面板消失。
-  await historyPage.keyboard.press("ArrowUp");
-  await expect(historyPage, ".terminal-history-panel", "history panel reopens");
-  for (let i = 0; i < 8; i += 1) await historyPage.keyboard.press("ArrowUp");
-  const panelsAtTop = await historyPage.locator(".terminal-history-panel").count();
-  check("ArrowUp past the oldest entry keeps the panel open (stay)", panelsAtTop === 1, `panels=${panelsAtTop}`);
-  await historyPage.keyboard.press("Escape");
-  const panelsAfterEsc = await historyPage.locator(".terminal-history-panel").count();
-  check("Escape closes the panel", panelsAfterEsc === 0, `panels=${panelsAfterEsc}`);
-  // 用过即散：↑ 开面板命中引导条教的键位，面板关闭后引导条不再出现。
-  const hintsAfterPanelUse = await historyPage.locator(".terminal-prompt-hints").count();
-  check("hint strip stays dismissed after using the panel (used-once dismissal)", hintsAfterPanelUse === 0, `hints=${hintsAfterPanelUse}`);
 
-  // 热键唤起聚焦搜索框（批 3d，Warp Ctrl+R 心智）：⌘⇧H（mac）/ Ctrl+Shift+H。
+  // 旧热键（⌘⇧H / Ctrl+Shift+H 与 Ctrl+R）同样不再唤起面板。
   const historyHotkey = process.platform === "darwin" ? "Meta+Shift+h" : "Control+Shift+H";
   await historyPage.keyboard.press(historyHotkey);
-  await expect(historyPage, ".terminal-history-panel", "history panel opens via hotkey");
-  const focusOnSearchHotkey = await historyPage.evaluate(() => document.activeElement?.classList?.contains("terminal-history-search-input") === true);
-  check("hotkey entry focuses the search box", focusOnSearchHotkey, `active=${await historyPage.evaluate(() => document.activeElement?.className ?? "null")}`);
-  await historyPage.keyboard.press("Escape");
-  const panelsAfterHotkeyEsc = await historyPage.locator(".terminal-history-panel").count();
-  check("Escape closes the hotkey-opened panel", panelsAfterHotkeyEsc === 0, `panels=${panelsAfterHotkeyEsc}`);
-
-  // Ctrl+R（Warp Command Search 的默认键 workspace:show_command_search）：打开
-  // 即聚焦搜索框；收起走 Esc（焦点在搜索框时按键经面板转发链，Ctrl+R toggle
-  // 只在终端焦点路径成立）。
+  await sleep(300);
+  const panelsAfterHotkey = await historyPage.locator(".terminal-history-panel").count();
+  check("history hotkey opens no panel (panel removed)", panelsAfterHotkey === 0, `panels=${panelsAfterHotkey}`);
   await historyPage.keyboard.press("Control+r");
-  await expect(historyPage, ".terminal-history-panel", "history panel opens via Ctrl+R (Warp command search)");
-  const focusOnSearchCtrlR = await historyPage.evaluate(() => document.activeElement?.classList?.contains("terminal-history-search-input") === true);
-  check("Ctrl+R entry focuses the search box", focusOnSearchCtrlR, `active=${await historyPage.evaluate(() => document.activeElement?.className ?? "null")}`);
-  await historyPage.keyboard.press("Escape");
-  const panelsAfterCtrlREsc = await historyPage.locator(".terminal-history-panel").count();
-  check("Escape closes the Ctrl+R-opened panel", panelsAfterCtrlREsc === 0, `panels=${panelsAfterCtrlREsc}`);
+  await sleep(300);
+  const panelsAfterCtrlR = await historyPage.locator(".terminal-history-panel").count();
+  check("Ctrl+R opens no panel (panel removed)", panelsAfterCtrlR === 0, `panels=${panelsAfterCtrlR}`);
 
-  // 富元数据（批 4d，Warp command search）：mock 夹具 curl 命令 D 帧退出码 28
-  // → 重开面板应渲染 ✗ 28 红徽标。
-  await historyPage.keyboard.press("ArrowUp");
-  await expect(historyPage, ".terminal-history-panel", "history panel reopens for meta check");
-  try {
-    await historyPage.waitForFunction(
-      () => Array.from(document.querySelectorAll(".terminal-history-exit")).some((el) => el.textContent?.includes("28")),
-      null,
-      { timeout: 10_000 },
-    );
-    console.log('  ok  failed command shows the exit-code badge ("✗ 28")');
-  } catch {
-    failures.push('exit-code badge missing for the failed mock command');
-    console.log("  FAIL exit-code badge");
-  }
-  await historyPage.keyboard.press("Escape");
-
-  // --- inline ghost (batch 2, P0-C): prefix hits go to ghost, not the -----
-  // --- fuzzy overlay; Ctrl+→ accepts one word, → accepts the remainder. ---
-  // 同页续用（历史已种子）。注意先回车清行：前段走查中 ↑ 同步进输入行的
-  // 命令还留在行缓冲里（Esc 取消恢复的是原行 "tail"），不清行的话再敲
-  // "ec" 拼成 "tailec"，ghost/浮层都无命中。
-  await historyPage.keyboard.press("Enter");
-  await sleep(600);
-  await historyPage.click(".terminal-host");
-  await historyPage.keyboard.type("ec");
-  let ghostText = "";
-  try {
-    await historyPage.waitForFunction(
-      () => {
-        const el = document.querySelector(".terminal-ghost");
-        return el && el.textContent && el.textContent.length > 0 ? el.textContent : false;
-      },
-      null,
-      { timeout: 10_000 },
-    );
-    ghostText = await historyPage.locator(".terminal-ghost > span[aria-hidden]").textContent() ?? "";
-  } catch {
-    ghostText = "";
-  }
-  check("ghost shows the remainder for a prefix of seeded history", ghostText.startsWith("ho ui-mock-history-a"), `ghost="${ghostText}"`);
-  const overlaysDuringGhost = await historyPage.locator(".command-suggestions").count();
-  check("fuzzy suggestion overlay yields to the inline ghost (data split)", overlaysDuringGhost === 0, `overlays=${overlaysDuringGhost}`);
-  await historyPage.screenshot({ path: `${SHOT_DIR}/04b-ghost-inline.png`, fullPage: false }).catch(() => undefined);
-  await historyPage.keyboard.press("Control+ArrowRight");
-  let ghostAfterWord = "";
-  try {
-    await historyPage.waitForFunction(
-      () => {
-        const el = document.querySelector(".terminal-ghost");
-        return el && el.textContent === " ui-mock-history-a";
-      },
-      null,
-      { timeout: 10_000 },
-    );
-    ghostAfterWord = await historyPage.locator(".terminal-ghost > span[aria-hidden]").textContent() ?? "";
-  } catch {
-    // 抖动兜底：mock 回显 RTT 偶发让瞬时读取落空，缓冲后重读一次。
-    await sleep(1_200);
-    ghostAfterWord = await historyPage.locator(".terminal-ghost > span[aria-hidden]").textContent().catch(() => "") ?? "";
-  }
-  check("Ctrl+→ accepts one word (remainder shrinks)", ghostAfterWord === " ui-mock-history-a", `ghost="${ghostAfterWord}"`);
-  await historyPage.keyboard.press("ArrowRight");
-  await sleep(600);
-  const ghostAfterFull = await historyPage.locator(".terminal-ghost").count();
-  check("→ accepts the whole remainder (ghost disappears)", ghostAfterFull === 0, `ghost=${ghostAfterFull}`);
-  // Ctrl+F 整段接受（Warp 口径第二键；readline forward-char 等价截获）。
-  await historyPage.keyboard.press("Enter");
-  await sleep(600);
-  await historyPage.click(".terminal-host");
-  await historyPage.keyboard.type("ec");
-  try {
-    await historyPage.waitForFunction(() => !!document.querySelector(".terminal-ghost"), null, { timeout: 10_000 });
-  } catch { /* ghost miss handled below */ }
-  await historyPage.keyboard.press("Control+f");
-  await sleep(600);
-  const ghostAfterCtrlF = await historyPage.locator(".terminal-ghost").count();
-  check("Ctrl+F accepts the whole remainder (Warp second key)", ghostAfterCtrlF === 0, `ghost=${ghostAfterCtrlF}`);
-  try {
-    await historyPage.waitForFunction(
-      () => document.querySelector(".terminal-host")?.textContent?.includes("echo ui-mock-history-a"),
-      null,
-      { timeout: 10_000 },
-    );
-    console.log('  ok  Ctrl+F accepted ghost echoed into the input line');
-  } catch {
-    failures.push("Ctrl+F accepted ghost not echoed");
-    console.log("  FAIL Ctrl+F ghost echo");
-  }
-  try {
-    await historyPage.waitForFunction(
-      () => document.querySelector(".terminal-host")?.textContent?.includes("echo ui-mock-history-a"),
-      null,
-      { timeout: 10_000 },
-    );
-    console.log('  ok  accepted ghost echoed into the input line ("echo …")');
-  } catch {
-    failures.push('accepted ghost not echoed ("echo ui-mock-history-a")');
-    console.log("  FAIL accepted ghost echo");
-  }
   await historyPage.close();
+
+  // 历史采集保留：种子历史经行内建议（ghost/浮层）呈现。
+  // 独立新页面验证（上一页的 ↑/Ctrl+R 转义序列会污染待输入行模型）：
+  // 前缀命中种子条目即证明采集→建议链路在面板移除后仍工作。
+  const suggestPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  suggestPage.on("pageerror", (err) => pageError.push(String(err)));
+  await suggestPage.addInitScript(() => {
+    window.localStorage.setItem(
+      "ssh-command-history",
+      JSON.stringify({
+        "visual-connection": ["echo ui-mock-history-a", "tail -f /var/log/ui-mock.log", "kubectl get pods -n ui-mock"],
+      }),
+    );
+  });
+  await suggestPage.goto(`${baseUrl}?render=dom`, { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await sleep(2_500);
+  await suggestPage.bringToFront();
+  await suggestPage.click(".terminal-host");
+  const suggestFixClose = suggestPage.locator(".terminal-ai-fix-close");
+  if (await suggestFixClose.count()) await suggestFixClose.click({ timeout: 3_000 }).catch(() => undefined);
+  await sleep(150);
+  await suggestPage.click(".terminal-host");
+  await suggestPage.keyboard.type("echo ui-mock");
+  // 前缀严格延伸命中时建议走行内 ghost（灰字补全，与浮层分工，浮层不打开）：
+  // 种子命令 echo ui-mock-history-a 相对已输入行多出的后缀 -history-a 即 ghost。
+  await expect(suggestPage, ".terminal-ghost", "inline ghost suggestion appears while typing");
+  await expectText(suggestPage, ".terminal-ghost", "-history-a", "seeded history feeds the inline ghost suggestion");
+  await suggestPage.screenshot({ path: `${SHOT_DIR}/04-history-inline.png`, fullPage: false }).catch(() => undefined);
+  await suggestPage.keyboard.press("Control+u");
+  await sleep(300);
+  const ghostsAfterClear = await suggestPage.locator(".terminal-ghost").count();
+  check("clearing the line dismisses the ghost suggestion", ghostsAfterClear === 0, `ghosts=${ghostsAfterClear}`);
+  await suggestPage.close();
 
   // --- global quick commands: delete --------------------------------------
   console.log("==> quick commands: delete");
@@ -837,25 +715,24 @@ try {
   check("#150 bt menu: leaked ↑ reached the PTY as caret echo", ((await guardPage.locator(".xterm-rows").textContent())?.includes("^[[")) === true, "echo check");
   await guardPage.screenshot({ path: `${SHOT_DIR}/08c-interactive-prompt-guard-bt.png`, fullPage: false }).catch(() => undefined);
   console.log("  screenshot: docs/screenshots-ui-mock/08c-interactive-prompt-guard-bt.png");
-  // 对照组：回到普通提示符（提示行滚出采样窗口）→ ↑ 照常开面板。
+  // 对照组：回到普通提示符——面板已整体移除（iBorShell），普通提示符下 ↑ 同样不开面板。
   await guardPage.evaluate((prefix) => window.__dbxMockEmitTerminal(`${prefix}user@server:~$ `), clearScreen);
   await guardPage.waitForTimeout(250);
   await guardPage.keyboard.press("ArrowUp");
-  await expect(guardPage, ".terminal-history-panel", "#150 control: ↑ opens the history panel at a normal prompt");
+  await guardPage.waitForTimeout(400);
+  check("#150 control: ↑ opens no history panel at a normal prompt (panel removed)", (await guardPage.locator(".terminal-history-panel").count()) === 0, "panel count");
   await guardPage.screenshot({ path: `${SHOT_DIR}/08b-interactive-prompt-guard-release.png`, fullPage: false }).catch(() => undefined);
   console.log("  screenshot: docs/screenshots-ui-mock/08b-interactive-prompt-guard-release.png");
   await guardPage.close();
 
-  // --- issue #150 跟进：高历史 + 光标中下部的贴行定位（用户三状态截图复现）---
-  // 50 条历史的内容高远超窗格：面板必须 ① 贴光标上方（bottom 锚定，不得被
-  // 旧版「容器高−内容高」钳制钉到窗格底），② 盒高收进本侧（max-height 恒按
-  // 可用空间设置，顶部标题/搜索不被视口上缘裁掉），③ 不遮挡光标行（列表
-  // min-height:0 内部滚动）。DOM 断言 + 截图双佐证。
-  console.log("==> issue #150 tall-history placement");
+  // --- 面板移除回归：50 条历史 + 光标中下部时 ↑ 不开面板、终端渲染不受扰 ---
+  // 原 #150 跟进验的是面板贴行定位；面板整体移除后（iBorShell），该场景
+  // 只需守两点：↑ 不唤起任何面板、终端行照常渲染（无布局残留）。
+  console.log("==> tall history: no panel after removal");
   const tallPage = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   tallPage.on("pageerror", (err) => pageError.push(String(err)));
   await tallPage.addInitScript(() => {
-    // legacy 扁平数组形态（sanitize 迁入 legacyScope 桶）：40 条长命令，内容高远超窗格。
+    // legacy 扁平数组形态（sanitize 迁入 legacyScope 桶）：40 条长命令。
     const lines = [];
     for (let i = 0; i < 40; i += 1) {
       lines.push(i % 4 === 0
@@ -876,38 +753,10 @@ try {
   await tallPage.waitForTimeout(400);
   await tallPage.keyboard.press("ArrowUp");
   await tallPage.waitForTimeout(500);
-  const placement = await tallPage.evaluate(({ filler }) => {
-    const panel = document.querySelector(".terminal-history-panel");
-    if (!panel) return null;
-    const screen = document.querySelector(".xterm-screen")?.getBoundingClientRect();
-    const host = document.querySelector(".terminal-host")?.getBoundingClientRect();
-    const rowEl = document.querySelector(".xterm-rows")?.children?.[0];
-    const cellHeight = rowEl ? rowEl.getBoundingClientRect().height : 0;
-    const rect = panel.getBoundingClientRect();
-    const screenTop = screen?.top ?? 0;
-    return {
-      styleBottom: panel.style.bottom || null,
-      rectTop: Math.round(rect.top), rectBottom: Math.round(rect.bottom),
-      screenTop: Math.round(screenTop),
-      hostTop: Math.round(host?.top ?? 0),
-      cursorLineTop: Math.round(screenTop + filler * cellHeight),
-      titleVisible: !!panel.querySelector(".terminal-history-title"),
-      searchVisible: !!panel.querySelector(".terminal-history-search-input"),
-    };
-  }, { filler: FILLER_LINES });
-  if (!placement) {
-    failures.push("#150 tall history: panel did not open at a normal prompt");
-    console.log("  FAIL #150 tall history: no panel");
-  } else {
-    check("#150 tall history: panel is above-anchored (bottom set, not parked at pane bottom)", !!placement.styleBottom && placement.styleBottom !== "0px", `style.bottom=${placement.styleBottom}`);
-    // 定位包含块是 terminal-pane:面板顶允许到 host 顶（screen 有内边距，比
-    // host 低几像素),只要不钻进工具条后方即为完整可见。
-    check("#150 tall history: panel top stays inside the terminal viewport (header not clipped)", placement.rectTop >= placement.hostTop - 1, `rectTop=${placement.rectTop} hostTop=${placement.hostTop}`);
-    check("#150 tall history: panel does not cover the cursor line", placement.rectBottom <= placement.cursorLineTop + 2, `rectBottom=${placement.rectBottom} cursorTop=${placement.cursorLineTop}`);
-    check("#150 tall history: title and search rows render", placement.titleVisible && placement.searchVisible, "chrome rows");
-  }
-  await tallPage.screenshot({ path: `${SHOT_DIR}/08d-tall-history-placement.png`, fullPage: false }).catch(() => undefined);
-  console.log("  screenshot: docs/screenshots-ui-mock/08d-tall-history-placement.png");
+  check("#150 tall history: no panel at a normal prompt (panel removed)", (await tallPage.locator(".terminal-history-panel").count()) === 0, "panel count");
+  check("#150 tall history: terminal rows still render", (await tallPage.locator(".xterm-rows").count()) === 1, "rows count");
+  await tallPage.screenshot({ path: `${SHOT_DIR}/08d-tall-history-removed.png`, fullPage: false }).catch(() => undefined);
+  console.log("  screenshot: docs/screenshots-ui-mock/08d-tall-history-removed.png");
   await tallPage.close();
 
   // --- issue #197: file drag without drop must not strand the SFTP pane on the upload overlay ---

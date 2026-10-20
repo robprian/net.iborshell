@@ -214,7 +214,8 @@ mod tests {
     fn other_providers_fall_through_and_missing_provider_is_not_local() {
         // The SSH provider's payload must never be claimed by this parser.
         assert_eq!(
-            LocalTarget::from_lifecycle_params(&lifecycle("net.iborshell.connection")).expect("parse"),
+            LocalTarget::from_lifecycle_params(&lifecycle("net.iborshell.connection"))
+                .expect("parse"),
             None
         );
         // Older hosts may omit the provider stamp entirely.

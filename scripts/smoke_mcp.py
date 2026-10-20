@@ -200,11 +200,14 @@ def sftp_file_family(proc: subprocess.Popen, next_id: list, connection: dict) ->
     stat = call_tool(proc, next_id, "sftp_stat", {**connection, "path": file_a})
     assert stat["size"] == len(payload.encode()), stat
     # sftp_exists 已随 #203 工具瘦身移出 MCP 面（sftp_stat 是严格超集）；
-    # 「不存在」现在表现为 sftp_stat 的 JSON-RPC error（status 2 =
-    # SSH_FX_NO_SUCH_FILE），绝不静默误报。
-    assert "status 2" in call_tool_error(proc, next_id, "sftp_stat", {
+    # 「不存在」现在表现为 sftp_stat 的 JSON-RPC error，绝不静默误报。
+    # 错误措辞随门面而异：裸包门面是 "status 2"，MCP 高层门面经 russh-sftp
+    # 的 StatusCode Display 是 "No such file"——两者都指 SSH_FX_NO_SUCH_FILE，
+    # 且与权限拒绝（"Permission denied"）可区分，这正是本断言要守的口径。
+    missing_error = call_tool_error(proc, next_id, "sftp_stat", {
         **connection, "path": f"{base}/no-such-probe",
     })
+    assert "No such file" in missing_error, missing_error
 
     call_tool(proc, next_id, "ssh_exec", {
         **connection, "command": f"mkdir '{base}/sub' && cp -a '{file_a}' '{base}/sub/probe.txt'",
@@ -224,9 +227,10 @@ def sftp_file_family(proc: subprocess.Popen, next_id: list, connection: dict) ->
     call_tool(proc, next_id, "ssh_exec", {
         **connection, "command": f"rm -f '{file_b}' '{base}/probe-copy.txt' && rm -rf '{base}'",
     })
-    assert "status 2" in call_tool_error(proc, next_id, "sftp_stat", {
+    removed_error = call_tool_error(proc, next_id, "sftp_stat", {
         **connection, "path": base,
     })
+    assert "No such file" in removed_error, removed_error
     print("sftp file family round-trip ok (sftp face + shell mutation face)")
 
 
