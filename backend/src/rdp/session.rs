@@ -992,7 +992,7 @@ pub(crate) fn client_name() -> String {
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| "DBX-SSH".to_string())
+        .unwrap_or_else(|| "iBorShell".to_string())
 }
 
 fn current_platform() -> MajorPlatformType {
