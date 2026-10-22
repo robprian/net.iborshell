@@ -39,10 +39,13 @@ export function useGhostSuggest(options: {
 // 经 update:ghost-suggest 即时跟随；acceptPayload 直接写 PTY，等价用户键入。
 const GHOST_SUGGEST_KEY = "ssh-terminal-ghost-suggest";
 function loadGhostSuggestEnabled(): boolean {
+  // iBorShell 1.0.3: default OFF (owner request — per-keystroke history
+  // matching felt heavy in the webview). Only an explicit stored "1"
+  // (Settings toggle) enables it; a stored "0" or no key stays off.
   try {
-    return pluginStore.getItem(GHOST_SUGGEST_KEY) !== "0";
+    return pluginStore.getItem(GHOST_SUGGEST_KEY) === "1";
   } catch {
-    return true;
+    return false;
   }
 }
 const ghostEnabled = ref(loadGhostSuggestEnabled());

@@ -595,6 +595,7 @@ const TRANSFER_COMPRESS_MODE_KEY = "ssh-transfer-compress-mode";
 const TRANSFER_COMPRESS_THRESHOLD_KEY = "ssh-transfer-compress-threshold-mib";
 // 命令输入建议（P1-1）：开关 + 查询长度上下限；同一偏好链路持久化。
 const SUGGESTIONS_ENABLED_KEY = "ssh-history-suggestions-enabled";
+const SUGGESTIONS_OFF_MIGRATION_KEY = "iborshell-103-suggestions-off";
 const SUGGESTIONS_MIN_CHARS_KEY = "ssh-history-suggestion-min-chars";
 const SUGGESTIONS_MAX_CHARS_KEY = "ssh-history-suggestion-max-chars";
 // 下载偏好的内存权威态：setup 早期（downloadUseDefaultDraft 初始化）就会被读，
@@ -611,7 +612,10 @@ const sftpNameEncodingState = ref<SftpNameEncoding>("auto");
 // 压缩传输（M33）：策略默认 auto、阈值默认 64 MiB（0=不限下限，上限 65536）。
 const transferCompressModeState = ref<SftpCompressMode>("auto");
 const transferCompressThresholdState = ref(64);
-const suggestionsEnabledState = ref(true);
+// iBorShell 1.0.3: riwayat saran perintah default MATI (permintaan owner —
+// pencocokan per ketikan terasa berat di webview). Toggle di Settings tetap
+// ada; nilai eksplisit dari sidecar preferences tetap dihormati.
+const suggestionsEnabledState = ref(false);
 const suggestionMinCharsState = ref(1);
 const suggestionMaxCharsState = ref(64);
 // ghost 接受键（Warp 多键模型）：→ / Ctrl+F / Ctrl+E 整段、Ctrl+→ 逐词恒可用
@@ -5896,7 +5900,9 @@ function cachePrefs() {
     else window.localStorage.removeItem(TRANSFER_COMPRESS_THRESHOLD_KEY);
     if (transferDuplicateState.value !== "rename") window.localStorage.setItem(TRANSFER_DUPLICATE_KEY, transferDuplicateState.value);
     else window.localStorage.removeItem(TRANSFER_DUPLICATE_KEY);
-    if (!suggestionsEnabledState.value) window.localStorage.setItem(SUGGESTIONS_ENABLED_KEY, "0");
+    // iBorShell 1.0.3: default MATI — hanya simpan kunci ("1") saat aktif,
+    // supaya pengguna yang belum pernah mengatur tidak terkunci ke default lama.
+    if (suggestionsEnabledState.value) window.localStorage.setItem(SUGGESTIONS_ENABLED_KEY, "1");
     else window.localStorage.removeItem(SUGGESTIONS_ENABLED_KEY);
     if (suggestionMinCharsState.value !== 1) window.localStorage.setItem(SUGGESTIONS_MIN_CHARS_KEY, String(suggestionMinCharsState.value));
     else window.localStorage.removeItem(SUGGESTIONS_MIN_CHARS_KEY);
@@ -5969,7 +5975,7 @@ async function hydratePrefsOnce() {
     sftpNameEncodingState.value = sanitizeNameEncoding(window.localStorage.getItem(SFTP_NAME_ENCODING_KEY));
     transferCompressModeState.value = sanitizeTransferCompressMode(window.localStorage.getItem(TRANSFER_COMPRESS_MODE_KEY));
     transferCompressThresholdState.value = sanitizeTransferCompressThresholdMib(window.localStorage.getItem(TRANSFER_COMPRESS_THRESHOLD_KEY) ?? undefined);
-    suggestionsEnabledState.value = window.localStorage.getItem(SUGGESTIONS_ENABLED_KEY) !== "0";
+    suggestionsEnabledState.value = window.localStorage.getItem(SUGGESTIONS_ENABLED_KEY) === "1";
     suggestionMinCharsState.value = clampSuggestionMinChars(window.localStorage.getItem(SUGGESTIONS_MIN_CHARS_KEY));
     suggestionMaxCharsState.value = clampSuggestionMaxChars(window.localStorage.getItem(SUGGESTIONS_MAX_CHARS_KEY));
   } catch {
@@ -6069,6 +6075,23 @@ async function hydratePrefsOnce() {
       suggestionMinCharsState.value = mirrored.history_suggestion_min_chars;
       suggestionMaxCharsState.value = mirrored.history_suggestion_max_chars;
       void syncPrefs();
+    }
+    // iBorShell 1.0.3 one-time migration: the suggestions default flipped to
+    // OFF, but installs from <=1.0.2 carry history_suggestions_enabled=true in
+    // the sidecar prefs and the mirror (written unconditionally by syncPrefs
+    // under the old default, indistinguishable from an explicit opt-in).
+    // Force it off exactly once and persist; afterwards the Settings toggle
+    // is authoritative again.
+    try {
+      if (window.localStorage.getItem(SUGGESTIONS_OFF_MIGRATION_KEY) !== "1") {
+        window.localStorage.setItem(SUGGESTIONS_OFF_MIGRATION_KEY, "1");
+        if (suggestionsEnabledState.value) {
+          suggestionsEnabledState.value = false;
+          void syncPrefs();
+        }
+      }
+    } catch {
+      // Storage unavailable: the in-memory default (off) still applies.
     }
     cachePrefs();
   } catch {
@@ -7416,19 +7439,25 @@ const panelNetRates = computed<{ rx: number; tx: number } | null>(() => {
 });
 
 // —— Live stats strip (iBorShell): CPU / ping / disk selalu terlihat di
-// toolbar terminal utama, polling ssh/metrics (cached) tiap 3 detik selama
-// sesi SSH terhubung. Ping = waktu round-trip RPC metrics (perkiraan
-// latensi ke host), diukur mengelilingi invoke. ——
+// toolbar terminal utama selama sesi SSH terhubung. Tick tiap 3 detik HANYA
+// membaca snapshot backend (cached: true — tanpa exec ke server, sekadar
+// RPC lokal) untuk ping; snapshot-nya sendiri disegarkan lewat satu fresh
+// collect tiap 15 detik (tick ke-5), karena di permukaan terminal tidak ada
+// poller lain yang mengisinya (kartu metrics/panel dock punya poller 5 detik
+// sendiri). Saat kartu metrics terbuka strip berhenti total — poller kartu
+// yang memiliki snapshot, tidak ada polling ganda. Ping = waktu round-trip
+// RPC metrics (perkiraan latensi ke host), diukur mengelilingi invoke. ——
 const liveStats = ref<{ cpu: number | null; disk: number | null; ping: number | null }>({ cpu: null, disk: null, ping: null });
 const liveStatsVisible = computed(() =>
   !panelSurface.value && connected.value && !localTerminalActive.value && liveStats.value.cpu !== null,
 );
-async function refreshLiveStats() {
+let liveStatsTick = 0;
+async function refreshLiveStats(fresh: boolean) {
   const sessionId = session.value?.sessionId;
   if (!sessionId) return;
   const started = performance.now();
   try {
-    const sample = await window.dbxPlugin.invoke<ServerMetrics>("ssh/metrics", { sessionId, cached: true }, { timeoutMs: 15_000 });
+    const sample = await window.dbxPlugin.invoke<ServerMetrics>("ssh/metrics", { sessionId, cached: !fresh }, { timeoutMs: 15_000 });
     const disks = sample.disks ?? [];
     const root = disks.find((disk) => disk.mount === "/") ?? disks[0];
     liveStats.value = {
@@ -7443,11 +7472,17 @@ async function refreshLiveStats() {
 let liveStatsTimer = 0;
 watch([connected, localTerminalActive], ([isConnected, isLocal]) => {
   window.clearInterval(liveStatsTimer);
+  liveStatsTick = 0;
   liveStats.value = { cpu: null, disk: null, ping: null };
   if (!isConnected || isLocal || panelSurface.value) return;
-  void refreshLiveStats();
+  void refreshLiveStats(true);
   liveStatsTimer = window.setInterval(() => {
-    if (document.visibilityState === "visible") void refreshLiveStats();
+    if (document.visibilityState !== "visible") return;
+    // Kartu metrics terbuka: poller 5 detik kartu menyegarkan snapshot yang
+    // sama — strip diam supaya tidak ada dua poller aktif bersamaan.
+    if (metricsOpen.value) return;
+    liveStatsTick += 1;
+    void refreshLiveStats(liveStatsTick % 5 === 0);
   }, 3000);
 }, { immediate: true });
 onBeforeUnmount(() => window.clearInterval(liveStatsTimer));

@@ -385,10 +385,12 @@ function applyCommandHistoryLimitFromDraft() {
 }
 
 function loadGhostEnabled(): boolean {
+  // iBorShell 1.0.3: default OFF, mirrors loadGhostSuggestEnabled in
+  // useGhostSuggest.ts — only an explicit stored "1" enables it.
   try {
-    return pluginStore.getItem(GHOST_SUGGEST_KEY) !== "0";
+    return pluginStore.getItem(GHOST_SUGGEST_KEY) === "1";
   } catch {
-    return true;
+    return false;
   }
 }
 

@@ -1178,7 +1178,7 @@ fn vendored_sspi_marks_ntlmv1_and_lm_as_unsupported() {
 
 #[test]
 fn client_build_encodes_the_package_version() {
-    assert_eq!(client_build(), 10002); // 1.0.2：major/minor/patch 两位数折叠 (1*100+0)*100+2 = 10002；版本变更时同步更新此 pin
+    assert_eq!(client_build(), 10003); // 1.0.3：major/minor/patch 两位数折叠 (1*100+0)*100+3 = 10003；版本变更时同步更新此 pin
 }
 
 #[test]

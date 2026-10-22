@@ -357,6 +357,9 @@ try {
         "visual-connection": ["echo ui-mock-history-a", "tail -f /var/log/ui-mock.log", "kubectl get pods -n ui-mock"],
       }),
     );
+    // iBorShell 1.0.3: ghost suggestions are opt-in (default off) — this
+    // walkthrough verifies the collection -> ghost pipeline, so enable it.
+    window.localStorage.setItem("ssh-terminal-ghost-suggest", "1");
   });
   await suggestPage.goto(`${baseUrl}?render=dom`, { waitUntil: "domcontentloaded", timeout: 30_000 });
   await sleep(2_500);

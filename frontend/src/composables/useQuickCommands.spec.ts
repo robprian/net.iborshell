@@ -53,6 +53,9 @@ function setupHarness() {
     suggestionMaxCharsState: ref(200),
     readTerminalCellFrame: () => ({ originLeft: 0, originTop: 0, cursorX: line.value.length, visibleRow: 0, cellWidth: 8, cellHeight: 16 }),
   });
+  // iBorShell 1.0.3: ghost suggestions default OFF (opt-in) — this suite
+  // exercises ghost behavior, so enable it explicitly.
+  ghost.setGhostEnabled(true);
 
   const session = ref<{ sessionId?: string } | undefined>({ sessionId: "s1" });
   const qc = useQuickCommands({

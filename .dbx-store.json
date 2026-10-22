@@ -19,7 +19,7 @@
   "source": "https://github.com/robprian/net.iborshell",
   "homepage": "https://github.com/robprian/net.iborshell",
   "license": "MIT",
-  "releaseNotes": "iBorShell 1.0.2: new plugin logo (transparent PNG artwork). All platform packages are Ed25519-signed (key_id net.iborshell). Feature set unchanged from 1.0.0: fork of jinpy's Terminal (io.dbx.ssh 0.7.9-beta.2) repacked as net.iborshell — Multi Exec panel, Clone Session, live CPU/ping/disk stats strip; command history panel removed.",
+  "releaseNotes": "iBorShell 1.0.3: performance pass. Command history suggestions and inline ghost suggestions are now OFF by default (opt-in via Settings > Command suggestions) to keep typing light in the webview; existing installs are migrated off once. Live stats strip no longer serves stale CPU/disk values: its 3s tick only reads the backend snapshot for ping, one fresh metrics collect runs every 15s, and the strip pauses while the Server metrics card is open (no overlapping pollers). All platform packages are Ed25519-signed (key_id net.iborshell). Fork of jinpy's Terminal (io.dbx.ssh 0.7.9-beta.2) repacked as net.iborshell — Multi Exec panel, Clone Session, live CPU/ping/disk stats strip; command history panel removed.",
   "localizations": {
     "zh-CN": {
       "name": "终端",
