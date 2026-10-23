@@ -301,7 +301,12 @@ impl DialTarget {
 }
 
 const DIRECTORY_HANDSHAKE_LIMIT: usize = 64 * 1024;
-const DIRECTORY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+// 8s, not 3s: on a loaded host the login path (sshd/PAM, shell rc, MOTD)
+// can take longer than 3s before the typed install line executes and the
+// ready marker comes back; a tight window made the fail-open flush below
+// dump the echoed install line onto the user's screen (the fail-open scrub
+// is the second line of defence for the same failure).
+const DIRECTORY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 const REMOTE_SHELL_DETECTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Error shown when a terminal-routed agent command finds no live workbench
@@ -1209,14 +1214,54 @@ enum RemoteShell {
 #[derive(Default)]
 struct DirectoryHandshakeFilter {
     marker: Option<Vec<u8>>,
+    /// The exact install line typed into the PTY for this arming. The tty
+    /// echoes it back into the output stream; on the success path the whole
+    /// pre-marker span (echo included) is dropped, but a fail-open flush
+    /// must scrub this span first or the user sees the raw install script
+    /// (long-standing user report, re-reported 2026-10-23).
+    echo: Vec<u8>,
     buffered: Vec<u8>,
     started_at: Option<Instant>,
     failed: bool,
 }
 
+/// Removes the echoed install line from a handshake buffer that is about
+/// to be flushed (fail-open). The tty echoes the typed bytes verbatim
+/// except that each CR comes back as CRLF under the default OPOST/ONLCR
+/// output processing, so try the CRLF-expanded form first, then the
+/// verbatim form. Only the first occurrence is removed: the line is typed
+/// exactly once per arming, and everything else in the buffer (MOTD, real
+/// command output) must survive untouched. A buffer that ends mid-echo
+/// (limit hit while the echo was still arriving) simply matches nothing
+/// and flushes as-is — the common failure (slow shell, marker late) has
+/// the complete echo in the buffer.
+fn scrub_install_echo(buffered: &[u8], echo: &[u8]) -> Vec<u8> {
+    if echo.is_empty() || buffered.is_empty() {
+        return buffered.to_vec();
+    }
+    let mut expanded = Vec::with_capacity(echo.len() + 4);
+    for &byte in echo {
+        if byte == b'\r' {
+            expanded.extend_from_slice(b"\r\n");
+        } else {
+            expanded.push(byte);
+        }
+    }
+    for candidate in [expanded.as_slice(), echo] {
+        if let Some(index) = find_bytes(buffered, candidate) {
+            let mut result = Vec::with_capacity(buffered.len() - candidate.len());
+            result.extend_from_slice(&buffered[..index]);
+            result.extend_from_slice(&buffered[index + candidate.len()..]);
+            return result;
+        }
+    }
+    buffered.to_vec()
+}
+
 impl DirectoryHandshakeFilter {
-    fn begin(&mut self, marker: Vec<u8>) {
+    fn begin(&mut self, marker: Vec<u8>, echo: Vec<u8>) {
         self.marker = Some(marker);
+        self.echo = echo;
         self.buffered.clear();
         self.started_at = Some(Instant::now());
         self.failed = false;
@@ -1233,6 +1278,7 @@ impl DirectoryHandshakeFilter {
         let index = find_bytes(&self.buffered, marker)?;
         let result = self.buffered[index + marker.len()..].to_vec();
         self.marker = None;
+        self.echo.clear();
         self.buffered.clear();
         self.started_at = None;
         (!result.is_empty()).then_some(result)
@@ -1257,7 +1303,11 @@ impl DirectoryHandshakeFilter {
         self.started_at = None;
         self.failed = true;
         let buffered = std::mem::take(&mut self.buffered);
-        (!buffered.is_empty()).then_some(buffered)
+        let echo = std::mem::take(&mut self.echo);
+        // Never flush the echoed install line to the screen: it is plugin
+        // plumbing, not user output. MOTD and any real output still flush.
+        let scrubbed = scrub_install_echo(&buffered, &echo);
+        (!scrubbed.is_empty()).then_some(scrubbed)
     }
 }
 
@@ -2587,7 +2637,8 @@ impl SshRuntime {
                                 continue;
                             }
                             directory_tracking_enabled = true;
-                            directory_filter.begin(directory_tracking_marker(&directory_marker_id));
+                            let script = directory_tracking_script(&directory_marker_id, remote_shell);
+                            directory_filter.begin(directory_tracking_marker(&directory_marker_id), script.as_bytes().to_vec());
                             publish_terminal(
                                 &task_id,
                                 TerminalStream::Stdout,
@@ -2595,7 +2646,6 @@ impl SshRuntime {
                                 &replay,
                                 &emitter,
                             ).await;
-                            let script = directory_tracking_script(&directory_marker_id, remote_shell);
                             if channel.data(script.as_bytes()).await.is_err() { break; }
                         }
                         Some(TerminalCommand::InstallPromptHook { shell }) => {
@@ -2614,8 +2664,8 @@ impl SshRuntime {
                             }
                             remote_shell = shell;
                             directory_tracking_enabled = true;
-                            directory_filter.begin(directory_tracking_marker(&directory_marker_id));
                             let script = directory_tracking_script(&directory_marker_id, shell);
+                            directory_filter.begin(directory_tracking_marker(&directory_marker_id), script.as_bytes().to_vec());
                             if channel.data(script.as_bytes()).await.is_err() { break; }
                         }
                         Some(TerminalCommand::Close) | None => {
@@ -14105,13 +14155,56 @@ matrix-ed25519";
     fn directory_handshake_filters_split_marker() {
         let marker = directory_tracking_marker("session-1");
         let mut filter = DirectoryHandshakeFilter::default();
-        filter.begin(marker.clone());
+        filter.begin(marker.clone(), b" install line".to_vec());
         assert_eq!(filter.filter(b"echoed script"), None);
         let split = marker.len() / 2;
         assert_eq!(filter.filter(&marker[..split]), None);
         let mut final_frame = marker[split..].to_vec();
         final_frame.extend_from_slice(b"prompt$ ");
         assert_eq!(filter.filter(&final_frame), Some(b"prompt$ ".to_vec()));
+    }
+
+    #[test]
+    fn directory_handshake_fail_open_scrubs_install_echo() {
+        // The typed install line ends in CR; the tty echoes it back as CRLF
+        // (OPOST/ONLCR). On fail-open the MOTD and real output must flush,
+        // but the echoed install line must never reach the screen.
+        let marker = directory_tracking_marker("session-1");
+        let script = directory_tracking_script("session-1", RemoteShell::Bash);
+        let mut filter = DirectoryHandshakeFilter::default();
+        filter.begin(marker, script.as_bytes().to_vec());
+        let mut echoed = b"Welcome to Ubuntu\r\n".to_vec();
+        echoed.extend_from_slice(script.replace('\r', "\r\n").as_bytes());
+        echoed.extend_from_slice(b"robby@host:~$ ");
+        assert_eq!(filter.filter(&echoed), None);
+        let flushed = filter.fail_open().expect("buffered output flushes");
+        let text = String::from_utf8(flushed).expect("utf8");
+        assert!(
+            text.contains("Welcome to Ubuntu"),
+            "MOTD survives: {text:?}"
+        );
+        assert!(text.contains("robby@host:~$ "), "prompt survives: {text:?}");
+        assert!(
+            !text.contains("__DBX_CWD_ACTIVE"),
+            "install echo scrubbed: {text:?}"
+        );
+    }
+
+    #[test]
+    fn scrub_install_echo_variants() {
+        // Verbatim echo (ONLCR off) is scrubbed too.
+        let echo = b" install-body\r".to_vec();
+        let buffered = b"pre install-body\rpost".to_vec();
+        assert_eq!(scrub_install_echo(&buffered, &echo), b"prepost".to_vec());
+        // No echo present: buffer passes through untouched.
+        let plain = b"just user output".to_vec();
+        assert_eq!(scrub_install_echo(&plain, &echo), plain);
+        // Only the first occurrence is removed (the line is typed once).
+        let twice = b" install-body\r install-body\r".to_vec();
+        assert_eq!(
+            scrub_install_echo(&twice, &echo),
+            b" install-body\r".to_vec()
+        );
     }
 
     #[test]

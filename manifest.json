@@ -3,7 +3,7 @@
   "manifest_version": 1,
   "id": "net.iborshell",
   "name": "iBorShell",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "publisher": "robprian",
   "description": "iBorShell: a secure SSH terminal for DBX — interactive sessions, SFTP file transfer, multi-host exec, clone session and live server stats. Fork of jinpy's Terminal plugin.",
   "source": "https://github.com/robprian/net.iborshell",
